@@ -113,6 +113,15 @@ ARG DAMAGE_BLOCK_DURATION=4
 COPY patches/damage-block-duration.sh /tmp/damage-block-duration.sh
 RUN sh /tmp/damage-block-duration.sh "$DAMAGE_BLOCK_DURATION" && rm -f /tmp/damage-block-duration.sh
 
+# drag files from the host onto the stream and they are pasted into WeChat; drag
+# them out of the sidebar file list and they download. Added as a plain script
+# beside the bundle (like src/universalTouchGamepad.js) rather than as surgery
+# inside 666 KB of minified JS — it only uses window.webrtcInput, which the
+# bundle already exports.
+COPY patches/wechat-dragdrop.js /usr/share/selkies/selkies-dashboard/src/wechat-dragdrop.js
+COPY patches/inject-dragdrop-script.sh /tmp/inject-dragdrop-script.sh
+RUN sh /tmp/inject-dragdrop-script.sh && rm -f /tmp/inject-dragdrop-script.sh
+
 # set app name
 ENV TITLE="WeChat-Selkies"
 ENV TZ="Asia/Shanghai"
