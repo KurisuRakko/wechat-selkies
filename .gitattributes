@@ -1,0 +1,14 @@
+# Everything in this repo ends up inside a Linux container (Dockerfile does
+# `COPY /root /`), so all text files must be checked out with LF regardless of
+# the developer's core.autocrlf setting. With CRLF, /defaults/autostart and the
+# `#!/bin/bash` shebangs in /scripts get carriage returns baked into the image
+# and openbox never launches WeChat.
+* text=auto eol=lf
+
+# Binary files: never touch.
+*.jpg  binary
+*.jpeg binary
+*.png  binary
+*.ico  binary
+*.gif  binary
+*.deb  binary
