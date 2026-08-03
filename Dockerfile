@@ -96,6 +96,10 @@ RUN apt-get autoclean && \
 # configure openbox dock mode for stalonetray
 RUN sed -i '/<dock>/,/<\/dock>/s/<noStrut>no<\/noStrut>/<noStrut>yes<\/noStrut>/' /etc/xdg/openbox/rc.xml
 
+# commit host-IME text in one insert instead of one keystroke per character
+COPY patches/atomic-ime-commit.sh /tmp/atomic-ime-commit.sh
+RUN sh /tmp/atomic-ime-commit.sh && rm -f /tmp/atomic-ime-commit.sh
+
 # set app name
 ENV TITLE="WeChat-Selkies"
 ENV TZ="Asia/Shanghai"
