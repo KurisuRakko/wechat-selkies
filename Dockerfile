@@ -28,7 +28,8 @@ RUN apt-get update && \
     libgtk-3-0 libnspr4 libnss3 libpango-1.0-0 libpangocairo-1.0-0 libstdc++6 libx11-6 \
     libxcomposite1 libxdamage1 libxext6 libxfixes3 libxi6 libxrandr2 libxrender1 \
     libxss1 libxtst6 libatomic1 libxcomposite1 libxrender1 libxrandr2 libxkbcommon-x11-0 \
-    libfontconfig1 libdbus-1-3 libnss3 libx11-xcb1 stalonetray inotify-tools
+    libfontconfig1 libdbus-1-3 libnss3 libx11-xcb1 stalonetray inotify-tools \
+    wmctrl
 
 ARG INSTALL_PCMANFM
 RUN if [ "$INSTALL_PCMANFM" = "true" ]; then \
@@ -122,6 +123,12 @@ COPY patches/wechat-dragdrop.js /usr/share/selkies/selkies-dashboard/src/wechat-
 COPY patches/inject-dragdrop-script.sh /tmp/inject-dragdrop-script.sh
 RUN sh /tmp/inject-dragdrop-script.sh && rm -f /tmp/inject-dragdrop-script.sh
 
+# stop losing keystrokes: give the key injector a fallback when its xdotool child
+# fails, stop truncating long IME commits, and make the primary display actually
+# honour backpressure so a slow link sheds frames instead of killing the session
+COPY patches/input-and-backpressure-fixes.py /tmp/input-and-backpressure-fixes.py
+RUN /lsiopy/bin/python3 /tmp/input-and-backpressure-fixes.py && rm -f /tmp/input-and-backpressure-fixes.py
+
 # set app name
 ENV TITLE="WeChat-Selkies"
 ENV TZ="Asia/Shanghai"
@@ -133,6 +140,13 @@ ENV WECHAT_NIGHTLY_STOP_TIME="23:30"
 ENV WECHAT_NIGHTLY_START_TIME="01:30"
 ENV ENABLE_WECHAT_AUTO_LOGIN="true"
 ENV AUTO_LOGIN_DELAY="3"
+# Keep the main window maximized and present. openbox's <maximized> rule only
+# fires when a window first appears and WeChat remembers its own geometry, so
+# start.sh also runs a watcher that re-maximizes it, maps it back when WeChat
+# hides to the tray, and relaunches the process if it exits.
+ENV ENABLE_WECHAT_WINDOW_WATCHDOG="true"
+ENV WECHAT_FORCE_MAXIMIZED="true"
+ENV WECHAT_WINDOW_CHECK_INTERVAL="5"
 
 
 

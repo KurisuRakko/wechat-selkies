@@ -11,19 +11,31 @@ if [ ! -f /config/.config/openbox/rc.xml ] || grep -A20 "<dock>" /config/.config
     openbox --reconfigure
 fi
 
-# configure default window behavior: open WeChat/QQ as normal windows instead of maximized
+# configure default window behavior for WeChat/QQ
 OB_RC="/config/.config/openbox/rc.xml"
+WECHAT_MAX="no"
+[ "${WECHAT_FORCE_MAXIMIZED:-true}" = "true" ] && WECHAT_MAX="yes"
 if [ -f "$OB_RC" ] && ! grep -q '<application class="wechat"' "$OB_RC"; then
-    sed -i '/<\/openbox_config>/i \
-  <applications>\
-    <application class="wechat">\
-      <maximized>no</maximized>\
-    </application>\
-    <application class="QQ">\
-      <maximized>no</maximized>\
-    </application>\
-  </applications>' "$OB_RC"
+    sed -i "/<\/openbox_config>/i \\
+  <applications>\\
+    <application class=\"wechat\">\\
+      <maximized>${WECHAT_MAX}</maximized>\\
+    </application>\\
+    <application class=\"QQ\">\\
+      <maximized>no</maximized>\\
+    </application>\\
+  </applications>" "$OB_RC"
     openbox --reconfigure 2>/dev/null || true
+elif [ -f "$OB_RC" ]; then
+    # rc.xml lives on the /config volume and is only ever seeded once, so an
+    # existing file keeps whatever value it was created with. Reconcile just
+    # WeChat's rule with WECHAT_FORCE_MAXIMIZED, leaving QQ's alone.
+    CURRENT=$(sed -n '/<application class="wechat">/,/<\/application>/s|.*<maximized>\(.*\)</maximized>.*|\1|p' "$OB_RC" | head -1)
+    if [ -n "$CURRENT" ] && [ "$CURRENT" != "$WECHAT_MAX" ]; then
+        sed -i "/<application class=\"wechat\">/,/<\/application>/s|<maximized>${CURRENT}</maximized>|<maximized>${WECHAT_MAX}</maximized>|" "$OB_RC"
+        echo "🔲 openbox: WeChat <maximized> ${CURRENT} -> ${WECHAT_MAX}"
+        openbox --reconfigure 2>/dev/null || true
+    fi
 fi
 
 # generate openbox menu from defaults + ~/Desktop/*.desktop files
@@ -48,6 +60,14 @@ if [ "$AUTO_START_WECHAT" = "true" ]; then
             nohup /lsiopy/bin/python3 /scripts/wechat/wechat-auto-login.py >/dev/null 2>&1 &
         fi
     fi
+fi
+
+# keep the WeChat main window present and maximized, and relaunch it if it exits.
+# openbox's <maximized> rule only applies when a window first appears, and WeChat
+# remembers its own geometry, so a long-lived session needs a watcher too.
+if [ "${ENABLE_WECHAT_WINDOW_WATCHDOG:-true}" = "true" ] && [ -f /usr/bin/wechat ]; then
+    chmod +x /scripts/wechat/*.sh 2>/dev/null || true
+    nohup /scripts/wechat/wechat-window-watchdog.sh > /dev/null 2>&1 &
 fi
 
 # start QQ application in the background if exists and auto-start enabled
