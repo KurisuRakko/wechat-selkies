@@ -100,6 +100,19 @@ RUN sed -i '/<dock>/,/<\/dock>/s/<noStrut>no<\/noStrut>/<noStrut>yes<\/noStrut>/
 COPY patches/atomic-ime-commit.sh /tmp/atomic-ime-commit.sh
 RUN sh /tmp/atomic-ime-commit.sh && rm -f /tmp/atomic-ime-commit.sh
 
+# let the browser choose its own video decoder instead of being forced onto software
+COPY patches/decoder-no-preference.sh /tmp/decoder-no-preference.sh
+RUN sh /tmp/decoder-no-preference.sh && rm -f /tmp/decoder-no-preference.sh
+
+# shorten the wasted full-stripe encodes that trail the end of any motion.
+# pixelflux keeps encoding a "busy" stripe every frame for this many frames
+# without re-hashing it, so upstream's 20 leaves a tail of up to 40 frames after
+# the screen has already gone static. Raise it back toward 20 if hashing ever
+# shows up as the bottleneck instead.
+ARG DAMAGE_BLOCK_DURATION=4
+COPY patches/damage-block-duration.sh /tmp/damage-block-duration.sh
+RUN sh /tmp/damage-block-duration.sh "$DAMAGE_BLOCK_DURATION" && rm -f /tmp/damage-block-duration.sh
+
 # set app name
 ENV TITLE="WeChat-Selkies"
 ENV TZ="Asia/Shanghai"
