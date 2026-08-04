@@ -141,9 +141,19 @@ COPY patches/wechat-dragdrop.js /usr/share/selkies/selkies-dashboard/src/wechat-
 COPY patches/inject-dragdrop-script.sh /tmp/inject-dragdrop-script.sh
 RUN sh /tmp/inject-dragdrop-script.sh && rm -f /tmp/inject-dragdrop-script.sh
 
+# anchor the host IME's candidate window to where the user clicked: composition
+# happens in an invisible full-screen <input> whose caret sits at its centre-left,
+# so the candidate list popped up nowhere near WeChat's text box — and the hidden
+# input's value was never cleared, so the anchor also drifted with every message.
+COPY patches/wechat-ime-anchor.js /usr/share/selkies/selkies-dashboard/src/wechat-ime-anchor.js
+COPY patches/inject-ime-anchor-script.sh /tmp/inject-ime-anchor-script.sh
+RUN sh /tmp/inject-ime-anchor-script.sh && rm -f /tmp/inject-ime-anchor-script.sh
+
 # stop losing keystrokes: give the key injector a fallback when its xdotool child
-# fails, stop truncating long IME commits, and make the primary display actually
-# honour backpressure so a slow link sheds frames instead of killing the session
+# fails, paste CJK IME commits through the clipboard instead of racing xdotool's
+# per-character keymap rebinding (Qt drops characters typed that way), stop
+# truncating long ASCII commits, and make the primary display actually honour
+# backpressure so a slow link sheds frames instead of killing the session
 COPY patches/input-and-backpressure-fixes.py /tmp/input-and-backpressure-fixes.py
 RUN /lsiopy/bin/python3 /tmp/input-and-backpressure-fixes.py && rm -f /tmp/input-and-backpressure-fixes.py
 

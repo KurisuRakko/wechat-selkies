@@ -141,23 +141,230 @@ patch(
 )
 
 
-# --------------------------------------------------------------------------- 2
-# co,end truncates long text and orphans its child.
+# --------------------------------------------------------------------------- 2a
+# Make Selkies' existing Unicode clipboard injector transactional and let its
+# caller know whether the paste keystroke was actually dispatched.
 #
-# This path carries every IME phrase commit (see atomic-ime-commit.sh) and, per
-# on_message, every modifier-free non-alphabetic printable — so all digits and
-# punctuation. xdotool's default inter-key delay is 12 ms, so the fixed 0.5 s
-# ceiling truncates anything past roughly 40 characters, and the exception is
-# swallowed with a warning.
-#
-# The delay is deliberately left at xdotool's default rather than set to 0:
-# upstream issue #257 reports that an inter-key delay below ~10 ms makes Selkies
-# lose individual letters, so racing the target application would trade one
-# failure mode for another. Scale the timeout instead.
+# Upstream restores the old selection only on its success path. A failed paste
+# after the temporary text is installed therefore leaks the IME commit into the
+# user's clipboard, and the method swallows the error so co,end cannot choose a
+# fallback. Keep one implementation for both the existing single-codepoint
+# fallback and phrase commits, but move restoration into finally and return a
+# dispatch flag. A restore failure is deliberately logged without changing a
+# successful result: falling back after Ctrl+V was sent would duplicate text.
 
 patch(
     "input_handler.py",
-    "co,end timeout scaling and orphan kill",
+    "transactional clipboard injection with dispatch result",
+    """    async def _inject_unicode_via_clipboard(self, text_to_type):
+        async with self.clipboard_injection_lock:
+            self.clipboard_paused = True
+            KEY_SHIFT_L = 0xFFE1
+            KEY_INSERT  = 0xFF63
+
+            currently_active_mods = list(self.active_modifiers)
+
+            try:
+                for mod_keysym in currently_active_mods:
+                    await self.send_x11_keypress(mod_keysym, down=False)
+
+                old_data, old_mime = await self.read_clipboard(use_binary=True)
+
+                mime_to_use = "UTF8_STRING" if not self.is_wayland else "text/plain"
+                await self.write_clipboard(text_to_type, mime_type=mime_to_use)
+                await asyncio.sleep(0.02)
+
+                await self.send_x11_keypress(KEY_SHIFT_L, down=True)
+                await self.send_x11_keypress(KEY_INSERT, down=True)
+                await self.send_x11_keypress(KEY_INSERT, down=False)
+                await self.send_x11_keypress(KEY_SHIFT_L, down=False)
+                await asyncio.sleep(0.05)
+
+                if old_data is not None:
+                    await self.write_clipboard(old_data, mime_type=old_mime or "text/plain")
+                elif self.is_wayland:
+                    try:
+                        proc = await subprocess.create_subprocess_exec(
+                            "wl-copy", "--clear",
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            env=self._get_wl_env()
+                        )
+                        await asyncio.wait_for(proc.communicate(), timeout=1.0)
+                    except Exception:
+                        pass
+
+            except Exception as e:
+                logger_webrtc_input.error(f"Error during clipboard injection: {e}", exc_info=True)
+            finally:
+                for mod_keysym in currently_active_mods:
+                    if mod_keysym in self.active_modifiers:
+                        await self.send_x11_keypress(mod_keysym, down=True)
+
+                self.clipboard_paused = False
+""",
+    """    async def _inject_unicode_via_clipboard(self, text_to_type):
+        async with self.clipboard_injection_lock:
+            self.clipboard_paused = True
+            currently_active_mods = list(self.active_modifiers)
+            old_data = None
+            old_mime = None
+            clipboard_replaced = False
+            paste_dispatched = False
+
+            try:
+                for mod_keysym in currently_active_mods:
+                    await self.send_x11_keypress(mod_keysym, down=False)
+
+                old_data, old_mime = await self.read_clipboard(use_binary=True)
+                mime_to_use = "UTF8_STRING" if not self.is_wayland else "text/plain"
+                if not await self.write_clipboard(text_to_type, mime_type=mime_to_use):
+                    raise RuntimeError("temporary clipboard write failed")
+                clipboard_replaced = True
+
+                # xclip/wl-copy forks an owner for the selection. Let it become
+                # observable before asking the application to convert it.
+                await asyncio.sleep(0.02)
+                if self.is_wayland:
+                    # Preserve upstream's Wayland-compatible Shift+Insert path.
+                    key_shift_l = 0xFFE1
+                    key_insert = 0xFF63
+                    await self.send_x11_keypress(key_shift_l, down=True)
+                    await self.send_x11_keypress(key_insert, down=True)
+                    await self.send_x11_keypress(key_insert, down=False)
+                    await self.send_x11_keypress(key_shift_l, down=False)
+                    paste_dispatched = True
+                else:
+                    paste_proc = await subprocess.create_subprocess_exec(
+                        "xdotool", "key", "--clearmodifiers", "ctrl+v",
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                    )
+                    try:
+                        _, paste_stderr = await asyncio.wait_for(
+                            paste_proc.communicate(), timeout=2.0
+                        )
+                    except asyncio.TimeoutError:
+                        try:
+                            paste_proc.kill()
+                        except ProcessLookupError:
+                            pass
+                        await paste_proc.wait()
+                        raise
+                    if paste_proc.returncode != 0:
+                        raise RuntimeError(
+                            f"paste keystroke failed with code {paste_proc.returncode}: "
+                            f"{paste_stderr.decode(errors='replace').strip()}"
+                        )
+                    paste_dispatched = True
+
+                # Selection conversion is pull-based. This matches the delay
+                # proven by the local WeChat history integration and prevents
+                # WeChat from fetching the restored (old) selection instead.
+                await asyncio.sleep(0.2)
+                return True
+            except Exception as e:
+                logger_webrtc_input.error(
+                    f"Error during clipboard injection: {e}", exc_info=True
+                )
+                return paste_dispatched
+            finally:
+                try:
+                    # Restoration must run even when the temporary write or
+                    # paste command times out. If no prior payload existed,
+                    # install an explicitly empty selection rather than leaking
+                    # the IME text.
+                    if clipboard_replaced:
+                        try:
+                            if old_data:
+                                restored = await self.write_clipboard(
+                                    old_data, mime_type=old_mime or "text/plain"
+                                )
+                                if not restored:
+                                    raise RuntimeError("clipboard restore returned false")
+                            elif self.is_wayland:
+                                clear_proc = await subprocess.create_subprocess_exec(
+                                    "wl-copy", "--clear",
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL,
+                                    env=self._get_wl_env(),
+                                )
+                                await asyncio.wait_for(
+                                    clear_proc.communicate(), timeout=1.0
+                                )
+                                if clear_proc.returncode != 0:
+                                    raise RuntimeError(
+                                        f"wl-copy --clear returned {clear_proc.returncode}"
+                                    )
+                            else:
+                                clear_proc = await subprocess.create_subprocess_exec(
+                                    "xclip", "-selection", "clipboard", "-i", "-t", "UTF8_STRING",
+                                    stdin=subprocess.PIPE,
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL,
+                                )
+                                await asyncio.wait_for(
+                                    clear_proc.communicate(input=b""), timeout=1.0
+                                )
+                                if clear_proc.returncode != 0:
+                                    raise RuntimeError(
+                                        f"xclip clear returned {clear_proc.returncode}"
+                                    )
+                        except Exception as restore_exc:
+                            logger_webrtc_input.error(
+                                f"Clipboard restore after injection failed: {restore_exc}",
+                                exc_info=True,
+                            )
+
+                    for mod_keysym in currently_active_mods:
+                        if mod_keysym in self.active_modifiers:
+                            try:
+                                await self.send_x11_keypress(mod_keysym, down=True)
+                            except Exception as modifier_exc:
+                                logger_webrtc_input.error(
+                                    f"Failed to restore modifier {mod_keysym}: {modifier_exc}",
+                                    exc_info=True,
+                                )
+                finally:
+                    self.clipboard_paused = False
+""",
+)
+
+
+# --------------------------------------------------------------------------- 2b
+# co,end drops CJK characters, truncates long text, and orphans its child.
+#
+# This path carries every IME phrase commit (see atomic-ime-commit.sh) and, per
+# on_message, every modifier-free non-alphabetic printable — so all digits,
+# punctuation, and any CJK the host IME commits.
+#
+# Two distinct failure modes, needing two different transports:
+#
+#   * ASCII is on the stock us layout, so `xdotool type` presses real keycodes —
+#     race-free. Its only bug here was the fixed 0.5 s ceiling: at xdotool's
+#     12 ms default inter-key delay anything past roughly 40 characters was
+#     truncated, and the exception swallowed with a warning. Scale the timeout
+#     instead. (The delay itself is left alone: upstream issue #257 reports that
+#     under ~10 ms Selkies starts losing individual letters.)
+#
+#   * Everything off the layout — ALL CJK — makes xdotool rebind a spare keycode
+#     per character on the fly (XChangeKeyboardMapping). The target app learns of
+#     the rebinding asynchronously via MappingNotify, so under any load some
+#     characters get resolved against the stale map and are silently dropped or
+#     corrupted. Qt applications like WeChat are notoriously bad at this (same
+#     bug family as xdotool #56/#49: typed output resolved against the wrong
+#     map). No inter-key delay fixes a race; the transport is wrong. Paste the
+#     commit through the clipboard instead — one atomic insert, no per-character
+#     timing at all. This is the same mechanism upstream itself uses on Wayland
+#     (_keyboard_worker -> _inject_unicode_via_clipboard) and the same
+#     save/paste/restore dance the wechat-history integration has proven against
+#     this exact WeChat build. clipboard_paused keeps the monitor from
+#     broadcasting the transient clipboard contents to the browser, and the old
+#     clipboard is restored only after WeChat has had time to pull the selection
+#     (paste is pull-based; restoring immediately would paste the OLD content).
+
+patch(
+    "input_handler.py",
+    "co,end: clipboard paste for CJK, scaled timeout for ASCII",
     """                    cmd = ["xdotool", "type", text_to_type]
                     process = await subprocess.create_subprocess_exec(
                         *cmd,
@@ -166,26 +373,67 @@ patch(
                     )
                     await asyncio.wait_for(process.communicate(), timeout=0.5)
 """,
-    """                    cmd = ["xdotool", "type", text_to_type]
-                    process = await subprocess.create_subprocess_exec(
-                        *cmd,
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE
-                    )
-                    # 20 ms per character, comfortably above xdotool's 12 ms
-                    # default inter-key delay, so a long IME commit is not cut off
-                    # partway through. The old fixed 0.5 s truncated anything past
-                    # roughly 40 characters.
-                    co_end_timeout = 0.5 + 0.02 * len(text_to_type)
-                    try:
-                        await asyncio.wait_for(process.communicate(), timeout=co_end_timeout)
-                    except asyncio.TimeoutError:
-                        # Kill it: wait_for cancels communicate() but leaves the
-                        # child typing, which interleaves with later keystrokes and
-                        # scrambles them.
-                        process.kill()
-                        await process.wait()
-                        raise
+    """                    if text_to_type.isascii():
+                        # On-layout characters: real keycodes, no remapping race.
+                        cmd = ["xdotool", "type", text_to_type]
+                        process = await subprocess.create_subprocess_exec(
+                            *cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE
+                        )
+                        # 20 ms per character, comfortably above xdotool's 12 ms
+                        # default inter-key delay, so a long commit is not cut
+                        # off partway through.
+                        co_end_timeout = 0.5 + 0.02 * len(text_to_type)
+                        try:
+                            _, type_stderr = await asyncio.wait_for(
+                                process.communicate(), timeout=co_end_timeout
+                            )
+                        except asyncio.TimeoutError:
+                            # Kill it: wait_for cancels communicate() but leaves
+                            # the child typing, which interleaves with later
+                            # keystrokes and scrambles them.
+                            try:
+                                process.kill()
+                            except ProcessLookupError:
+                                pass
+                            await process.wait()
+                            raise
+                        if process.returncode != 0:
+                            raise RuntimeError(
+                                f"xdotool type failed with code {process.returncode}: "
+                                f"{type_stderr.decode(errors='replace').strip()}"
+                            )
+                    else:
+                        # Off-layout characters (all CJK): one clipboard insert.
+                        # The helper returns True once the paste keystroke was
+                        # dispatched, even if restoring the clipboard later
+                        # fails, so the fallback can never duplicate text.
+                        pasted = await self._inject_unicode_via_clipboard(text_to_type)
+                        if not pasted:
+                            # Last resort: the racy per-character path still beats
+                            # dropping the whole commit.
+                            process = await subprocess.create_subprocess_exec(
+                                "xdotool", "type", "--clearmodifiers", text_to_type,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE,
+                            )
+                            try:
+                                _, type_stderr = await asyncio.wait_for(
+                                    process.communicate(), timeout=0.5 + 0.02 * len(text_to_type)
+                                )
+                            except asyncio.TimeoutError:
+                                try:
+                                    process.kill()
+                                except ProcessLookupError:
+                                    pass
+                                await process.wait()
+                                raise
+                            if process.returncode != 0:
+                                raise RuntimeError(
+                                    f"fallback xdotool type failed with code {process.returncode}: "
+                                    f"{type_stderr.decode(errors='replace').strip()}"
+                                )
 """,
 )
 
@@ -269,4 +517,4 @@ if os.path.isdir(cache):
         os.remove(os.path.join(cache, name))
     os.rmdir(cache)
 
-print("input-and-backpressure-fixes: 3 patch(es) applied")
+print("input-and-backpressure-fixes: 4 patch(es) applied")
