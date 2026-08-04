@@ -15,6 +15,7 @@ ARG TARGETPLATFORM
 ARG BUILDPLATFORM
 ARG INSTALL_QQ=true
 ARG INSTALL_PCMANFM=true
+ARG INSTALL_WECHAT_HISTORY=false
 RUN echo "🏗️ Building WeChat-Selkies on $BUILDPLATFORM, targeting $TARGETPLATFORM"
 
 RUN apt-get update && \
@@ -36,7 +37,24 @@ RUN if [ "$INSTALL_PCMANFM" = "true" ]; then \
         apt-get install -y --no-install-recommends pcmanfm; \
     fi
 
+# Optional, private WeChat history integration. Keep this disabled in public
+# images; only the local compose file enables it.
+RUN if [ "$INSTALL_WECHAT_HISTORY" = "true" ]; then \
+        apt-get install -y --no-install-recommends xdotool xclip; \
+    fi
+
 RUN pip install --no-cache-dir python-xlib
+
+COPY integrations/wechat-history/requirements.lock /tmp/wechat-history-requirements.lock
+RUN if [ "$INSTALL_WECHAT_HISTORY" = "true" ]; then \
+        /lsiopy/bin/python3 -m pip install \
+            --no-cache-dir \
+            --only-binary=:all: \
+            --require-hashes \
+            --target /opt/wechat-history/site-packages \
+            -r /tmp/wechat-history-requirements.lock; \
+    fi && \
+    rm -f /tmp/wechat-history-requirements.lock
 
 # Install WeChat based on target architecture
 RUN case "$TARGETPLATFORM" in \
@@ -129,6 +147,16 @@ RUN sh /tmp/inject-dragdrop-script.sh && rm -f /tmp/inject-dragdrop-script.sh
 COPY patches/input-and-backpressure-fixes.py /tmp/input-and-backpressure-fixes.py
 RUN /lsiopy/bin/python3 /tmp/input-and-backpressure-fixes.py && rm -f /tmp/input-and-backpressure-fixes.py
 
+# open links from WeChat in the viewer's own browser. The container has no browser
+# at all, so Qt's first choice — xdg-open on PATH — currently fails silently and a
+# clicked link does nothing. /usr/local/bin precedes /usr/bin in the container
+# PATH, so this shim intercepts; it queues URLs for the injected page script and
+# delegates everything that is not a URL to the real /usr/bin/xdg-open.
+COPY patches/xdg-open-forward.sh /usr/local/bin/xdg-open
+RUN chmod 0755 /usr/local/bin/xdg-open
+# Consulted by non-Qt callers, and by Qt after xdg-open; point it at the shim too.
+ENV BROWSER="/usr/local/bin/xdg-open"
+
 # set app name
 ENV TITLE="WeChat-Selkies"
 ENV TZ="Asia/Shanghai"
@@ -155,3 +183,7 @@ RUN cp /usr/share/icons/hicolor/128x128/apps/wechat.png /usr/share/selkies/www/i
 
 # add local files
 COPY /root /
+
+# Source is harmless when the optional dependencies are disabled and keeping it
+# separate from /root avoids copying tests/licenses into the container root.
+COPY integrations/wechat-history /opt/wechat-history

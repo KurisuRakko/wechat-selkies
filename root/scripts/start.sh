@@ -67,6 +67,9 @@ fi
 # remembers its own geometry, so a long-lived session needs a watcher too.
 if [ "${ENABLE_WECHAT_WINDOW_WATCHDOG:-true}" = "true" ] && [ -f /usr/bin/wechat ]; then
     chmod +x /scripts/wechat/*.sh 2>/dev/null || true
+    # The watchdog keeps its own timestamped log. Discarding its output, as this
+    # line used to, meant a misbehaving watchdog left no evidence at all.
+    : > /config/.wechat-watchdog.log 2>/dev/null || true
     nohup /scripts/wechat/wechat-window-watchdog.sh > /dev/null 2>&1 &
 fi
 

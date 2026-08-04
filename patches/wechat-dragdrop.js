@@ -251,7 +251,7 @@
     setInterval(scan, 2000);
   }
 
-  /* ------------------------------------------------------------------ setup */
+  /* ------------------------------------------------------ drop-in attachment */
 
   function attach() {
     var el = document.getElementById("overlayInput");
@@ -265,6 +265,115 @@
     return true;
   }
 
+  /* ------------------------------------------------- open URLs in this browser */
+
+  // /usr/local/bin/xdg-open inside the container appends "<epoch_ms> <url>" here
+  // instead of trying to open a browser it does not have. nginx already publishes
+  // /config/Desktop at /files, and there is no dotfile deny rule, so this needs
+  // no server-side change at all.
+  var URL_QUEUE = "./files/.wechat-open-urls";
+  var URL_POLL_MS = Number(window.WECHAT_URL_POLL_MS || 1000);
+  // A link clicked while nobody was watching should not pop up hours later.
+  var URL_MAX_AGE_MS = Number(window.WECHAT_URL_MAX_AGE_MS || 60000);
+  // Cursor is persisted so a page reload does not replay the whole queue.
+  var URL_CURSOR_KEY = "wechatDragdrop.urlCursor";
+
+  function urlCursor() {
+    var v = Number(localStorage.getItem(URL_CURSOR_KEY) || 0);
+    return isFinite(v) ? v : 0;
+  }
+
+  function setUrlCursor(ts) {
+    try { localStorage.setItem(URL_CURSOR_KEY, String(ts)); } catch (e) { /* private mode */ }
+  }
+
+  function showOpenPrompt(url) {
+    // window.open outside a user gesture is popup-blocked. A real anchor the user
+    // clicks is a fresh gesture and always allowed.
+    var host;
+    try { host = new URL(url).host; } catch (e) { host = url; }
+
+    var bar = document.createElement("div");
+    bar.style.cssText = [
+      "position:fixed", "top:0", "left:50%", "transform:translateX(-50%)",
+      "z-index:2147483647", "max-width:90vw", "box-sizing:border-box",
+      "margin:8px", "padding:10px 14px", "border-radius:8px",
+      "background:#1f1f1f", "color:#fff", "font:14px system-ui,sans-serif",
+      "box-shadow:0 4px 16px rgba(0,0,0,.45)", "display:flex",
+      "align-items:center", "gap:12px"
+    ].join(";");
+
+    var a = document.createElement("a");
+    a.href = url;
+    a.target = "_blank";
+    a.rel = "noopener noreferrer";
+    a.textContent = "🔗 在浏览器打开 " + host;
+    a.style.cssText = "color:#7ab8ff;text-decoration:none;font-weight:600";
+    a.addEventListener("click", function () { bar.remove(); });
+
+    var x = document.createElement("button");
+    x.textContent = "✕";
+    x.style.cssText =
+      "background:none;border:none;color:#aaa;cursor:pointer;font-size:15px;line-height:1";
+    x.addEventListener("click", function () { bar.remove(); });
+
+    bar.appendChild(a);
+    bar.appendChild(x);
+    document.body.appendChild(bar);
+    setTimeout(function () { bar.remove(); }, URL_MAX_AGE_MS);
+  }
+
+  function openForwardedUrl(url) {
+    // Never hand window.open a scheme the container could use to run script in
+    // this origin; the queue file is world-readable over /files.
+    if (!/^(https?:|mailto:)/i.test(url)) {
+      console.warn(TAG, "refusing to open non-http(s) url:", url);
+      return;
+    }
+    var w = null;
+    try { w = window.open(url, "_blank", "noopener,noreferrer"); } catch (e) { w = null; }
+    if (w) {
+      console.log(TAG, "opened", url);
+    } else {
+      console.log(TAG, "popup blocked, showing prompt for", url);
+      showOpenPrompt(url);
+    }
+  }
+
+  function pollUrlQueue() {
+    if (document.hidden) return;   // a hidden tab cannot usefully open anything
+    fetch(URL_QUEUE, { cache: "no-store" })
+      .then(function (r) { return r.ok ? r.text() : null; })
+      .then(function (text) {
+        if (!text) return;         // 404 until the first link is clicked
+        var cursor = urlCursor();
+        var now = Date.now();
+        var newest = cursor;
+        text.split("\n").forEach(function (line) {
+          var sp = line.indexOf(" ");
+          if (sp <= 0) return;
+          var ts = Number(line.slice(0, sp));
+          var url = line.slice(sp + 1).trim();
+          if (!isFinite(ts) || !url) return;
+          if (ts > newest) newest = ts;
+          if (ts <= cursor) return;              // already handled
+          if (now - ts > URL_MAX_AGE_MS) return; // too old to be wanted
+          openForwardedUrl(url);
+        });
+        if (newest > cursor) setUrlCursor(newest);
+      })
+      .catch(function () { /* nginx not ready, or offline */ });
+  }
+
+  function watchUrlQueue() {
+    // Start the cursor at "now" so links queued long before this tab existed are
+    // not opened on load. Stale entries are also age-filtered above.
+    if (!localStorage.getItem(URL_CURSOR_KEY)) setUrlCursor(Date.now());
+    setInterval(pollUrlQueue, URL_POLL_MS);
+  }
+
+  /* ------------------------------------------------------------------ setup */
+
   function boot() {
     var tries = 0;
     var t = setInterval(function () {
@@ -273,7 +382,9 @@
       if (ready) {
         clearInterval(t);
         watchFileIframes();
-        console.log(TAG, "ready (paste delay " + PASTE_DELAY_MS + "ms, upload dir " + UPLOAD_DIR + ")");
+        watchUrlQueue();
+        console.log(TAG, "ready (paste delay " + PASTE_DELAY_MS + "ms, upload dir " + UPLOAD_DIR +
+          ", url poll " + URL_POLL_MS + "ms)");
       } else if (tries > 120) {
         clearInterval(t);
         console.warn(TAG, "gave up waiting for #overlayInput / window.webrtcInput");
