@@ -197,6 +197,16 @@ docker run -it -p 3001:3001 -v ./config:/config --device /dev/dri:/dev/dri nickr
 
 > **注意：** 如果升级后右键菜单缺少 `WeChat` 相关选项，请先清空本地挂载目录下的openbox目录(如`./config/.config/openbox`)。
 
+### 可选：本机聊天记录 MCP
+
+仓库包含一个默认关闭、仅用于本人本机非商用测试的聊天记录 MCP 集成。它通过
+`INSTALL_WECHAT_HISTORY=true` 显式启用，只读取配置中固定的单一账户；回复工具只会
+填写草稿，不提供自动发送。密钥扫描权限被隔离在一次性 Compose profile 中，主微信
+容器不会获得 `SYS_PTRACE`。
+
+完整的构建、密钥扫描、MCP 配置、安全边界和测试说明见
+[本机微信聊天记录 MCP](docs/wechat-history.md)。请勿发布启用了该功能的公共镜像。
+
 ## 安装第三方应用（如 Telegram）
 
 本项目支持通过 [proot-apps](https://github.com/linuxserver/proot-apps) 安装第三方 Linux 应用。以 Telegram 为例：

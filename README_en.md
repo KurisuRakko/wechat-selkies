@@ -195,6 +195,18 @@ Configure the following environment variables in `docker-compose.yml`. Variables
 
 > **Note:** If the right-click menu lacks `WeChat` related options after an upgrade, please clear the `openbox` directory in the local mounted directory (e.g., `./config/.config/openbox`).
 
+### Optional Local Chat History MCP
+
+The repository includes a disabled-by-default, single-account chat-history MCP
+integration for private, local, non-commercial testing. Enable it explicitly
+with `INSTALL_WECHAT_HISTORY=true`. Its reply tool only prepares a draft in the
+WeChat input box and never sends it; process-memory access is confined to a
+one-shot Compose helper and is never granted to the main container.
+
+See [Local WeChat Chat History MCP](docs/wechat-history.md) for setup, security
+boundaries, testing, and legal cautions. Do not publish a public image with this
+feature enabled.
+
 ## Installing Third-Party Applications (e.g., Telegram)
 
 This project supports installing third-party Linux applications via [proot-apps](https://github.com/linuxserver/proot-apps). Here's how to install Telegram as an example:
