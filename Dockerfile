@@ -148,6 +148,15 @@ COPY patches/wechat-ime-anchor.js /usr/share/selkies/selkies-dashboard/src/wecha
 COPY patches/inject-ime-anchor-script.sh /tmp/inject-ime-anchor-script.sh
 RUN sh /tmp/inject-ime-anchor-script.sh && rm -f /tmp/inject-ime-anchor-script.sh
 
+# Chromium blocks an AudioContext created during page initialization. Defer the
+# playback context until the first trusted pointer/key/touch gesture, then use a
+# single gate for later resume attempts so every audio packet cannot repeat the
+# same autoplay-policy warning. The microphone context is deliberately left in
+# its existing explicit user-action path.
+COPY patches/selkies-audio-unlock.js /usr/share/selkies/selkies-dashboard/src/selkies-audio-unlock.js
+COPY patches/patch-audio-autoplay.py /tmp/patch-audio-autoplay.py
+RUN /lsiopy/bin/python3 /tmp/patch-audio-autoplay.py && rm -f /tmp/patch-audio-autoplay.py
+
 # stop losing keystrokes: give the key injector a fallback when its xdotool child
 # fails, paste CJK IME commits through the clipboard instead of racing xdotool's
 # per-character keymap rebinding (Qt drops characters typed that way), stop
