@@ -1,0 +1,8 @@
+#!/usr/bin/with-contenv bash
+
+export PYTHONPATH="/opt/wechat-history/site-packages:/opt/wechat-history"
+export PYTHONDONTWRITEBYTECODE=1
+export PYTHONUNBUFFERED=1
+
+exec s6-setuidgid abc \
+  /lsiopy/bin/python3 -m wechat_history.notifications

@@ -196,3 +196,27 @@ COPY /root /
 # Source is harmless when the optional dependencies are disabled and keeping it
 # separate from /root avoids copying tests/licenses into the container root.
 COPY integrations/wechat-history /opt/wechat-history
+
+# Web Push itself is private-history-only. http-ece is pure Python but publishes
+# no wheel, so this small, separately hashed set is installed without dependency
+# resolution after the main locked environment above.
+RUN if [ "$INSTALL_WECHAT_HISTORY" = "true" ]; then \
+        /lsiopy/bin/python3 -m pip install \
+            --no-cache-dir \
+            --no-build-isolation \
+            --no-deps \
+            --require-hashes \
+            --target /opt/wechat-history/site-packages \
+            -r /opt/wechat-history/webpush-requirements.lock; \
+    fi
+
+# Only a private history-enabled image receives the notification UI, root-scoped
+# Service Worker, loopback API proxy and s6 longrun. The public default build is
+# byte-for-byte unchanged at each of those runtime paths.
+COPY patches/wechat-notifications.js /tmp/wechat-notifications/wechat-notifications.js
+COPY patches/wechat-notification-sw.js /tmp/wechat-notifications/wechat-notification-sw.js
+COPY patches/wechat-notifications-s6 /tmp/wechat-notifications/s6
+COPY patches/install-wechat-notifications.sh /tmp/install-wechat-notifications.sh
+RUN sh /tmp/install-wechat-notifications.sh \
+        "$INSTALL_WECHAT_HISTORY" /tmp/wechat-notifications && \
+    rm -rf /tmp/wechat-notifications /tmp/install-wechat-notifications.sh

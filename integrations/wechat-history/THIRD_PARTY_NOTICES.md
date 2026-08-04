@@ -18,3 +18,8 @@ implementation additionally:
 
 The upstream work is licensed under Apache License 2.0. A copy is included as
 `LICENSE.wechat-cli`.
+
+The optional browser notification service uses `pywebpush` and `py-vapid`
+under Mozilla Public License 2.0, and `http-ece` under the MIT License. Their
+unmodified Python distributions are installed from PyPI with pinned versions
+and SHA-256 hashes when `INSTALL_WECHAT_HISTORY=true`.
