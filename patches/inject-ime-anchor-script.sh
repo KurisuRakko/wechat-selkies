@@ -3,8 +3,8 @@
 #
 # Same pattern as inject-dragdrop-script.sh: the dashboard already loads plain
 # (non-module) scripts next to the bundle, so the IME anchor script is added the
-# same way instead of editing the minified bundle. It only touches #overlayInput
-# styling and value, which the bundle creates by id.
+# same way instead of editing the minified bundle. It keeps #overlayInput as the
+# pointer surface and adds a click-local textarea for native IME composition.
 #
 # /usr/share/selkies/web is deleted and recreated from /usr/share/selkies/$DASHBOARD
 # by init-nginx on every container start, so both the HTML and the JS have to live
@@ -19,11 +19,30 @@ found=0
 for html in "$ROOT"/*/index.html; do
     [ -f "$html" ] || continue
     dir=$(dirname "$html")
+    bundle="$dir/src/selkies-core.js"
 
     # Only dashboards that actually carry the streaming client.
     [ -f "$dir/$SCRIPT_REL" ] || continue
 
-    if grep -q "wechat-ime-anchor.js" "$html"; then
+    if [ ! -f "$bundle" ]; then
+        echo "inject-ime-anchor-script: missing Selkies bundle beside $html" >&2
+        exit 1
+    fi
+
+    for api in window.webrtcInput _compositionStart _compositionUpdate _compositionEnd; do
+        if ! grep -Fq "$api" "$bundle"; then
+            echo "inject-ime-anchor-script: required API $api missing from $bundle" >&2
+            exit 1
+        fi
+    done
+
+    tag_count=$(grep -Fo "$TAG" "$html" | wc -l | tr -d ' ')
+    if [ "$tag_count" -gt 1 ]; then
+        echo "inject-ime-anchor-script: duplicate script tags in $html" >&2
+        exit 1
+    fi
+
+    if [ "$tag_count" -eq 1 ]; then
         echo "inject-ime-anchor-script: already present in $html"
         found=$((found + 1))
         continue
@@ -38,7 +57,8 @@ for html in "$ROOT"/*/index.html; do
     # #overlayInput (or the script's own poll will find it shortly after).
     sed -i "s|</body>|  $TAG\n</body>|" "$html"
 
-    grep -q "wechat-ime-anchor.js" "$html" || {
+    tag_count=$(grep -Fo "$TAG" "$html" | wc -l | tr -d ' ')
+    [ "$tag_count" -eq 1 ] || {
         echo "inject-ime-anchor-script: FAILED to inject into $html" >&2
         exit 1
     }

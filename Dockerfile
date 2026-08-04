@@ -141,10 +141,9 @@ COPY patches/wechat-dragdrop.js /usr/share/selkies/selkies-dashboard/src/wechat-
 COPY patches/inject-dragdrop-script.sh /tmp/inject-dragdrop-script.sh
 RUN sh /tmp/inject-dragdrop-script.sh && rm -f /tmp/inject-dragdrop-script.sh
 
-# anchor the host IME's candidate window to where the user clicked: composition
-# happens in an invisible full-screen <input> whose caret sits at its centre-left,
-# so the candidate list popped up nowhere near WeChat's text box — and the hidden
-# input's value was never cleared, so the anchor also drifted with every message.
+# anchor the host IME's candidate window with a click-local textarea while the
+# original full-screen input remains the mouse/drag surface. Padding the large
+# native input is not a reliable caret anchor on macOS Chromium.
 COPY patches/wechat-ime-anchor.js /usr/share/selkies/selkies-dashboard/src/wechat-ime-anchor.js
 COPY patches/inject-ime-anchor-script.sh /tmp/inject-ime-anchor-script.sh
 RUN sh /tmp/inject-ime-anchor-script.sh && rm -f /tmp/inject-ime-anchor-script.sh

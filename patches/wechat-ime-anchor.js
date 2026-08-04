@@ -1,156 +1,230 @@
 /*
- * Put the host IME's candidate window where the user is actually typing.
+ * Anchor the host IME candidate window to the last click on the stream.
  *
- * All keyboard input for the stream lands in #overlayInput, an invisible
- * <input> stretched over the whole video. The browser anchors the IME
- * composition/candidate popup to that input's caret, and the caret of an
- * empty full-screen input sits at its centre-left — so the candidate list
- * popped up in the middle of nowhere instead of beside WeChat's text box.
- * (Same class of bug as noVNC's IME popup appearing at the screen corner
- * where its hidden input lives.)
+ * Selkies uses one transparent, full-screen input for both mouse events and
+ * composition. Padding that input does not reliably move the native caret on
+ * macOS Chromium: the candidate window is still laid out against the large
+ * form control. Keep that element untouched for pointer math and use a real,
+ * one-line textarea at the click point as the IME focus target instead.
  *
- * Fix: every click on the stream moves the overlay's caret to the click
- * point. The element itself cannot move (it is the mouse-event target for
- * the whole video), but with box-sizing:border-box its *padding* can herd
- * the caret anywhere without changing the element's geometry, which keeps
- * the bundle's mouse math untouched:
- *
- *   horizontal: caret x = padding-left            (value is kept empty)
- *   vertical:   padding-top/-bottom squeeze the content box to one line
- *               height centred on the click y, pinning the caret there
- *
- * The second half of the fix is value hygiene. Nothing ever cleared
- * #overlayInput.value, so every committed phrase accumulated in the hidden
- * input and the caret (= the IME popup) drifted further right with every
- * message typed. The committed text is worthless — the stream types via
- * key events and "co,end" messages, never from this value — so drop it as
- * soon as each composition is over.
- *
- * Runs as a plain script beside the bundle (same pattern as
- * src/wechat-dragdrop.js); nothing minified is touched.
+ * Keyboard events are already captured on window by Selkies. Only the three
+ * composition events need forwarding from the proxy to window.webrtcInput.
  */
 (function () {
   "use strict";
 
   var TAG = "[wechat-ime-anchor]";
+  var PROXY_ID = "wechatImeProxy";
+  var PROXY_WIDTH_PX = 1;
+  var LINE_PX = 20;
+  var DEFAULT_FRAC_X = 0.4;
+  var DEFAULT_FRAC_Y = 0.85;
 
-  // Read-only viewers get no keyboard input; match wechat-dragdrop's guard.
   if (String(location.hash).indexOf("shared") !== -1 ||
       String(location.hash).indexOf("player") !== -1) {
     return;
   }
 
-  // Keep a page-level margin so the caret (and the popup anchored to it)
-  // never gets pinned into a border where the popup would cover the text.
-  var EDGE_PX = 24;
-  // Height the content box is squeezed to; must stay >= the caret's line
-  // height (14px font => ~17px) or the browser would refuse the padding.
-  var LINE_PX = 20;
-
-  // Until the first click, anchor roughly where a maximized WeChat puts its
-  // message box, so even the very first composition pops up near it.
-  var fracX = 0.4;
-  var fracY = 0.85;
+  if (window.__wechatImeAnchorInstalled) return;
+  window.__wechatImeAnchorInstalled = true;
 
   var overlay = null;
+  var proxy = null;
+  var fracX = DEFAULT_FRAC_X;
+  var fracY = DEFAULT_FRAC_Y;
   var composing = false;
+  var warnedMissingHandler = false;
 
-  function applyAnchor() {
-    if (!overlay) return;
-    var rect = overlay.getBoundingClientRect();
-    if (rect.width < EDGE_PX * 2 || rect.height < EDGE_PX * 2) return;
+  function clamp(value, low, high) {
+    return Math.min(Math.max(value, low), high);
+  }
 
-    var x = Math.min(Math.max(fracX * rect.width, EDGE_PX), rect.width - EDGE_PX);
-    var y = Math.min(Math.max(fracY * rect.height, EDGE_PX), rect.height - EDGE_PX);
-
-    // Squeeze the content box down to a single line height centred on the
-    // click y. With the content box exactly one line tall the caret sits at
-    // (padTop + LINE_PX/2) no matter how the browser vertically aligns text
-    // inside an input, so this does not depend on Chrome's centring rule.
-    var h = rect.height;
-    var padTop = Math.max(0, Math.min(y - LINE_PX / 2, h - LINE_PX));
-    var padBottom = Math.max(0, h - padTop - LINE_PX);
-
-    // border-box: padding moves the caret, never the element's box, so the
-    // bundle's coordinate math and the resize handler stay correct.
-    overlay.style.boxSizing = "border-box";
-    // A predictable caret rect for the popup to anchor to; the element is
-    // opacity:0 so none of this renders.
-    overlay.style.fontSize = "14px";
-    overlay.style.paddingLeft = Math.round(x) + "px";
-    overlay.style.paddingRight = "0px";
-    overlay.style.paddingTop = Math.round(padTop) + "px";
-    overlay.style.paddingBottom = Math.round(padBottom) + "px";
+  function getInputHandler(silent) {
+    var handler = window.webrtcInput;
+    if (!handler ||
+        typeof handler._compositionStart !== "function" ||
+        typeof handler._compositionUpdate !== "function" ||
+        typeof handler._compositionEnd !== "function") {
+      if (!silent && !warnedMissingHandler) {
+        warnedMissingHandler = true;
+        console.warn(TAG, "Selkies composition handler is unavailable");
+      }
+      return null;
+    }
+    warnedMissingHandler = false;
+    return handler;
   }
 
   function clearValue() {
-    // Never while the IME is mid-composition: yanking the value out from
-    // under it would cancel or scramble the pre-edit.
-    if (overlay && !composing && overlay.value) {
-      overlay.value = "";
+    if (proxy && !composing && proxy.value) {
+      proxy.value = "";
     }
   }
 
-  function onMouseDown(e) {
-    if (!overlay || e.target !== overlay) return;
+  function positionProxy() {
+    if (!overlay || !proxy || !overlay.parentElement) return;
+
+    var overlayRect = overlay.getBoundingClientRect();
+    var parentRect = overlay.parentElement.getBoundingClientRect();
+    if (overlayRect.width <= 0 || overlayRect.height <= 0) return;
+
+    var anchorX = overlayRect.left + clamp(fracX, 0, 1) * overlayRect.width;
+    var anchorY = overlayRect.top + clamp(fracY, 0, 1) * overlayRect.height;
+    var minLeft = overlayRect.left - parentRect.left;
+    var maxLeft = overlayRect.right - parentRect.left - PROXY_WIDTH_PX;
+    var minTop = overlayRect.top - parentRect.top;
+    var maxTop = overlayRect.bottom - parentRect.top - LINE_PX;
+
+    var left = clamp(anchorX - parentRect.left, minLeft, Math.max(minLeft, maxLeft));
+    var top = clamp(anchorY - parentRect.top - LINE_PX / 2,
+                    minTop, Math.max(minTop, maxTop));
+
+    proxy.style.left = Math.round(left) + "px";
+    proxy.style.top = Math.round(top) + "px";
+  }
+
+  function focusProxy() {
+    if (!proxy) return;
+    clearValue();
+    try {
+      proxy.focus({ preventScroll: true });
+    } catch (e) {
+      proxy.focus();
+    }
+    try {
+      var end = proxy.value.length;
+      proxy.setSelectionRange(end, end);
+    } catch (e) {
+      // Selection APIs can be unavailable while the document is losing focus.
+    }
+  }
+
+  function forwardComposition(method, event) {
+    var handler = getInputHandler();
+    if (!handler) return false;
+    handler[method].call(handler, event);
+    return true;
+  }
+
+  function onMouseDown(event) {
+    if (!overlay || !proxy || event.target !== overlay || event.button !== 0) {
+      return;
+    }
+
     var rect = overlay.getBoundingClientRect();
     if (rect.width > 0 && rect.height > 0) {
-      fracX = (e.clientX - rect.left) / rect.width;
-      fracY = (e.clientY - rect.top) / rect.height;
+      fracX = clamp((event.clientX - rect.left) / rect.width, 0, 1);
+      fracY = clamp((event.clientY - rect.top) / rect.height, 0, 1);
     }
-    clearValue();
-    applyAnchor();
+    positionProxy();
+
+    // Do not prevent or stop this event: Selkies must still deliver the click
+    // and drag to the remote desktop. Focus after the input's default action,
+    // otherwise Chromium focuses #overlayInput again at the end of mousedown.
+    setTimeout(focusProxy, 0);
+  }
+
+  function createProxy(parent) {
+    var existing = document.getElementById(PROXY_ID);
+    if (existing) {
+      if (existing.tagName !== "TEXTAREA") {
+        console.warn(TAG, "#" + PROXY_ID + " exists but is not a textarea");
+        return null;
+      }
+      return existing;
+    }
+
+    var textarea = document.createElement("textarea");
+    textarea.id = PROXY_ID;
+    textarea.rows = 1;
+    textarea.wrap = "off";
+    textarea.tabIndex = -1;
+    textarea.autocomplete = "off";
+    textarea.setAttribute("autocorrect", "off");
+    textarea.setAttribute("autocapitalize", "off");
+    textarea.setAttribute("spellcheck", "false");
+    textarea.setAttribute("aria-label", "Remote desktop IME input");
+
+    var style = textarea.style;
+    style.position = "absolute";
+    style.left = "0px";
+    style.top = "0px";
+    style.width = PROXY_WIDTH_PX + "px";
+    style.height = LINE_PX + "px";
+    style.boxSizing = "border-box";
+    style.padding = "0";
+    style.border = "0";
+    style.margin = "0";
+    style.outline = "0";
+    style.resize = "none";
+    style.overflow = "hidden";
+    style.whiteSpace = "nowrap";
+    style.fontSize = "16px";
+    style.lineHeight = LINE_PX + "px";
+    style.opacity = "0";
+    style.color = "transparent";
+    style.background = "transparent";
+    style.caretColor = "transparent";
+    style.pointerEvents = "none";
+    style.zIndex = "4";
+
+    parent.appendChild(textarea);
+    return textarea;
   }
 
   function attach(ov) {
     overlay = ov;
 
-    // Capture phase and window-level: the bundle stops propagation of some
-    // events on the overlay, but composition/mousedown reach us regardless.
+    // Remove the previous padding-based fix if this script is loaded into a
+    // page that was patched in place during development.
+    overlay.style.removeProperty("box-sizing");
+    overlay.style.removeProperty("font-size");
+    overlay.style.removeProperty("padding-left");
+    overlay.style.removeProperty("padding-right");
+    overlay.style.removeProperty("padding-top");
+    overlay.style.removeProperty("padding-bottom");
+
+    proxy = createProxy(overlay.parentElement);
+    if (!proxy) return;
+
     window.addEventListener("mousedown", onMouseDown, true);
 
-    window.addEventListener("compositionstart", function (e) {
-      if (e.target === overlay) composing = true;
-    }, true);
-
-    window.addEventListener("compositionend", function (e) {
-      if (e.target !== overlay) return;
+    proxy.addEventListener("compositionstart", function (event) {
+      composing = forwardComposition("_compositionStart", event);
+    });
+    proxy.addEventListener("compositionupdate", function (event) {
+      forwardComposition("_compositionUpdate", event);
+    });
+    proxy.addEventListener("compositionend", function (event) {
+      forwardComposition("_compositionEnd", event);
       composing = false;
-      // The browser inserts the committed text into the value after this
-      // event; clear once that has happened (guarded in clearValue if a new
-      // composition started in the meantime).
       setTimeout(clearValue, 0);
-    }, true);
-
-    // Non-composition insertions (e.g. emoji picker, paste into the page)
-    // would otherwise accumulate exactly like commits did.
-    overlay.addEventListener("input", function (e) {
-      if (!e.isComposing) setTimeout(clearValue, 0);
+    });
+    proxy.addEventListener("input", function (event) {
+      if (!event.isComposing) setTimeout(clearValue, 0);
     });
 
-    // The bundle rewrites the overlay's size on every resize; padding
-    // survives, but its clamping needs to be redone for the new box.
     window.addEventListener("resize", function () {
-      setTimeout(applyAnchor, 100);
+      setTimeout(positionProxy, 100);
     });
 
-    applyAnchor();
-    console.log(TAG, "anchoring IME popup to clicks on #overlayInput");
+    positionProxy();
+    console.log(TAG, "using a click-local textarea for IME composition");
   }
 
   function boot() {
     var tries = 0;
-    var t = setInterval(function () {
+    var timer = setInterval(function () {
       tries++;
       var ov = document.getElementById("overlayInput");
-      if (ov) {
-        clearInterval(t);
+      if (ov && ov.parentElement && getInputHandler(true)) {
+        clearInterval(timer);
         attach(ov);
-      } else if (tries > 120) {
-        clearInterval(t);
-        console.warn(TAG, "gave up waiting for #overlayInput");
+      } else if (tries > 240) {
+        clearInterval(timer);
+        console.warn(TAG, "gave up waiting for Selkies input initialization");
       }
-    }, 500);
+    }, 250);
   }
 
   if (document.readyState === "loading") {
