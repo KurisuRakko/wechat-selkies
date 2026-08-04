@@ -49,10 +49,18 @@ esac
 
 # Anchored so the WeChatAppEx mini-program runtime is not matched.
 WECHAT_CLASS='^wechat$'
-# The login/QR window is ~560x760 and dialogs ~564x516; requiring both axes above
-# this means neither can ever be treated as the main window.
+# Only the MAIN window is ever touched. The login/QR window is ~560x760 and modal
+# dialogs ~564x516, so requiring both axes above this floor means neither they nor
+# any other WeChat window can be picked up and resized.
 MIN_W=600
 MIN_H=600
+# WeChat's systray icon is a 24x24 override-redirect window that also carries
+# WM_CLASS "wechat", and xdotool --onlyvisible reports it as visible (it is
+# IsViewable, reparented into stalonetray). Anything at or below this size is
+# therefore chrome, not a window the user can see or interact with — used to tell
+# "the login screen is up" apart from "everything is hidden in the tray".
+MIN_REAL_W=200
+MIN_REAL_H=200
 # Counts as maximized at this fraction of the screen. Not 100%: openbox runs with
 # noStrut so a maximized window is full-screen, but leave slack for rounding.
 MAX_W_PCT=95
@@ -83,11 +91,13 @@ is_modal() {
     xprop -id "$1" _NET_WM_STATE 2>/dev/null | grep -q '_NET_WM_STATE_MODAL'
 }
 
-# Largest non-modal class=wechat window at or above the size floor.
+# Largest non-modal class=wechat window at or above a size floor.
 # $1: "visible" restricts to mapped windows; "any" includes unmapped ones, which
 #     is what tray recovery needs.
-find_main_window() {
-    local scope="$1" search_args wid w h area best best_area
+# $2/$3: minimum width/height, defaulting to the main-window floor.
+find_window() {
+    local scope="$1" min_w="${2:-$MIN_W}" min_h="${3:-$MIN_H}"
+    local search_args wid w h area best best_area
     if [ "$scope" = "visible" ]; then
         search_args="--onlyvisible"
     else
@@ -100,7 +110,7 @@ find_main_window() {
         set -- $(win_geom "$wid")
         w="$1"; h="$2"
         [ -n "$w" ] && [ -n "$h" ] || continue
-        [ "$w" -ge "$MIN_W" ] && [ "$h" -ge "$MIN_H" ] || continue
+        [ "$w" -ge "$min_w" ] && [ "$h" -ge "$min_h" ] || continue
         area=$((w * h))
         if [ "$area" -gt "$best_area" ]; then
             best_area="$area"
@@ -168,29 +178,42 @@ while true; do
         continue   # no display yet
     fi
 
-    if wid=$(find_main_window visible); then
+    if wid=$(find_window visible); then
         if [ "$FORCE_MAX" = "true" ] && ! geometry_is_maximized "$wid" "$SW" "$SH"; then
             maximize "$wid" "$SW" "$SH"
         fi
         continue
     fi
 
-    # No main window mapped. If any class=wechat window is visible it is the
-    # login/QR screen — leave that alone, auto-login deals with it.
-    if [ -n "$(xdotool search --onlyvisible --class "$WECHAT_CLASS" 2>/dev/null)" ]; then
+    # No main window mapped. If a real (non-tray-sized) WeChat window is visible,
+    # that is the login/QR screen — leave it alone, auto-login deals with it.
+    #
+    # The size floor here is load-bearing: WeChat's 24x24 systray icon also has
+    # WM_CLASS "wechat" and xdotool --onlyvisible reports it as visible, so a bare
+    # "is anything visible?" test is satisfied forever and the recovery below never
+    # runs. That was the actual reason closing the window did not restore it.
+    if find_window visible "$MIN_REAL_W" "$MIN_REAL_H" >/dev/null; then
         continue
     fi
 
-    # Nothing visible at all: WeChat hid to the tray. Map the main window back.
-    # The previous version never reached this branch — its "is any window up?"
-    # check matched by title and so was satisfied by the unmapped ghost window.
-    if hidden=$(find_main_window any); then
-        log "window: nothing visible, mapping $hidden back from the tray"
+    # Only the tray icon is left: WeChat unmapped its main window rather than
+    # exiting. Verified on a live container that the window survives as
+    # IsUnMapped and that re-running /usr/bin/wechat does NOT bring it back, so
+    # windowmap is the recovery.
+    if hidden=$(find_window any); then
+        log "window: only the tray icon is visible, mapping $hidden back"
         xdotool windowmap "$hidden" 2>/dev/null
         xdotool windowactivate "$hidden" 2>/dev/null
         sleep 1
+        if xwininfo -id "$hidden" 2>/dev/null | grep -q "IsViewable"; then
+            log "window: $hidden restored ($(win_geom "$hidden"))"
+        else
+            log "window: windowmap did not stick for $hidden"
+        fi
         if [ "$FORCE_MAX" = "true" ] && ! geometry_is_maximized "$hidden" "$SW" "$SH"; then
             maximize "$hidden" "$SW" "$SH"
         fi
+    else
+        log "window: nothing visible and no hidden main window found"
     fi
 done
