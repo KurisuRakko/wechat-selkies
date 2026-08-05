@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from wechat_history.errors import HistoryError
-from wechat_history.reply import CommandRunner, ReplyPreparer
+from wechat_history.reply import CommandRunner, ReplyPreparer, find_wechat_window
 
 
 class FakeReader:
@@ -118,6 +118,26 @@ class ReplyTests(unittest.TestCase):
                 preparer.prepare("filehelper", "不得粘贴")
         self.assertEqual(raised.exception.code, "WECHAT_DIALOG_VISIBLE")
         self.assertEqual(runner.paste_count, 0)
+
+    def test_systray_icon_is_not_mistaken_for_a_dialog(self) -> None:
+        # The live container always has a 24x24 override-redirect window with
+        # WM_CLASS "wechat" alongside the main one, so counting every visible
+        # window made the dialog check fire on every single request.
+        runner = FakeRunner()
+        original_output = runner.output
+
+        def with_tray_icon(arguments: list[str], *, input_data: bytes | None = None) -> bytes:
+            if arguments[:4] == ["xdotool", "search", "--onlyvisible", "--class"]:
+                runner.commands.append(arguments)
+                return b"123\n456\n"
+            if arguments[:2] == ["xdotool", "getwindowgeometry"] and arguments[-1] == "456":
+                runner.commands.append(arguments)
+                return b"WINDOW=456\nX=4\nY=4\nWIDTH=24\nHEIGHT=24\n"
+            return original_output(arguments, input_data=input_data)
+
+        runner.output = with_tray_icon  # type: ignore[method-assign]
+        window = find_wechat_window(runner)
+        self.assertEqual(window.window_id, "123")
 
 
 if __name__ == "__main__":

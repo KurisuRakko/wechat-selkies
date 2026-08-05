@@ -14,6 +14,13 @@ from .errors import HistoryError, fail
 from .reader import HistoryReader
 
 
+# WeChat keeps a 24x24 override-redirect systray window that carries the same
+# WM_CLASS as the main window and that xdotool --onlyvisible always reports as
+# visible. Anything below this edge is that icon, never a dialog. Same floor and
+# same trap as scripts/wechat/wechat-window-watchdog.sh (MIN_REAL_W/MIN_REAL_H).
+TRAY_ICON_MAX_EDGE = 200
+
+
 @dataclass(frozen=True, slots=True)
 class ClipboardSnapshot:
     target: str | None
@@ -138,11 +145,12 @@ def find_wechat_window(runner: CommandRunner) -> WeChatWindow:
     except (OSError, subprocess.SubprocessError) as exc:
         raise fail("WECHAT_NOT_VISIBLE", "找不到可见的微信主窗口") from exc
     candidates: list[WeChatWindow] = []
-    visible_ids: list[str] = []
+    seen_ids: list[str] = []
+    real_ids: list[str] = []
     for window_id in (line.strip() for line in raw_ids.splitlines()):
-        if not window_id.isdigit() or window_id in visible_ids:
+        if not window_id.isdigit() or window_id in seen_ids:
             continue
-        visible_ids.append(window_id)
+        seen_ids.append(window_id)
         try:
             geometry = runner.output(
                 ["xdotool", "getwindowgeometry", "--shell", window_id]
@@ -157,11 +165,14 @@ def find_wechat_window(runner: CommandRunner) -> WeChatWindow:
             if value.strip().lstrip("-").isdigit():
                 values[key] = int(value)
         width, height = values.get("WIDTH", 0), values.get("HEIGHT", 0)
+        if width < TRAY_ICON_MAX_EDGE or height < TRAY_ICON_MAX_EDGE:
+            continue
+        real_ids.append(window_id)
         if width >= 500 and height >= 600:
             candidates.append(WeChatWindow(window_id, width, height))
     if len(candidates) > 1:
         raise fail("WECHAT_WINDOW_AMBIGUOUS", "检测到多个微信主窗口，拒绝填写草稿")
-    if len(visible_ids) > 1 or (visible_ids and not candidates):
+    if len(real_ids) > 1 or (real_ids and not candidates):
         raise fail("WECHAT_DIALOG_VISIBLE", "检测到微信弹窗；请先在界面中处理后重试")
     if not candidates:
         raise fail("WECHAT_NOT_VISIBLE", "微信窗口尺寸不符合已验证的界面布局")
