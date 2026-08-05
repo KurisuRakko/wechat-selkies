@@ -1,2 +1,7 @@
 /config/
 .env
+# integrations/wechat-history is a real Python package and the Dockerfile COPYs
+# the directory wholesale, so stray bytecode would be committed and then baked
+# into the image. The container itself runs with PYTHONDONTWRITEBYTECODE=1.
+__pycache__/
+*.py[cod]
