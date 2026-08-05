@@ -148,6 +148,24 @@ COPY patches/wechat-ime-anchor.js /usr/share/selkies/selkies-dashboard/src/wecha
 COPY patches/inject-ime-anchor-script.sh /tmp/inject-ime-anchor-script.sh
 RUN sh /tmp/inject-ime-anchor-script.sh && rm -f /tmp/inject-ime-anchor-script.sh
 
+# show whether the stream is actually alive. A half-open websocket never fires
+# close, so the bundle's own reload-on-close reconnect never runs: the picture
+# just stops and the page looks fine. The pill ages the server's stats push
+# locally (clock-skew proof) and, if it goes quiet for 20 s with no upload in
+# flight and the tab visible, reloads — at most three times in ten minutes.
+COPY patches/wechat-connection-status.js /usr/share/selkies/selkies-dashboard/src/wechat-connection-status.js
+COPY patches/inject-connection-status-script.sh /tmp/inject-connection-status-script.sh
+RUN sh /tmp/inject-connection-status-script.sh && rm -f /tmp/inject-connection-status-script.sh
+
+# four named quality presets in the same top bar, instead of eleven encoder
+# knobs. A browser that once stored "H264 (CPU) FullFrame with rate control
+# off" re-imposes it on every reconnect; the presets pin x264enc-striped + CBR
+# and seed the settings before the bundle boots, then apply live through the
+# same postMessage the sidebar uses. The sidebar stays as the advanced view.
+COPY patches/wechat-quality-presets.js /usr/share/selkies/selkies-dashboard/src/wechat-quality-presets.js
+COPY patches/inject-quality-presets-script.sh /tmp/inject-quality-presets-script.sh
+RUN sh /tmp/inject-quality-presets-script.sh && rm -f /tmp/inject-quality-presets-script.sh
+
 # Chromium blocks an AudioContext created during page initialization. Defer the
 # playback context until the first trusted pointer/key/touch gesture, then use a
 # single gate for later resume attempts so every audio packet cannot repeat the
