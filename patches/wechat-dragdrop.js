@@ -3,19 +3,29 @@
  *
  * Two behaviours, neither of which upstream Selkies has:
  *
- *   IN   Drop a file on the stream and it is pasted into whatever WeChat input
- *        has focus. Images go onto the X clipboard as image/png (WeChat is a Qt
- *        app; Qt maps an image/png selection target onto application/x-qt-image,
- *        which is what QMimeData::hasImage() consumes, so Ctrl+V inlines the
- *        picture). Anything else goes on as text/uri-list pointing at the copy
- *        Selkies just uploaded, which Qt surfaces via QMimeData::hasUrls() so
- *        the paste attaches the file.
+ *   IN   Drop a file on the stream and it is uploaded by Selkies' own handler
+ *        to /config/Desktop, then put into WeChat's input box. The paste is
+ *        performed server-side by the wechat-history integration
+ *        (wechat_history/attach.py, reached through the same loopback API the
+ *        notification UI uses), because only something running next to WeChat
+ *        can activate the window, verify focus, click the input box and verify
+ *        focus again before touching the clipboard. This page can only fire a
+ *        blind Ctrl+V at the stream, which is kept solely as a fallback.
  *
  *   OUT  Drag a row out of the sidebar's file list onto the host desktop and it
  *        downloads, using Chromium's DownloadURL DataTransfer format. nginx
  *        already serves /config/Desktop at /files with Content-Disposition:
  *        attachment, so no server-side work is needed. Chromium only — Firefox
  *        has no equivalent.
+ *
+ * History, because it constrains what this file may do: images used to be
+ * base64-encoded here and pushed as ONE `cb,image/png,…` message. In
+ * --mode=websockets that message shares the video socket, and websockets'
+ * server default is max_size=1 MiB — so every screenshot-sized drop was
+ * answered with close code 1009 and took the whole session down, recovered
+ * only by the client's 5 s location.reload() poll. Images now take exactly the
+ * same chunked upload path as every other file. Do not reintroduce a sender
+ * that puts whole file contents in a single stream message.
  *
  * This runs as a plain (non-module) script alongside the bundle, the same way
  * src/universalTouchGamepad.js does, and talks to the stream only through the
@@ -24,8 +34,8 @@
  * hooks or logs that it did not.
  *
  * The upload itself is still done by Selkies' own drop handler; this only adds
- * the clipboard write and the paste. So a dropped file always also lands in
- * /config/Desktop and stays reachable at /files.
+ * the attach request. So a dropped file always also lands in /config/Desktop
+ * and stays reachable at /files, whatever happens afterwards.
  */
 (function () {
   "use strict";
@@ -40,9 +50,17 @@
 
   // xclip is spawned asynchronously on the server, so the selection is not
   // guaranteed to be in place the instant the cb message is sent. Give it a
-  // moment before pressing Ctrl+V. Overridable for debugging.
+  // moment before pressing Ctrl+V. Only used by the fallback path.
   var PASTE_DELAY_MS = Number(window.WECHAT_DRAGDROP_PASTE_DELAY || 500);
   var UPLOAD_DIR = String(window.WECHAT_DRAGDROP_UPLOAD_DIR || "/config/Desktop");
+
+  // The server waits up to 40 s for the file to finish landing plus up to 15 s
+  // for the shared draft lock; nginx gives the whole proxied request 60 s.
+  var ATTACH_TIMEOUT_MS = Number(window.WECHAT_ATTACH_TIMEOUT_MS || 55000);
+  // A drop whose upload never reports back must not stay in the table forever.
+  var PENDING_TTL_MS = 180000;
+  var PENDING_SWEEP_MS = 30000;
+  var TOAST_MS = 5000;
 
   var XK_CONTROL_L = 65507;
   var XK_v = 118;
@@ -62,6 +80,16 @@
   function mimeFor(name) {
     var m = /\.([^.]+)$/.exec(String(name).toLowerCase());
     return (m && EXT_MIME[m[1]]) || "application/octet-stream";
+  }
+
+  // Only a hint for the server: it still decides by magic number whether the
+  // bytes can be inlined as an image, so a wrong guess degrades to a file
+  // attachment rather than pasting garbage.
+  function kindFor(file) {
+    var type = String((file && file.type) || "");
+    if (type.indexOf("image/") === 0) return "image";
+    if (mimeFor(file && file.name).indexOf("image/") === 0) return "image";
+    return "file";
   }
 
   // btoa() cannot take a huge argument list, so chunk it.
@@ -95,54 +123,102 @@
     send("ku," + XK_CONTROL_L);
   }
 
-  // Re-encode to PNG so the advertised image/png target always matches the
-  // bytes. A dropped JPEG/WebP announced as image/png would paste as garbage.
-  function toPngBuffer(file) {
-    return new Promise(function (resolve, reject) {
-      var url = URL.createObjectURL(file);
-      var img = new Image();
-      img.onload = function () {
-        try {
-          var c = document.createElement("canvas");
-          c.width = img.naturalWidth;
-          c.height = img.naturalHeight;
-          c.getContext("2d").drawImage(img, 0, 0);
-          c.toBlob(function (blob) {
-            URL.revokeObjectURL(url);
-            if (!blob) { reject(new Error("canvas.toBlob returned null")); return; }
-            blob.arrayBuffer().then(resolve, reject);
-          }, "image/png");
-        } catch (e) {
-          URL.revokeObjectURL(url);
-          reject(e);
-        }
-      };
-      img.onerror = function () {
-        URL.revokeObjectURL(url);
-        reject(new Error("could not decode " + file.name));
-      };
-      img.src = url;
-    });
-  }
-
   function delay(ms) {
     return new Promise(function (r) { setTimeout(r, ms); });
   }
 
-  function pasteImage(file) {
-    return toPngBuffer(file).then(function (buf) {
-      if (!send("cb,image/png," + bytesToBase64(buf))) return;
-      console.log(TAG, "image on clipboard:", file.name, buf.byteLength, "bytes");
-      return delay(PASTE_DELAY_MS).then(pressCtrlV);
-    });
+  /* ------------------------------------------------------------------ toast */
+
+  // Deliberately not .notification-container: that belongs to the bundle's own
+  // upload progress list, which is repositioned by wechat-connection-status.js.
+  function toast(text) {
+    if (!document.body) return;
+    var bar = document.createElement("div");
+    bar.setAttribute("role", "status");
+    bar.style.cssText = [
+      "position:fixed", "bottom:16px", "right:20px", "z-index:2147483646",
+      "max-width:min(80vw,420px)", "box-sizing:border-box",
+      "padding:9px 13px", "border-radius:8px",
+      "background:rgba(31,31,31,.94)", "color:#fff",
+      "font:13px/1.4 system-ui,-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif",
+      "box-shadow:0 4px 16px rgba(0,0,0,.45)",
+      "word-break:break-all", "pointer-events:none"
+    ].join(";");
+    bar.textContent = text;
+    document.body.appendChild(bar);
+    setTimeout(function () {
+      if (bar.parentNode) bar.parentNode.removeChild(bar);
+    }, TOAST_MS);
   }
 
-  function pasteFileUri(name) {
-    // The uploader keeps the dropped name verbatim under the upload dir.
+  /* --------------------------------------------------------- fallback paste */
+
+  // Best-effort only: blind Ctrl+V into whatever has focus inside the
+  // container. Used when the server-side attach endpoint is not there at all
+  // (a build with INSTALL_WECHAT_HISTORY=false), or is unreachable.
+  function fallbackPaste(name) {
     var uri = "file://" + UPLOAD_DIR + "/" + encodeURIComponent(name) + "\r\n";
     if (!send("cb,text/uri-list," + utf8ToBase64(uri))) return Promise.resolve();
     console.log(TAG, "uri-list on clipboard:", uri.trim());
     return delay(PASTE_DELAY_MS).then(pressCtrlV);
+  }
+
+  /* ---------------------------------------------------------- attach client */
+
+  // Relative to the directory this page is served from, so a SUBFOLDER
+  // deployment reaches the same nginx location the notification UI uses.
+  function attachUrl() {
+    return location.pathname.replace(/[^/]*$/, "") +
+      "wechat-notifications/api/attach";
+  }
+
+  function attachViaApi(name, meta) {
+    var controller = typeof AbortController === "function" ? new AbortController() : null;
+    var timer = setTimeout(function () {
+      if (controller) controller.abort();
+    }, ATTACH_TIMEOUT_MS);
+    var options = {
+      method: "POST",
+      credentials: "same-origin",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        fileName: name,
+        size: Number(meta && meta.size) || 0,
+        kind: (meta && meta.kind) === "image" ? "image" : "file"
+      })
+    };
+    if (controller) options.signal = controller.signal;
+
+    return fetch(attachUrl(), options).then(function (response) {
+      if (response.ok) {
+        toast("已放入微信聊天框: " + name);
+        console.log(TAG, "attached", name);
+        return;
+      }
+      // 409 means the server reached WeChat and refused for a reason it can
+      // describe (upload still in flight, draft lock busy, window not
+      // visible, focus lost). A blind Ctrl+V would not do better and could
+      // paste into the wrong window, so report it instead of falling back.
+      if (response.status === 409) {
+        return response.json().catch(function () { return null; }).then(function (body) {
+          var message = body && body.error && body.error.message;
+          toast("未能放入聊天框（文件已在 Desktop）: " + (message || name));
+          console.warn(TAG, "attach refused", name, body);
+        });
+      }
+      throw new Error("attach API " + response.status);
+    }).catch(function (error) {
+      // No endpoint (a build without the history integration), a 5xx, or the
+      // request never completed. Try the legacy blind paste.
+      console.warn(TAG, "attach failed, falling back to blind paste:", name, error);
+      return fallbackPaste(name);
+    }).then(function () {
+      clearTimeout(timer);
+    }, function (error) {
+      clearTimeout(timer);
+      console.warn(TAG, error);
+    });
   }
 
   /* ---------------------------------------------------------------- drop in */
@@ -150,11 +226,27 @@
   // Files whose upload we are waiting on, keyed by the name the uploader will
   // report back in its fileUpload postMessage.
   var pendingUploads = Object.create(null);
+  // Top-level directory names already announced, so a folder with 200 files
+  // produces one toast rather than 200.
+  var announcedFolders = Object.create(null);
   var chain = Promise.resolve();
 
   function queue(fn) {
     chain = chain.then(fn).catch(function (e) { console.warn(TAG, e); });
     return chain;
+  }
+
+  // Without this, a drop whose upload never reports "end" (the tab was hidden,
+  // the socket died mid-transfer) stays in the table for the life of the page.
+  function sweepPending() {
+    var now = Date.now();
+    var name;
+    for (name in pendingUploads) {
+      if (now - pendingUploads[name].ts > PENDING_TTL_MS) delete pendingUploads[name];
+    }
+    for (name in announcedFolders) {
+      if (now - announcedFolders[name] > PENDING_TTL_MS) delete announcedFolders[name];
+    }
   }
 
   function onDrop(ev) {
@@ -167,14 +259,13 @@
     if (!files.length) return;
 
     files.forEach(function (file) {
-      if (file.type && file.type.indexOf("image/") === 0) {
-        // An image does not need the uploaded copy; paste it straight away.
-        queue(function () { return pasteImage(file); });
-      } else {
-        // A file URI has to point at something that exists, so wait for the
-        // upload Selkies is already performing to finish.
-        pendingUploads[file.name] = true;
-      }
+      // Images included: they go through the same chunked upload as
+      // everything else. See the note at the top of this file.
+      pendingUploads[file.name] = {
+        size: Number(file.size) || 0,
+        kind: kindFor(file),
+        ts: Date.now()
+      };
     });
   }
 
@@ -183,14 +274,31 @@
     var d = ev.data;
     if (!d || d.type !== "fileUpload" || !d.payload) return;
     var p = d.payload, name = p.fileName;
-    if (!name || !pendingUploads[name]) return;
+    if (!name) return;
+
+    // A folder drop reports each member as "<top>/…/<leaf>". Those land under
+    // /config/Desktop/<top>/ rather than directly in it, so there is nothing
+    // single-file attach can be pointed at.
+    if (String(name).indexOf("/") !== -1) {
+      if (p.status !== "end") return;
+      var top = String(name).split("/")[0];
+      delete pendingUploads[top];
+      if (announcedFolders[top]) return;
+      announcedFolders[top] = Date.now();
+      toast("文件夹已上传到 Desktop/" + top + "（未自动放入聊天框）");
+      return;
+    }
+
+    var meta = pendingUploads[name];
+    if (!meta) return;
 
     if (p.status === "end") {
       delete pendingUploads[name];
-      queue(function () { return pasteFileUri(name); });
+      if (!meta.size && Number(p.fileSize) > 0) meta.size = Number(p.fileSize);
+      queue(function () { return attachViaApi(name, meta); });
     } else if (p.status === "error") {
       delete pendingUploads[name];
-      console.warn(TAG, "upload failed, not pasting:", name, p.message);
+      console.warn(TAG, "upload failed, not attaching:", name, p.message);
     }
   }
 
@@ -383,6 +491,7 @@
         clearInterval(t);
         watchFileIframes();
         watchUrlQueue();
+        setInterval(sweepPending, PENDING_SWEEP_MS);
         console.log(TAG, "ready (paste delay " + PASTE_DELAY_MS + "ms, upload dir " + UPLOAD_DIR +
           ", url poll " + URL_POLL_MS + "ms)");
       } else if (tries > 120) {

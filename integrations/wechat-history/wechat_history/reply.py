@@ -110,6 +110,17 @@ class Clipboard:
         except (OSError, subprocess.SubprocessError) as exc:
             raise fail("CLIPBOARD_FAILED", "无法设置 X11 剪贴板") from exc
 
+    def set_target(self, target: str, data: bytes) -> None:
+        """Own the clipboard for an arbitrary X11 target (image, uri-list, …)."""
+
+        try:
+            self.runner.action(
+                ["xclip", "-selection", "clipboard", "-t", target, "-i"],
+                input_data=data,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise fail("CLIPBOARD_FAILED", "无法设置 X11 剪贴板") from exc
+
     def get_text(self) -> str:
         try:
             return self.runner.output(

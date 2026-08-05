@@ -22,6 +22,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from pywebpush import WebPushException, webpush_async
 
+from .attach import AttachPreparer
 from .constants import TARGET_USERNAME
 from .errors import HistoryError
 from .formatting import decompress_content
@@ -840,6 +841,13 @@ async def _json_body(request: web.Request) -> object:
 
 def create_app(runtime: NotificationRuntime) -> web.Application:
     app = web.Application(client_max_size=MAX_API_BODY_BYTES)
+    # Drag-and-drop attachment. Deliberately independent of the history reader
+    # and its monitor, so a stale key or a pending re-decrypt cannot stop a
+    # dropped file from reaching the input box.
+    attach_preparer = AttachPreparer()
+    # Serializes attach requests inside this process; the flock inside
+    # AttachPreparer covers the MCP server drafting a reply at the same time.
+    attach_lock = asyncio.Lock()
 
     async def config(_: web.Request) -> web.Response:
         return web.json_response(
@@ -889,10 +897,34 @@ def create_app(runtime: NotificationRuntime) -> web.Application:
         asyncio.create_task(runtime.sender.send_one(item, event))
         return web.json_response({"ok": True}, status=202)
 
+    async def attach(request: web.Request) -> web.Response:
+        _request_origin(request)
+        body = await _json_body(request)
+        if not isinstance(body, dict):
+            raise web.HTTPBadRequest(text="object body required")
+        file_name = body.get("fileName")
+        size = body.get("size")
+        kind = body.get("kind")
+        if not isinstance(file_name, str) or not file_name:
+            raise web.HTTPBadRequest(text="fileName required")
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            raise web.HTTPBadRequest(text="size must be a non-negative integer")
+        if kind not in ("image", "file"):
+            raise web.HTTPBadRequest(text="kind must be image or file")
+        async with attach_lock:
+            try:
+                result = await asyncio.to_thread(
+                    attach_preparer.attach, file_name, size, kind
+                )
+            except HistoryError as exc:
+                return web.json_response(exc.payload(), status=409)
+        return web.json_response(result)
+
     app.router.add_get("/wechat-notifications/api/config", config)
     app.router.add_put("/wechat-notifications/api/subscription", put_subscription)
     app.router.add_delete("/wechat-notifications/api/subscription", delete_subscription)
     app.router.add_post("/wechat-notifications/api/test", test_subscription)
+    app.router.add_post("/wechat-notifications/api/attach", attach)
 
     async def lifecycle(_: web.Application):
         await runtime.start()
