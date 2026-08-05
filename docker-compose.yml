@@ -18,6 +18,7 @@ services:
       - PGID=${PGID:-100}               # set group id according to your system
       - CUSTOM_USER=${CUSTOM_USER:-}    # recommended to set a custom user name
       - PASSWORD=${PASSWORD:-}          # recommended to set a password for selkies web ui
+      - SELKIES_ENABLE_RATE_CONTROL=${SELKIES_ENABLE_RATE_CONTROL:-true}  # let the quality presets' CBR bitrate cap actually apply
       - ENABLE_WECHAT_NIGHTLY_RESTART=${ENABLE_WECHAT_NIGHTLY_RESTART:-false}
       - WECHAT_NIGHTLY_STOP_TIME=${WECHAT_NIGHTLY_STOP_TIME:-23:30}
       - WECHAT_NIGHTLY_START_TIME=${WECHAT_NIGHTLY_START_TIME:-01:30}

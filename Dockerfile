@@ -196,6 +196,20 @@ RUN /lsiopy/bin/python3 /tmp/patch-upload-client.py && rm -f /tmp/patch-upload-c
 COPY patches/upload-and-stats-fixes.py /tmp/upload-and-stats-fixes.py
 RUN /lsiopy/bin/python3 /tmp/upload-and-stats-fixes.py && rm -f /tmp/upload-and-stats-fixes.py
 
+# stop horizontal tearing in the striped (x264enc-striped) video path. pixelflux
+# cuts each frame into horizontal Y-stripes and the bundle runs one VideoDecoder
+# per stripe, pushing every decoded output into one global paint queue that the
+# render loop flushes unconditionally on every rAF — so frame N's top half and
+# frame N+1's bottom half can land in the same paint pass. This tracks the real
+# frame id per stripe (the bundle's own vncFrameID is bound stale at decoder
+# creation) and only lets a frame paint once every stripe belonging to it has
+# arrived, with a short timeout so an incomplete frame never freezes the picture.
+COPY patches/wechat-frame-assembler.js /usr/share/selkies/selkies-dashboard/src/wechat-frame-assembler.js
+COPY patches/inject-frame-assembler-script.sh /tmp/inject-frame-assembler-script.sh
+RUN sh /tmp/inject-frame-assembler-script.sh && rm -f /tmp/inject-frame-assembler-script.sh
+COPY patches/patch-frame-assembly.py /tmp/patch-frame-assembly.py
+RUN /lsiopy/bin/python3 /tmp/patch-frame-assembly.py && rm -f /tmp/patch-frame-assembly.py
+
 # open links from WeChat in the viewer's own browser. The container has no browser
 # at all, so Qt's first choice — xdg-open on PATH — currently fails silently and a
 # clicked link does nothing. /usr/local/bin precedes /usr/bin in the container
@@ -205,6 +219,12 @@ COPY patches/xdg-open-forward.sh /usr/local/bin/xdg-open
 RUN chmod 0755 /usr/local/bin/xdg-open
 # Consulted by non-Qt callers, and by Qt after xdg-open; point it at the shim too.
 ENV BROWSER="/usr/local/bin/xdg-open"
+
+# selkies.py only forwards a client's rate_control_mode (cbr/crf) to the encoder
+# when this is enabled; otherwise it silently drops the setting and always runs
+# CRF, so the four quality presets' "cbr" ceiling never takes effect and the
+# encoder can burst without bound.
+ENV SELKIES_ENABLE_RATE_CONTROL="true"
 
 # set app name
 ENV TITLE="WeChat-Selkies"
