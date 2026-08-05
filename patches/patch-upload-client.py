@@ -36,6 +36,19 @@ from pathlib import Path
 
 
 CORE_REL = "src/selkies-core.js"
+# /usr/share/selkies holds more than one dashboard: the default
+# `selkies-dashboard` and the stock alternate `selkies-dashboard-wish`, both
+# carrying src/selkies-core.js and their own bundle. (`web/` is a third copy,
+# but init-nginx deletes and recreates it from $DASHBOARD on every container
+# start, so it does not exist at build time and must never be patched.)
+#
+# Only the dashboard this image customises is patched, identified the same way
+# patch-audio-autoplay.py identifies it: by one of the scripts the Dockerfile
+# has already copied into it. The alternate dashboard receives none of the
+# WeChat integration — no dragdrop bridge, no IME anchor, no audio gate — so
+# fixing its uploader alone would be pointless, and it is unreachable without
+# setting DASHBOARD by hand.
+MARKER_REL = "src/wechat-dragdrop.js"
 
 # const T=10*1024*1024,D=50,$=new FileReader   (core)
 # const be=10*1024*1024,Re=50,tt=new FileReader (vite bundle)
@@ -152,11 +165,14 @@ def patch_root(root: Path) -> None:
     dashboards = []
     for html in root.glob("*/index.html"):
         dashboard = html.parent
-        if (dashboard / CORE_REL).is_file():
+        if (dashboard / CORE_REL).is_file() and (dashboard / MARKER_REL).is_file():
             dashboards.append(dashboard)
 
     if len(dashboards) != 1:
-        fail(f"expected exactly one dashboard carrying {CORE_REL}, found {len(dashboards)}")
+        fail(
+            f"expected exactly one dashboard carrying both {CORE_REL} and "
+            f"{MARKER_REL}, found {len(dashboards)}"
+        )
     patch_dashboard(dashboards[0])
 
 
