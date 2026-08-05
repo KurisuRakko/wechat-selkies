@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Build-time patches for three ways this Selkies build loses keystrokes.
+"""Build-time patches for three ways this Selkies build loses keystrokes,
+plus the frame-id bookkeeping bug that freezes the picture instead.
 
-Applied with exact-string replacement rather than sed: all three targets are
+Applied with exact-string replacement rather than sed: every target is
 indentation-sensitive Python, where a regex that half-matches would produce a
 file that still imports but behaves differently.
 
@@ -508,6 +509,45 @@ patch(
 )
 
 
+# --------------------------------------------------------------------------- 4
+# A pipeline restart fakes a ~65000-frame desync and blacks the screen out.
+#
+# _reset_frame_ids_and_notify zeroes last_sent_frame_id whenever the capture
+# pipeline restarts (a browser window resize is enough). A CLIENT_FRAME_ACK
+# still in flight from the *old* pipeline then lands and refills
+# acknowledged_frame_id with a high id, so this loop sees server_id < client_id
+# with a small absolute gap — under FRAME_ID_SUSPICIOUS_GAP_THRESHOLD, so the
+# rebase guard a few lines above does not fire — and falls into the uint16
+# wraparound arm, which computes (65535 - client_id) + server_id + 1 ≈ 65000
+# frames of desync. Backpressure engages permanently and the user sees a frozen
+# or black screen until something forces it back off.
+#
+# The wraparound arm is unreachable in the case it was written for: a real
+# uint16 wrap means client_id is near 65535 and server_id near 0, i.e. a gap far
+# larger than the suspicious-gap threshold, which is caught and rebased above.
+# So every value it ever produces here is wrong. Treat server_id < client_id as
+# what it actually is — counters that no longer share an origin — and rebase the
+# stall timer instead, exactly like the suspicious-gap guard does.
+
+patch(
+    "selkies.py",
+    "frame-id reset does not trigger backpressure",
+    """                frame_desync = (server_id - client_id) if server_id >= client_id else ((MAX_UINT16_FRAME_ID - client_id) + server_id + 1)
+""",
+    """                if server_id < client_id:
+                    # Counters were reset out from under an in-flight ACK.
+                    # Anything computed from these two ids is meaningless.
+                    if not display_state.get('backpressure_enabled', True):
+                        data_logger.info(f"Backpressure LIFTED for '{display_id}'. S:{server_id}, C:{client_id} (frame-id counters reset).")
+                    display_state['backpressure_enabled'] = True
+                    display_state['last_ack_update_time'] = time.monotonic()
+                    continue
+
+                frame_desync = server_id - client_id
+""",
+)
+
+
 # The bundled .pyc files would otherwise be consulted first. Python invalidates
 # them on the source mtime, which we just changed, but drop them so nothing can
 # shadow the patched source.
@@ -517,4 +557,4 @@ if os.path.isdir(cache):
         os.remove(os.path.join(cache, name))
     os.rmdir(cache)
 
-print("input-and-backpressure-fixes: 4 patch(es) applied")
+print("input-and-backpressure-fixes: 5 patch(es) applied")

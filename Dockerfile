@@ -165,6 +165,19 @@ RUN /lsiopy/bin/python3 /tmp/patch-audio-autoplay.py && rm -f /tmp/patch-audio-a
 COPY patches/input-and-backpressure-fixes.py /tmp/input-and-backpressure-fixes.py
 RUN /lsiopy/bin/python3 /tmp/input-and-backpressure-fixes.py && rm -f /tmp/input-and-backpressure-fixes.py
 
+# stop an upload from freezing the picture and killing the session. In
+# --mode=websockets video, audio, input, clipboard and file bytes all share one
+# socket, and the stock uploader lets 10 MiB of file data queue ahead of every
+# keystroke, frame ACK and pong. Cap the client-side queue at 256 KiB, take the
+# blocking chunk write off the server's event loop, raise the 1 MiB frame
+# ceiling that closes the connection with 1009, and forward the already
+# collected stats once a second so the status pill can tell a slow link from a
+# dead one.
+COPY patches/patch-upload-client.py /tmp/patch-upload-client.py
+RUN /lsiopy/bin/python3 /tmp/patch-upload-client.py && rm -f /tmp/patch-upload-client.py
+COPY patches/upload-and-stats-fixes.py /tmp/upload-and-stats-fixes.py
+RUN /lsiopy/bin/python3 /tmp/upload-and-stats-fixes.py && rm -f /tmp/upload-and-stats-fixes.py
+
 # open links from WeChat in the viewer's own browser. The container has no browser
 # at all, so Qt's first choice — xdg-open on PATH — currently fails silently and a
 # clicked link does nothing. /usr/local/bin precedes /usr/bin in the container
