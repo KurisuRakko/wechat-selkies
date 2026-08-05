@@ -12,7 +12,7 @@ function flush() {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
-function pageContext(hash = "") {
+function pageContext(hash = "", { config: configPayload = null } = {}) {
   const elements = new Map();
   const fetches = [];
   const storage = new Map();
@@ -87,7 +87,7 @@ function pageContext(hash = "") {
       fetches.push({ url, options });
       let payload = { ok: true };
       if (url.endsWith("/config")) {
-        payload = {
+        payload = configPayload || {
           ready: true,
           vapidPublicKey: Buffer.from(Buffer.concat([Buffer.from([4]), Buffer.alloc(64, 2)]))
             .toString("base64url")
@@ -129,6 +129,27 @@ async function testPageEnrollment() {
   assert.strictEqual(JSON.parse(put.options.body).endpoint, "https://push.example/send/1");
   assert(fixture.fetches.some((entry) => entry.url.endsWith("/test")));
   assert.strictEqual(fixture.storage.get("wechatNotificationsEnabled"), "1");
+}
+
+async function testNotReadyShowsBackendReason() {
+  const fixture = pageContext("", {
+    config: {
+      ready: false,
+      vapidPublicKey: "",
+      error: { code: "KEY_STALE", message: "保存的密钥已失效；请显式重新扫描" }
+    }
+  });
+  vm.runInContext(pageSource, fixture.context, { filename: "wechat-notifications.js" });
+  const banner = fixture.elements.get("wechatNotificationsBanner");
+  await banner._wechatButton.onclick();
+  await flush();
+  await flush();
+  assert(
+    banner._wechatText.textContent.includes("保存的密钥已失效"),
+    "banner must surface the backend's failure reason"
+  );
+  assert.strictEqual(banner._wechatButton.textContent, "重试");
+  assert.strictEqual(fixture.storage.get("wechatNotificationsEnabled"), undefined);
 }
 
 function testViewerIsExcluded() {
@@ -232,6 +253,7 @@ async function testWorkerClickAndRenewal() {
 
 (async function main() {
   await testPageEnrollment();
+  await testNotReadyShowsBackendReason();
   testViewerIsExcluded();
   await testWorkerForegroundAndBackground();
   await testWorkerClickAndRenewal();

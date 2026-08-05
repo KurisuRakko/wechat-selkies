@@ -64,7 +64,8 @@
         await new Promise(function (resolve) { setTimeout(resolve, 1000); });
       }
     }
-    throw new Error("微信消息读取器尚未就绪");
+    var reason = config && config.error && config.error.message;
+    throw new Error(reason ? "微信消息读取器尚未就绪：" + reason : "微信消息读取器尚未就绪");
   }
 
   async function ensureSubscription(config) {

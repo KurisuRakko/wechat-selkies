@@ -15,7 +15,10 @@ from aiohttp.test_utils import TestClient, TestServer
 from pywebpush import WebPushException
 
 from wechat_history.constants import TARGET_USERNAME
+from wechat_history.errors import fail
 from wechat_history.notifications import (
+    NotificationError,
+    _error_details,
     MAX_SUBSCRIPTIONS,
     CursorStore,
     DirectSession,
@@ -403,6 +406,8 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
 
         class Runtime:
             history_ready = True
+            last_error = ""
+            last_error_message = ""
             vapid = SimpleNamespace(public_key="public-key")
             subscriptions = SubscriptionStore(root / "subscriptions.json")
             sender = Sender()
@@ -444,6 +449,41 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
             headers={"Origin": "https://evil.example"},
         )
         self.assertEqual(response.status, 403)
+
+    async def test_ready_config_carries_no_error(self) -> None:
+        response = await self.client.get("/wechat-notifications/api/config")
+        payload = await response.json()
+        self.assertTrue(payload["ready"])
+        self.assertNotIn("error", payload)
+
+    async def test_config_reports_monitor_failure_reason(self) -> None:
+        self.runtime.history_ready = False
+        self.runtime.last_error = "KEY_STALE"
+        self.runtime.last_error_message = "保存的密钥已失效；请显式重新扫描"
+        response = await self.client.get("/wechat-notifications/api/config")
+        payload = await response.json()
+        self.assertFalse(payload["ready"])
+        self.assertEqual(
+            payload["error"],
+            {"code": "KEY_STALE", "message": "保存的密钥已失效；请显式重新扫描"},
+        )
+
+
+class ErrorDetailTests(unittest.TestCase):
+    def test_history_error_exposes_code_and_safe_message(self) -> None:
+        code, message = _error_details(fail("KEY_STALE", "保存的密钥已失效"))
+        self.assertEqual(code, "KEY_STALE")
+        self.assertEqual(message, "保存的密钥已失效")
+
+    def test_notification_error_exposes_its_message(self) -> None:
+        code, message = _error_details(NotificationError("invalid cursor state"))
+        self.assertEqual(code, "NotificationError")
+        self.assertEqual(message, "invalid cursor state")
+
+    def test_unexpected_error_exposes_type_name_only(self) -> None:
+        code, message = _error_details(FileNotFoundError("/config/secret/path"))
+        self.assertEqual(code, "FileNotFoundError")
+        self.assertEqual(message, "")
 
 
 if __name__ == "__main__":

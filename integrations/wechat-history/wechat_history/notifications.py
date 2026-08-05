@@ -743,6 +743,21 @@ class PushSender:
         return await self._send_item(item, event)
 
 
+def _error_details(exc: BaseException) -> tuple[str, str]:
+    """Classify a monitor failure for the config endpoint.
+
+    Only errors that carry an intentionally safe message expose one; anything
+    unexpected reports just its type name so paths and secrets never reach the
+    browser.
+    """
+    code = str(getattr(exc, "code", type(exc).__name__))
+    if isinstance(exc, HistoryError):
+        return code, exc.safe_message
+    if isinstance(exc, NotificationError):
+        return code, str(exc)
+    return code, ""
+
+
 class NotificationRuntime:
     def __init__(self, state_root: Path = STATE_ROOT):
         state_root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -757,6 +772,7 @@ class NotificationRuntime:
         self.monitor_task: asyncio.Task[None] | None = None
         self.history_ready = False
         self.last_error = ""
+        self.last_error_message = ""
         self._last_error_log = 0.0
 
     async def start(self) -> None:
@@ -790,6 +806,7 @@ class NotificationRuntime:
                 events = await asyncio.to_thread(self.monitor.poll)
                 self.history_ready = True
                 self.last_error = ""
+                self.last_error_message = ""
                 if self.sender is not None:
                     for event in events:
                         await self.sender.send_all(event)
@@ -798,7 +815,7 @@ class NotificationRuntime:
             except Exception as exc:
                 failed = True
                 self.history_ready = False
-                error_name = str(getattr(exc, "code", type(exc).__name__))
+                error_name, self.last_error_message = _error_details(exc)
                 should_log = (
                     error_name != self.last_error
                     or started - self._last_error_log >= 60.0
@@ -850,14 +867,17 @@ def create_app(runtime: NotificationRuntime) -> web.Application:
     attach_lock = asyncio.Lock()
 
     async def config(_: web.Request) -> web.Response:
-        return web.json_response(
-            {
-                "version": 1,
-                "ready": runtime.history_ready,
-                "vapidPublicKey": runtime.vapid.public_key,
-            },
-            headers={"Cache-Control": "no-store"},
-        )
+        payload: dict[str, object] = {
+            "version": 1,
+            "ready": runtime.history_ready,
+            "vapidPublicKey": runtime.vapid.public_key,
+        }
+        if not runtime.history_ready and runtime.last_error:
+            payload["error"] = {
+                "code": runtime.last_error,
+                "message": runtime.last_error_message,
+            }
+        return web.json_response(payload, headers={"Cache-Control": "no-store"})
 
     async def put_subscription(request: web.Request) -> web.Response:
         origin = _request_origin(request)

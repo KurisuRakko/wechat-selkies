@@ -230,6 +230,18 @@ ENV WECHAT_WINDOW_CHECK_INTERVAL="5"
 # update favicon
 RUN cp /usr/share/icons/hicolor/128x128/apps/wechat.png /usr/share/selkies/www/icon.png
 
+# the baseimage's init-nginx writes manifest.json at startup declaring the icon
+# as 180x180; the WeChat icon above is 128x128 and Chrome rejects a manifest
+# icon whose declared size disagrees with the PNG
+RUN sed -i 's/180x180/128x128/' /etc/s6-overlay/s6-rc.d/init-nginx/run && \
+    grep -q '128x128' /etc/s6-overlay/s6-rc.d/init-nginx/run
+
+# Chromium deprecated apple-mobile-web-app-capable and warns on every page load
+# unless the standard tag is also present; keep both so iOS behaviour is unchanged
+RUN sed -i 's|<meta name="apple-mobile-web-app-capable" content="yes">|<meta name="mobile-web-app-capable" content="yes"><meta name="apple-mobile-web-app-capable" content="yes">|' \
+        /usr/share/selkies/selkies-dashboard/index.html && \
+    grep -q 'name="mobile-web-app-capable"' /usr/share/selkies/selkies-dashboard/index.html
+
 # add local files
 COPY /root /
 
