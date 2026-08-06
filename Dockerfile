@@ -59,8 +59,8 @@ RUN case "$TARGETPLATFORM" in \
 
 # Install QQ based on target architecture (optional)
 ARG INSTALL_QQ
-ARG QQ_AMD64_URL="https://qqdl.gtimg.cn/qqfile/QQNT/9.9.32/release/c390e792/QQ_3.2.31_260710_amd64_01.deb"
-ARG QQ_ARM64_URL="https://qqdl.gtimg.cn/qqfile/QQNT/9.9.32/release/c390e792/QQ_3.2.31_260710_arm64_01.deb"
+ARG QQ_AMD64_URL="https://qqdl.gtimg.cn/qqfile/QQNT/9.9.33/release/c97651b2/QQ_3.2.32_260730_amd64_01.deb"
+ARG QQ_ARM64_URL="https://qqdl.gtimg.cn/qqfile/QQNT/9.9.33/release/c97651b2/QQ_3.2.32_260730_arm64_01.deb"
 RUN if [ "$INSTALL_QQ" = "true" ]; then \
         case "$TARGETPLATFORM" in \
         "linux/amd64") \

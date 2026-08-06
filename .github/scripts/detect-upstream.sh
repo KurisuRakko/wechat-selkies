@@ -58,8 +58,8 @@ fetch_qq_urls
 
 WECHAT_AMD64_URL="${WECHAT_AMD64_URL:-https://dldir1v6.qq.com/weixin/Universal/Linux/WeChatLinux_x86_64.deb}"
 WECHAT_ARM64_URL="${WECHAT_ARM64_URL:-https://dldir1v6.qq.com/weixin/Universal/Linux/WeChatLinux_arm64.deb}"
-QQ_AMD64_URL="${QQ_AMD64_URL:-https://qqdl.gtimg.cn/qqfile/QQNT/9.9.32/release/c390e792/QQ_3.2.31_260710_amd64_01.deb}"
-QQ_ARM64_URL="${QQ_ARM64_URL:-https://qqdl.gtimg.cn/qqfile/QQNT/9.9.32/release/c390e792/QQ_3.2.31_260710_arm64_01.deb}"
+QQ_AMD64_URL="${QQ_AMD64_URL:-https://qqdl.gtimg.cn/qqfile/QQNT/9.9.33/release/c97651b2/QQ_3.2.32_260730_amd64_01.deb}"
+QQ_ARM64_URL="${QQ_ARM64_URL:-https://qqdl.gtimg.cn/qqfile/QQNT/9.9.33/release/c97651b2/QQ_3.2.32_260730_arm64_01.deb}"
 
 download_package() {
   local source_path="$1"
