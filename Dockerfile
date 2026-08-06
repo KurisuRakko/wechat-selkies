@@ -166,6 +166,13 @@ COPY patches/wechat-quality-presets.js /usr/share/selkies/selkies-dashboard/src/
 COPY patches/inject-quality-presets-script.sh /tmp/inject-quality-presets-script.sh
 RUN sh /tmp/inject-quality-presets-script.sh && rm -f /tmp/inject-quality-presets-script.sh
 
+# 锁定部署所需的显示/编码设置，隐藏侧边栏“应用程序/共享”卡片，并统一画质
+# 滑块方向（最左差、最右好）。浏览器在 bundle 启动前写入这些键，随后由
+# MutationObserver 持续锁定后渲染出来的控件和面板。
+COPY patches/wechat-locked-settings.js /usr/share/selkies/selkies-dashboard/src/wechat-locked-settings.js
+COPY patches/inject-locked-settings-script.sh /tmp/inject-locked-settings-script.sh
+RUN sh /tmp/inject-locked-settings-script.sh && rm -f /tmp/inject-locked-settings-script.sh
+
 # Chromium blocks an AudioContext created during page initialization. Defer the
 # playback context until the first trusted pointer/key/touch gesture, then use a
 # single gate for later resume attempts so every audio packet cannot repeat the
