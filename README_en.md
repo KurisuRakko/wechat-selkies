@@ -39,6 +39,25 @@ This project packages the official WeChat/QQ Linux client in a Docker container,
 - 📋 **Desktop Shortcut Integration**: Automatically scans `.desktop` files in `~/Desktop/` and adds them to the right-click menu, making it easy to launch third-party applications (e.g., apps installed via proot-apps)
 - 📂 **File Manager**: Built-in PCManFM lightweight file manager, accessible from the right-click menu for easy file management inside the container
 
+### Locked Settings
+
+Every dashboard load re-applies the following settings and disables their controls, so stale browser `localStorage` values cannot override them after a reconnect:
+
+| Setting | Locked value |
+|---------|--------------|
+| HiDPI (Pixel Perfect) | On |
+| Force Aligned Resolution | On |
+| Anti-aliasing | On |
+| Use CSS Cursors | On |
+| UI Scaling | 175% |
+| Encoder | `x264enc-striped` |
+| Encoder Rate Control Mode | CBR |
+| Use Static Region Optimization | On |
+| Turbo | Off |
+| CPU Encoding | Off |
+
+The **Applications** and **Sharing** sidebar cards are hidden entirely. The video bitrate slider keeps its natural higher-is-better direction; the static optimization CRF slider uses RTL direction, so the best-quality `min` is on the right and the worst-quality `max` is on the left, while the readout still shows the real CRF. UI scaling uses Selkies `scaling_dpi=168` (175%), and the server applies `Xft.dpi` through `xrdb` itself, so no container startup change is needed.
+
 ## Screenshots
 ![WeChat Screenshot](./docs/images/wechat-selkies-1.jpg)
 ![QQ Screenshot](./docs/images/wechat-selkies-2.jpg)
