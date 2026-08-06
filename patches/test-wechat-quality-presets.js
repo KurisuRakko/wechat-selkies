@@ -146,8 +146,9 @@ assert.deepEqual(
   ["15 fps · 4 Mbps", "24 fps · 8 Mbps", "45 fps · 12 Mbps", "90 fps · 24 Mbps"]
 );
 assert.equal(
-  group.children[group.children.length - 1].textContent,
-  "更多设置见左侧边栏"
+  group.children.length,
+  buttons.length,
+  "preset bar contains only the buttons"
 );
 assert.deepEqual(
   buttons.map((button) => button.attributes["aria-pressed"]),
