@@ -202,14 +202,6 @@
       buttons.push({ preset: preset, node: button });
     });
 
-    var hint = document.createElement("span");
-    hint.textContent = "更多设置见左侧边栏";
-    hint.style.cssText = [
-      "padding:0 8px 0 4px", "color:#9a9a9a", "font-size:11px",
-      "white-space:nowrap"
-    ].join(";");
-    group.appendChild(hint);
-
     ensureTopbar().appendChild(group);
     paint();
     console.log(TAG, "installed with preset", current.id);
