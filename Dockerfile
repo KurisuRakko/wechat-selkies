@@ -196,6 +196,13 @@ RUN /lsiopy/bin/python3 /tmp/patch-upload-client.py && rm -f /tmp/patch-upload-c
 COPY patches/upload-and-stats-fixes.py /tmp/upload-and-stats-fixes.py
 RUN /lsiopy/bin/python3 /tmp/upload-and-stats-fixes.py && rm -f /tmp/upload-and-stats-fixes.py
 
+# stop the constant idle audio stream. Upstream disables pcmflux's silence gate,
+# so an idle desktop still emits an Opus packet every 20 ms; with the gate on,
+# silent chunks never reach the callback and a quiet machine sends nothing.
+# Speech and notification sounds are unaffected.
+COPY patches/audio-silence-gate.py /tmp/audio-silence-gate.py
+RUN /lsiopy/bin/python3 /tmp/audio-silence-gate.py && rm -f /tmp/audio-silence-gate.py
+
 # stop horizontal tearing in the striped (x264enc-striped) video path. pixelflux
 # cuts each frame into horizontal Y-stripes and the bundle runs one VideoDecoder
 # per stripe, pushing every decoded output into one global paint queue that the
