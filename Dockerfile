@@ -233,6 +233,11 @@ ENV BROWSER="/usr/local/bin/xdg-open"
 # encoder can burst without bound.
 ENV SELKIES_ENABLE_RATE_CONTROL="true"
 
+# WeChat has no use for gamepad input; drop the top-bar toggle button and the
+# sidebar's "Gamepads" section so no gamepad UI ever renders.
+ENV SELKIES_GAMEPAD_ENABLED="false"
+ENV SELKIES_UI_SIDEBAR_SHOW_GAMEPADS="false"
+
 # set app name
 ENV TITLE="WeChat-Selkies"
 ENV TZ="Asia/Shanghai"
