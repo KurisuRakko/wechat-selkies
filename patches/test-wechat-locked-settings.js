@@ -153,6 +153,12 @@ global.document = {
       (el) => el.getAttribute("aria-controls") === match[1]
     );
   },
+  getElementsByTagName(tagName) {
+    if (String(tagName).toUpperCase() === "*") return allElements.slice();
+    return allElements.filter(
+      (el) => el.tagName === String(tagName).toUpperCase()
+    );
+  },
 };
 
 let observerCallback = null;
@@ -207,7 +213,14 @@ function makeControl(id, tagName = "BUTTON", value = "") {
     ];
     el.value = value;
   }
-  body.appendChild(el);
+  const row = new FakeElement("DIV");
+  row.className = "dev-setting-item";
+  const label = new FakeElement("LABEL");
+  label.textContent = id;
+  label.setAttribute("for", id);
+  row.appendChild(label);
+  row.appendChild(el);
+  body.appendChild(row);
   return el;
 }
 
@@ -234,6 +247,15 @@ function makeCrfSlider(id, min, max, value) {
   slider.value = String(value);
   body.appendChild(slider);
   return slider;
+}
+
+function makeGamepadButton() {
+  const button = new FakeElement("BUTTON");
+  button.className = "player-gamepad-button";
+  button.setAttribute("aria-label", "Toggle Touch Gamepad");
+  button.setAttribute("title", "Toggle Touch Gamepad");
+  body.appendChild(button);
+  return button;
 }
 
 function resetDom() {
@@ -264,7 +286,22 @@ run();
 assert.equal(store.size, 0, "#shared writes nothing");
 assert.equal(fakeWindow.wechatLockedSettingsInstalled, undefined);
 
-/* 1. 首次加载写入十个键并锁定已渲染控件 -------------------------------- */
+/* 0.5 player 页面只隐藏浮动手柄按钮，不写设置 --------------------------- */
+
+resetDom();
+fakeWindow.location.hash = "#player2";
+const playerButton = makeGamepadButton();
+run();
+fireInterval(500);
+assert.equal(store.size, 0, "player page does not seed settings");
+assert.equal(posts.length, 0, "player page does not post settings");
+assert.equal(playerButton.style.display, "none", "floating gamepad button is hidden");
+const latePlayerButton = makeGamepadButton();
+observerCallback([]);
+flushRaf();
+assert.equal(latePlayerButton.style.display, "none", "late gamepad button is hidden");
+
+/* 1. 首次加载写入十个键并隐藏已渲染设置行 -------------------------------- */
 
 resetDom();
 makeControl("hidpiToggle");
@@ -280,6 +317,10 @@ makeControl("rateControlSelect", "SELECT");
 makeControl("uiScalingSelect", "SELECT");
 const appsSection = makeSection("apps-content", "应用程序");
 const sharingSection = makeSection("sharing-content", "共享");
+const screenSettingsSection = makeSection("screen-settings-content", "屏幕设置");
+const videoSettingsSection = makeSection("video-settings-content", "视频设置");
+const gamepadButton = makeGamepadButton();
+const otherActionButton = makeControl("audioActionButton");
 const videoCrf = makeCrfSlider("videoCRFSlider", 5, 50, 25);
 const paintoverCrf = makeCrfSlider("h264PaintoverCRFSlider", 5, 50, 18);
 
@@ -290,7 +331,7 @@ assert.equal(store.get(key("useCssScaling")), "false");
 assert.equal(store.get(key("force_aligned_resolution")), "true");
 assert.equal(store.get(key("antiAliasingEnabled")), "true");
 assert.equal(store.get(key("use_browser_cursors")), "true");
-assert.equal(store.get(key("scaling_dpi")), "168");
+assert.equal(store.get(key("scaling_dpi")), "192");
 assert.equal(store.get(key("encoder")), "x264enc-striped");
 assert.equal(store.get(key("rate_control_mode")), "cbr");
 assert.equal(store.get(key("use_paint_over_quality")), "true");
@@ -316,19 +357,22 @@ for (const id of [
 ]) {
   const el = byId.get(id);
   assert.ok(el, `${id} exists`);
-  assert.equal(el.disabled, true, `${id} is disabled`);
-  assert.equal(el.getAttribute("aria-disabled"), "true", `${id} aria-disabled`);
-  assert.equal(el.style.pointerEvents, "none", `${id} ignores pointers`);
+  const row = el.parentNode;
+  assert.ok(row, `${id} has a parent row`);
+  assert.equal(row.className, "dev-setting-item", `${id} row is a dev-setting-item`);
+  assert.equal(row.style.display, "none", `${id} row is hidden`);
+  assert.equal(row.getAttribute("hidden"), "", `${id} row is marked hidden`);
+  assert.notEqual(row.children.length, 1, `${id} row hides label plus control`);
 }
 
-assert.equal(byId.get("hidpiToggle").getAttribute("aria-pressed"), "true");
-assert.equal(byId.get("h264StreamingModeToggle").getAttribute("aria-pressed"), "false");
-assert.equal(byId.get("useCpuToggle").getAttribute("aria-pressed"), "false");
-assert.equal(byId.get("uiScalingSelect").value, "168");
-assert.equal(byId.get("rateControlSelect").value, "cbr");
 assert.equal(appsSection.style.display, "none", "Applications card is hidden");
 assert.equal(appsSection.getAttribute("hidden"), "", "Applications is hidden");
 assert.equal(sharingSection.style.display, "none", "Sharing card is hidden");
+assert.equal(screenSettingsSection.style.display, "none", "Screen Settings card is hidden");
+assert.equal(screenSettingsSection.getAttribute("hidden"), "", "Screen Settings is hidden");
+assert.notEqual(videoSettingsSection.style.display, "none", "Video Settings card is not hidden");
+assert.equal(gamepadButton.style.display, "none", "floating gamepad button is hidden");
+assert.notEqual(otherActionButton.style.display, "none", "other action button is not hidden");
 assert.deepEqual(observeArgs.options, { childList: true, subtree: true });
 
 /* 2. CRF 滑块保留真实值，用 RTL 让最左差、最右好 ------------------------ */
@@ -344,7 +388,7 @@ assert.equal(paintoverCrf.listeners.has("input"), false, "no input interception"
 /* 3. 通过侧边栏同款事件实时发送设置 -------------------------------------- */
 
 const settingsPost = posts.find(
-  (post) => post.data.type === "settings" && post.data.settings.scaling_dpi === 168
+  (post) => post.data.type === "settings" && post.data.settings.scaling_dpi === 192
 );
 assert.ok(settingsPost, "settings message is posted");
 assert.equal(settingsPost.data.settings.encoder, "x264enc-striped");
@@ -360,10 +404,13 @@ assert.ok(
   "anti-aliasing has its own postMessage event"
 );
 
-/* 4. MutationObserver 隐藏后渲染的面板并锁定后渲染的控件 ----------------- */
+/* 4. MutationObserver 隐藏后渲染的面板和设置行 --------------------------- */
 
 body.children = body.children.filter(
-  (child) => child !== appsSection && child !== sharingSection
+  (child) =>
+    child !== appsSection &&
+    child !== sharingSection &&
+    child !== screenSettingsSection
 );
 allElements.length = 0;
 (function collect(node) {
@@ -371,9 +418,11 @@ allElements.length = 0;
   for (const child of node.children) collect(child);
 })(body);
 const lateApps = makeSection("apps-content", "Apps");
+const lateScreenSettings = makeSection("screen-settings-content", "屏幕设置");
 const lateToggle = makeControl("antiAliasingToggle");
+const lateGamepadButton = makeGamepadButton();
 assert.notEqual(lateApps.style.display, "none", "not hidden before the observer runs");
-assert.equal(lateToggle.disabled, false, "not locked before the observer runs");
+assert.notEqual(lateToggle.parentNode.style.display, "none", "row not hidden before the observer runs");
 assert.ok(observerCallback, "MutationObserver is installed");
 observerCallback([]);
 observerCallback([]);
@@ -381,7 +430,11 @@ assert.equal(rafCallbacks.length, 1, "mutations in one frame are coalesced");
 assert.notEqual(lateApps.style.display, "none", "not applied until the frame flush");
 flushRaf();
 assert.equal(lateApps.style.display, "none", "late Apps card is hidden");
-assert.equal(lateToggle.disabled, true, "late toggle is locked");
+assert.equal(lateScreenSettings.style.display, "none", "late Screen Settings card is hidden");
+assert.equal(lateGamepadButton.style.display, "none", "late gamepad button is hidden");
+assert.notEqual(videoSettingsSection.style.display, "none", "Video Settings is not hidden after mutations");
+assert.notEqual(otherActionButton.style.display, "none", "other action button is not hidden after mutations");
+assert.equal(lateToggle.parentNode.style.display, "none", "late toggle row is hidden");
 
 /* 5. DOM mutation 不触发 seed，定时 enforce 才兜底回写 ------------------- */
 
