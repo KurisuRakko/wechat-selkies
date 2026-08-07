@@ -147,11 +147,47 @@ global.document = {
     return this.querySelectorAll(selector)[0] || null;
   },
   querySelectorAll(selector) {
-    const match = selector.match(/^\[aria-controls="([^"]+)"\]$/);
-    if (!match) return [];
-    return allElements.filter(
-      (el) => el.getAttribute("aria-controls") === match[1]
-    );
+    const trimmed = selector.trim();
+    const ariaMatch = trimmed.match(/^\[aria-controls="([^"]+)"\]$/);
+    if (ariaMatch) {
+      return allElements.filter(
+        (el) => el.getAttribute("aria-controls") === ariaMatch[1]
+      );
+    }
+    const found = [];
+    const seen = new Set();
+    const push = (el) => {
+      if (!seen.has(el)) {
+        seen.add(el);
+        found.push(el);
+      }
+    };
+    for (const part of trimmed.split(",")) {
+      const selectorPart = part.trim();
+      if (selectorPart === "button.player-gamepad-button") {
+        for (const el of allElements) {
+          if (el.tagName === "BUTTON" &&
+              String(el.className || "").split(/\s+/).includes("player-gamepad-button")) {
+            push(el);
+          }
+        }
+      } else if (selectorPart === 'button[aria-label="Toggle Touch Gamepad"]') {
+        for (const el of allElements) {
+          if (el.tagName === "BUTTON" &&
+              el.getAttribute("aria-label") === "Toggle Touch Gamepad") {
+            push(el);
+          }
+        }
+      } else if (selectorPart === 'button[title="Toggle Touch Gamepad"]') {
+        for (const el of allElements) {
+          if (el.tagName === "BUTTON" &&
+              el.getAttribute("title") === "Toggle Touch Gamepad") {
+            push(el);
+          }
+        }
+      }
+    }
+    return found;
   },
   getElementsByTagName(tagName) {
     if (String(tagName).toUpperCase() === "*") return allElements.slice();

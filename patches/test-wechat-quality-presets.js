@@ -195,6 +195,12 @@ assert.ok(
   fetchCalls.every((call) => call.options.cache === "no-store"),
   "all speed test requests bypass the cache"
 );
+assert.ok(
+  fetchCalls.some(
+    (call) => call.options.signal && typeof call.options.signal.aborted === "boolean"
+  ),
+  "download request carries an AbortController signal"
+);
 posts.length = 0;
 
 fireInterval(500);   // boot poll finds document.body and builds the bar
@@ -408,13 +414,19 @@ assert.equal(delayedButtons[3].attributes["aria-pressed"], "true");
 
 resetQualityState();
 store.set("wechatQualityPreset", "smooth");
-fakeWindow.fetch = () => new Promise(() => {});
+let timeoutSignal;
+fakeWindow.fetch = (url, options = {}) => {
+  if (options.signal) timeoutSignal = options.signal;
+  return new Promise(() => {});
+};
 run();
 await settle();
 assert.equal(store.get("wechatQualityPreset"), "smooth", "before timeout");
+assert.ok(timeoutSignal, "timeout test captured the abort signal");
 fireTimeout(3000);
 await settle();
 assert.equal(store.get("wechatQualityPreset"), "smooth", "timeout keeps current preset");
+assert.equal(timeoutSignal.aborted, true, "timeout aborts the download");
 
 /* 11. a synchronous fetch throw still keeps the current preset -------------- */
 
