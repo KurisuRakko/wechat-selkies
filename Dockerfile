@@ -141,6 +141,15 @@ COPY patches/wechat-dragdrop.js /usr/share/selkies/selkies-dashboard/src/wechat-
 COPY patches/inject-dragdrop-script.sh /tmp/inject-dragdrop-script.sh
 RUN sh /tmp/inject-dragdrop-script.sh && rm -f /tmp/inject-dragdrop-script.sh
 
+# 修复浏览器端滚轮时快时慢：上游用最近 4 个 |deltaY| 猜设备类型，macOS 滚轮
+# 的系统加速会让真实滚轮被当成触控板；触控板路径按 100ms 限流丢事件，
+# _smallestDeltaY 又会把一格滚轮放大成 magnitude=10。这里在 capture 阶段
+# 接管 element 内的 wheel 事件，按 deltaMode 换算像素后固定阈值累积，绕开
+# 设备分类、限流丢事件和会话级最小 delta 放大三个问题。
+COPY patches/wechat-scroll-fix.js /usr/share/selkies/selkies-dashboard/src/wechat-scroll-fix.js
+COPY patches/inject-scroll-fix-script.sh /tmp/inject-scroll-fix-script.sh
+RUN sh /tmp/inject-scroll-fix-script.sh && rm -f /tmp/inject-scroll-fix-script.sh
+
 # anchor the host IME's candidate window with a click-local textarea while the
 # original full-screen input remains the mouse/drag surface. Padding the large
 # native input is not a reliable caret anchor on macOS Chromium.
