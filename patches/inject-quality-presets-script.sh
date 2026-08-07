@@ -32,6 +32,7 @@ for html in "$ROOT"/*/index.html; do
         'case"settings"' \
         '"framerate"' \
         '"video_bitrate"' \
+        '"h264_paintover_crf"' \
         '"encoder"' \
         '"rate_control_mode"' \
         'x264enc-striped' \

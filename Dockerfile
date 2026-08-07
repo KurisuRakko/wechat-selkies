@@ -166,6 +166,11 @@ COPY patches/wechat-quality-presets.js /usr/share/selkies/selkies-dashboard/src/
 COPY patches/inject-quality-presets-script.sh /tmp/inject-quality-presets-script.sh
 RUN sh /tmp/inject-quality-presets-script.sh && rm -f /tmp/inject-quality-presets-script.sh
 
+# Dedicated 1 MiB same-origin payload for the automatic speed test. A small
+# bundle would make the measurement noisy; this file guarantees a stable target.
+RUN dd if=/dev/zero of=/usr/share/selkies/selkies-dashboard/wechat-speedtest.bin bs=1048576 count=1 && \
+    test "$(wc -c < /usr/share/selkies/selkies-dashboard/wechat-speedtest.bin)" -eq 1048576
+
 # 锁定部署所需的显示/编码设置，隐藏侧边栏“应用程序/共享”卡片，并统一画质
 # 滑块方向（最左差、最右好）。浏览器在 bundle 启动前写入这些键，随后由
 # MutationObserver 持续锁定后渲染出来的控件和面板。

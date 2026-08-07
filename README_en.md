@@ -41,7 +41,7 @@ This project packages the official WeChat/QQ Linux client in a Docker container,
 
 ### Locked Settings
 
-Every dashboard load re-applies the following settings and disables their controls, so stale browser `localStorage` values cannot override them after a reconnect:
+Every dashboard load re-applies the following settings and hides their entire setting rows, so stale browser `localStorage` values cannot override them after a reconnect:
 
 | Setting | Locked value |
 |---------|--------------|
@@ -49,14 +49,27 @@ Every dashboard load re-applies the following settings and disables their contro
 | Force Aligned Resolution | On |
 | Anti-aliasing | On |
 | Use CSS Cursors | On |
-| UI Scaling | 175% |
+| UI Scaling | 200% |
 | Encoder | `x264enc-striped` |
 | Encoder Rate Control Mode | CBR |
 | Use Static Region Optimization | On |
 | Turbo | Off |
 | CPU Encoding | Off |
 
-The **Applications** and **Sharing** sidebar cards are hidden entirely. The video bitrate slider keeps its natural higher-is-better direction; the static optimization CRF slider uses RTL direction, so the best-quality `min` is on the right and the worst-quality `max` is on the left, while the readout still shows the real CRF. UI scaling uses Selkies `scaling_dpi=168` (175%), and the server applies `Xft.dpi` through `xrdb` itself, so no container startup change is needed.
+The **Applications**, **Sharing**, and **Screen Settings** sidebar cards are hidden entirely, and the floating gamepad button on player pages is hidden too. Screen Settings is UI-only hiding; the locked values are still written and applied on every load. The video bitrate slider keeps its natural higher-is-better direction; the static optimization CRF slider uses RTL direction, so the best-quality `min` is on the right and the worst-quality `max` is on the left, while the readout still shows the real CRF. UI scaling uses Selkies `scaling_dpi=192` (200%), and the server applies `Xft.dpi` through `xrdb` itself, so no container startup change is needed.
+
+### Quality Presets
+
+The top bar offers four quality presets, all using `x264enc-striped` with CBR rate control. Lower static CRF means higher quality for static scene repaints:
+
+| Preset | Framerate | Bitrate | Static CRF |
+|--------|-----------|---------|------------|
+| 省流 | 12 fps | 2 Mbps | 33 |
+| 流畅 (default) | 24 fps | 6 Mbps | 28 |
+| 高清 | 30 fps | 12 Mbps | 23 |
+| 极致 | 60 fps | 20 Mbps | 18 |
+
+Every page load runs an automatic speed test against a generated 1 MiB same-origin file: measured download `< 3 Mbps` selects 省流, `3–8 Mbps` selects 流畅, `8–15 Mbps` selects 高清, and `>= 15 Mbps` selects 极致. If RTT exceeds 150ms, the automatic pick is capped at 流畅. A 3-second timeout or failure keeps the current preset. Once the user manually clicks any preset, auto selection is disabled for that session and returns after a page refresh.
 
 ## Screenshots
 ![WeChat Screenshot](./docs/images/wechat-selkies-1.jpg)
