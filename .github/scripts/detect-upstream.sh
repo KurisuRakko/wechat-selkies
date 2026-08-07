@@ -10,6 +10,11 @@ ENV_WECHAT_ARM64_URL="${WECHAT_ARM64_URL-__UNSET__}"
 ENV_QQ_AMD64_URL="${QQ_AMD64_URL-__UNSET__}"
 ENV_QQ_ARM64_URL="${QQ_ARM64_URL-__UNSET__}"
 
+DEFAULT_WECHAT_AMD64_URL="https://dldir1v6.qq.com/weixin/Universal/Linux/WeChatLinux_x86_64.deb"
+DEFAULT_WECHAT_ARM64_URL="https://dldir1v6.qq.com/weixin/Universal/Linux/WeChatLinux_arm64.deb"
+DEFAULT_QQ_AMD64_URL="https://qqdl.gtimg.cn/qqfile/QQNT/9.9.33/release/c97651b2/QQ_3.2.32_260730_amd64_01.deb"
+DEFAULT_QQ_ARM64_URL="https://qqdl.gtimg.cn/qqfile/QQNT/9.9.33/release/c97651b2/QQ_3.2.32_260730_arm64_01.deb"
+
 cleanup() {
   rm -rf "$TMP_DIR"
 }
@@ -40,7 +45,7 @@ fi
 # Dynamically fetch latest QQ URLs from official CDN config if unset
 fetch_qq_urls() {
   local qq_config
-  qq_config="$(curl -fsSL --retry 3 --retry-delay 5 --retry-all-errors https://cdn-go.cn/qq-web/im.qq.com_new/latest/rainbow/linuxConfig.js || true)"
+  qq_config="$(curl -fsSL --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 3 https://cdn-go.cn/qq-web/im.qq.com_new/latest/rainbow/linuxConfig.js || true)"
   if [[ -n "$qq_config" ]]; then
     local fetched_amd64 fetched_arm64
     fetched_amd64="$(echo "$qq_config" | grep -oE 'https://[^"]+amd64[^"]+\.deb' | head -n 1 || true)"
@@ -56,20 +61,32 @@ fetch_qq_urls() {
 
 fetch_qq_urls
 
-WECHAT_AMD64_URL="${WECHAT_AMD64_URL:-https://dldir1v6.qq.com/weixin/Universal/Linux/WeChatLinux_x86_64.deb}"
-WECHAT_ARM64_URL="${WECHAT_ARM64_URL:-https://dldir1v6.qq.com/weixin/Universal/Linux/WeChatLinux_arm64.deb}"
-QQ_AMD64_URL="${QQ_AMD64_URL:-https://qqdl.gtimg.cn/qqfile/QQNT/9.9.33/release/c97651b2/QQ_3.2.32_260730_amd64_01.deb}"
-QQ_ARM64_URL="${QQ_ARM64_URL:-https://qqdl.gtimg.cn/qqfile/QQNT/9.9.33/release/c97651b2/QQ_3.2.32_260730_arm64_01.deb}"
+WECHAT_AMD64_URL="${WECHAT_AMD64_URL:-$DEFAULT_WECHAT_AMD64_URL}"
+WECHAT_ARM64_URL="${WECHAT_ARM64_URL:-$DEFAULT_WECHAT_ARM64_URL}"
+QQ_AMD64_URL="${QQ_AMD64_URL:-$DEFAULT_QQ_AMD64_URL}"
+QQ_ARM64_URL="${QQ_ARM64_URL:-$DEFAULT_QQ_ARM64_URL}"
 
 download_package() {
   local source_path="$1"
   local destination="$2"
+  local fallback_url="${3:-}"
 
   case "$source_path" in
     http://*|https://*)
-      curl --fail --silent --show-error --location \
+      if ! curl --fail --silent --show-error --location \
+        --connect-timeout 15 --max-time 300 \
         --retry 3 --retry-delay 5 --retry-all-errors \
-        -o "$destination" "$source_path"
+        -o "$destination" "$source_path"; then
+        if [[ -n "$fallback_url" && "$fallback_url" != "$source_path" ]]; then
+          echo "⚠️ Warning: Failed to download from ${source_path}, retrying with fallback URL: ${fallback_url}"
+          curl --fail --silent --show-error --location \
+            --connect-timeout 15 --max-time 300 \
+            --retry 3 --retry-delay 5 --retry-all-errors \
+            -o "$destination" "$fallback_url"
+        else
+          return 1
+        fi
+      fi
       ;;
     *)
       cp "$source_path" "$destination"
@@ -81,6 +98,7 @@ read_metadata() {
   local package_name="$1"
   local arch="$2"
   local source_path="$3"
+  local fallback_url="${4:-}"
   local package_path="$TMP_DIR/${package_name}-${arch}.deb"
   local version_var="${package_name}_${arch}_VERSION"
   local sha_var="${package_name}_${arch}_SHA256"
@@ -92,7 +110,7 @@ read_metadata() {
   local detected_sha
 
   echo "Checking ${package_name} ${arch} from ${source_path}"
-  download_package "$source_path" "$package_path"
+  download_package "$source_path" "$package_path" "$fallback_url"
 
   detected_version="$(dpkg-deb -f "$package_path" Version)"
   detected_sha="$(sha256sum "$package_path" | awk '{print $1}')"
@@ -105,10 +123,10 @@ read_metadata() {
   fi
 }
 
-read_metadata "WECHAT" "AMD64" "$WECHAT_AMD64_URL"
-read_metadata "WECHAT" "ARM64" "$WECHAT_ARM64_URL"
-read_metadata "QQ" "AMD64" "$QQ_AMD64_URL"
-read_metadata "QQ" "ARM64" "$QQ_ARM64_URL"
+read_metadata "WECHAT" "AMD64" "$WECHAT_AMD64_URL" "$DEFAULT_WECHAT_AMD64_URL"
+read_metadata "WECHAT" "ARM64" "$WECHAT_ARM64_URL" "$DEFAULT_WECHAT_ARM64_URL"
+read_metadata "QQ" "AMD64" "$QQ_AMD64_URL" "$DEFAULT_QQ_AMD64_URL"
+read_metadata "QQ" "ARM64" "$QQ_ARM64_URL" "$DEFAULT_QQ_ARM64_URL"
 
 CHECKED_AT="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 if [[ "$CHANGE_DETECTED" == "true" || ! -f "$STATE_FILE" ]]; then
