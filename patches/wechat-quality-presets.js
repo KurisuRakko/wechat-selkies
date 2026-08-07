@@ -158,9 +158,11 @@
     return withCacheBust(new URL(SPEED_TEST_RESOURCE, window.location.href).href);
   }
 
-  function measureDownload() {
+  function measureDownload(signal) {
     var start = now();
-    return window.fetch(speedTestUrl(), { cache: "no-store" })
+    var options = { cache: "no-store" };
+    if (signal) options.signal = signal;
+    return window.fetch(speedTestUrl(), options)
       .then(function (response) {
         if (!response.ok) throw new Error("speed test HTTP " + response.status);
         return response.arrayBuffer();
@@ -209,14 +211,21 @@
   function startSpeedTest() {
     if (typeof Promise === "undefined" || typeof window.fetch !== "function") return;
 
+    var controller = null;
+    if (typeof AbortController !== "undefined") {
+      controller = new AbortController();
+    }
     var timeout = new Promise(function (resolve) {
       setTimeout(function () {
+        if (controller) controller.abort();
         resolve(null);
       }, SPEED_TEST_TIMEOUT_MS);
     });
     // Promise.resolve().then(...) also catches synchronous fetch throws.
     var measured = Promise.all([
-      Promise.resolve().then(measureDownload),
+      Promise.resolve().then(function () {
+        return measureDownload(controller ? controller.signal : undefined);
+      }),
       Promise.resolve().then(measureRtt)
     ])
       .then(function (results) {

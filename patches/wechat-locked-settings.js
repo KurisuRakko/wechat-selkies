@@ -28,7 +28,7 @@
    * 十个设置值都来自 src/selkies-core.js 里的真实键名：
    * - HiDPI 的反向开关会同时写 use_css_scaling（dashboard UI）和
    *   useCssScaling（core 启动读取），false = 客户端像素完美画布。
- * - 200% 对应 scaling_dpi 枚举里的 DPI 192。
+   * - 200% 对应 scaling_dpi 枚举里的 DPI 192。
    * - Turbo 和 CPU 编码以 "true"/"false" 字符串存储。
    */
   var LOCKED_SETTINGS = {
@@ -59,8 +59,7 @@
     "useCpuToggle"
   ];
 
-  var HIDDEN_SECTIONS = ["apps-content", "sharing-content"];
-  var HIDDEN_SECTION_TITLES = ["屏幕设置"];
+  var HIDDEN_SECTIONS = ["apps-content", "sharing-content", "screen-settings-content"];
 
   var CRF_SLIDER_IDS = ["videoCRFSlider", "h264PaintoverCRFSlider"];
 
@@ -162,39 +161,19 @@
     }
   }
 
-  function hideSectionByTitle(title) {
-    var headings = [];
-    try {
-      headings = document.getElementsByTagName("h3") || [];
-    } catch (e) {
-      headings = [];
-    }
-    for (var i = 0; i < headings.length; i++) {
-      if (String(headings[i].textContent || "").trim() !== title) continue;
-      var section = headings[i].parentNode;
-      while (section && !hasClass(section, "sidebar-section")) {
-        section = section.parentNode;
-      }
-      if (section) hideElement(section, "title:" + title);
-      return;
-    }
-  }
-
   function hideGamepadButtons() {
-    var elements = [];
+    var buttons = [];
     try {
-      elements = document.getElementsByTagName("*") || [];
+      buttons = document.querySelectorAll(
+        'button.player-gamepad-button, ' +
+        'button[aria-label="Toggle Touch Gamepad"], ' +
+        'button[title="Toggle Touch Gamepad"]'
+      ) || [];
     } catch (e) {
-      elements = [];
+      buttons = [];
     }
-    for (var i = 0; i < elements.length; i++) {
-      var el = elements[i];
-      if (!el || el.tagName !== "BUTTON") continue;
-      if (hasClass(el, "player-gamepad-button") ||
-          el.getAttribute("aria-label") === "Toggle Touch Gamepad" ||
-          el.getAttribute("title") === "Toggle Touch Gamepad") {
-        hideElement(el, "gamepad-button");
-      }
+    for (var i = 0; i < buttons.length; i++) {
+      hideElement(buttons[i], "gamepad-button");
     }
   }
 
@@ -226,10 +205,6 @@
 
     for (var k = 0; k < HIDDEN_SECTIONS.length; k++) {
       hideSection(HIDDEN_SECTIONS[k]);
-    }
-
-    for (var n = 0; n < HIDDEN_SECTION_TITLES.length; n++) {
-      hideSectionByTitle(HIDDEN_SECTION_TITLES[n]);
     }
 
     hideGamepadButtons();
