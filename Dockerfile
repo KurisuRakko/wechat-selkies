@@ -326,3 +326,17 @@ COPY patches/install-wechat-notifications.sh /tmp/install-wechat-notifications.s
 RUN sh /tmp/install-wechat-notifications.sh \
         "$INSTALL_WECHAT_HISTORY" /tmp/wechat-notifications && \
     rm -rf /tmp/wechat-notifications /tmp/install-wechat-notifications.sh
+
+# drag a file out of a WeChat chat and download it in the viewer's browser. The
+# drag never leaves the remote X11 session — the browser only forwards pointer
+# events, so HTML5 drop events cannot fire — which is why the file is caught by
+# an XDND window the helper maps over the remote top-right corner for exactly as
+# long as a drag lasts, and the page merely mirrors that as a drop zone in place
+# of the quality preset bar. The helper runs as root because WeChat's attachment
+# directories are 0700 root. Must come after "COPY /root /": the install script
+# verifies and chmods /scripts/wechat/wechat-export-drop.py.
+COPY patches/wechat-desktop-export.js /tmp/wechat-desktop-export/wechat-desktop-export.js
+COPY patches/wechat-export-s6 /tmp/wechat-desktop-export/s6
+COPY patches/install-wechat-desktop-export.sh /tmp/install-wechat-desktop-export.sh
+RUN sh /tmp/install-wechat-desktop-export.sh /tmp/wechat-desktop-export && \
+    rm -rf /tmp/wechat-desktop-export /tmp/install-wechat-desktop-export.sh

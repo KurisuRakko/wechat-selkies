@@ -32,6 +32,7 @@ This project packages the official WeChat/QQ Linux client in a Docker container,
 - 🎨 **Chinese Support**: Complete Chinese fonts and localization support, including local Chinese input methods
 - 🖼️ **Image Copy**: Support image copying through sidebar panel
 - 📁 **File Transfer**: Support file transfer through sidebar panel
+- ⤓ **Drag-out Export**: Drag an image or file out of a WeChat chat into the top-right corner to download it locally (see [Drag-out Export](#drag-out-export))
 - 🖥️ **AMD64 and ARM64 Architecture Support**: Compatible with mainstream CPU architectures
 - 🔧 **Hardware Acceleration**: Optional GPU hardware acceleration support
 - 🪟 **Window Switcher**: Added a floating window switcher in the top left corner for easy switching to background windows, laying the foundation for adding other features in the future
@@ -70,6 +71,44 @@ The top bar offers four quality presets, all using `x264enc-striped` with CBR ra
 | 极致 | 60 fps | 20 Mbps | 18 |
 
 Every page load runs an automatic speed test against a generated 1 MiB same-origin file: measured download `< 3 Mbps` selects 省流, `3–8 Mbps` selects 流畅, `8–15 Mbps` selects 高清, and `>= 15 Mbps` selects 极致. If RTT exceeds 150ms, the automatic pick is capped at 流畅. A 3-second timeout or failure keeps the current preset. Once the user manually clicks any preset, auto selection is disabled for that session and returns after a page refresh.
+
+### Drag-out Export
+
+**Press and drag an image or file out of a WeChat chat** and the quality preset bar in
+the top-right corner disappears, replaced in place by a green dashed "拖到这里下载"
+(drop here to download) zone. Release the file over that zone and the browser downloads
+it like any ordinary link, then the preset bar comes back. Releasing anywhere else
+downloads nothing and restores the bar just the same. Dragging several files at once
+triggers one download each.
+
+The indirection is unavoidable: the whole drag happens inside the remote X11 session —
+the browser only forwards pointer events — so `dragover` / `drop` never fire on the
+page. What actually catches the file is an XDND window that
+`/scripts/wechat/wechat-export-drop.py` (s6 service `svc-wechat-export`) maps over the
+remote screen's top-right corner for exactly as long as a drag is running. It is created
+with no background pixmap, so it receives the drop without changing a single pixel on
+screen, and the page's drop zone is drawn from the rectangle the helper reports. The
+window is destroyed as soon as the drag ends, so it never covers WeChat's own UI or
+swallows a click.
+
+Caught files are copied into `/config/.host-export/` inside the container (deliberately
+not `/config/Desktop`, so drag-out exports cannot loop back through drag-in uploads),
+numbered on name collisions, and pruned to the **20 most recent**. Download links are
+one-shot tokens; the export directory itself is never exposed.
+
+| Environment variable | Default | Purpose |
+|----------------------|---------|---------|
+| `WECHAT_EXPORT_DIR` | `/config/.host-export` | Export directory |
+| `WECHAT_EXPORT_KEEP` | `20` | Files kept in the export directory |
+| `WECHAT_EXPORT_PORT` | `8766` | Helper loopback API port (nginx proxies `/wechat-export/`) |
+
+The helper has to run as root: WeChat stores chat attachments under
+`/config/xwechat_files/<account>/` with mode `0700 root`, which the desktop `abc` user
+cannot read.
+
+> Read-only `#shared` / `#player` pages do not enable this. If no drag-end arrives within
+> 10 seconds (a dropped event stream, say), the page restores the preset bar on its own
+> rather than hiding it forever.
 
 ## Screenshots
 ![WeChat Screenshot](./docs/images/wechat-selkies-1.jpg)

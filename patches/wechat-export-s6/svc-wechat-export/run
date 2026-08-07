@@ -1,0 +1,10 @@
+#!/usr/bin/with-contenv bash
+
+# Deliberately NOT s6-setuidgid abc: WeChat stores chat attachments under
+# /config/xwechat_files/<account>/ with mode 0700 root, so the desktop user
+# cannot read the very file the drag hands over.
+export DISPLAY="${DISPLAY:-:1}"
+export PYTHONDONTWRITEBYTECODE=1
+export PYTHONUNBUFFERED=1
+
+exec /lsiopy/bin/python3 /scripts/wechat/wechat-export-drop.py
