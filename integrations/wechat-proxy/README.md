@@ -79,6 +79,33 @@ reverse_proxy https://wechat-selkies:3001 {
 }
 ```
 
+## 443 已经被 `tailscale serve` 占着
+
+`tailscale serve` 自己会在 Tailscale 地址的 443 上监听，这时代理起不来。先看清它在服务
+什么，别急着关：
+
+```bash
+tailscale serve status
+```
+
+把这份输出**原样存一份**再动手——恢复时要照它逐条加回去。确认 443 那一段不再需要之后，
+只关这一个端口的路由（其它端口上的路由不受影响）：
+
+```bash
+tailscale serve --https=443 off
+```
+
+恢复时按存下来的输出逐条重建，例如：
+
+```bash
+tailscale serve --bg --https=443 --set-path=/ http://127.0.0.1:8765
+```
+
+有一个容易踩的坑：`serve` 的后端写的是**宿主机**的 loopback，而这个代理跑在容器里，两者
+能到达的地址不一样。容器里要用 `host.docker.internal` 才能回连宿主机 loopback 上的服务
+（Docker Desktop 有这个名字，Linux 上的 docker-ce 默认没有）。所以把原本挂在 `serve` 上
+的站点搬进这个代理，不是换个域名那么简单，先确认上游在容器里真的连得通。
+
 ## 上线与验收
 
 ```bash
@@ -89,7 +116,8 @@ docker compose -f compose.proxy.yml up -d
 必须逐条过：
 
 1. `docker compose -f compose.proxy.yml ps` 里状态是 `Up`，且日志没有重启循环
-   （配置写错时 Caddy 直接退出，不会静默代理到错的地方）。
+   （配置写错时 Caddy 直接退出，不会静默代理到错的地方）。启动失败最常见的原因是 443
+   已经被别的东西占着，见上一节。
 2. 从 tailnet 内的设备访问两个域名，都是 HTTPS 且能打开对应页面。
 3. **局域网不可达**：从同一局域网、不在 tailnet 的设备访问宿主机的局域网地址
    `443`，必须连接被拒绝（`Test-NetConnection <局域网IP> -Port 443` 应为 False）。
