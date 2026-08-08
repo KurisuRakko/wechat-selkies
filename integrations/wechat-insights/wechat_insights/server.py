@@ -68,7 +68,9 @@ class InsightsRuntime:
 
     def __init__(self, store: MetricsStore, analyzer_factory=None):
         self.store = store
-        self.analyzer_factory = analyzer_factory or (lambda: Analyzer(store))
+        self.analyzer_factory = analyzer_factory or (
+            lambda progress_cb: Analyzer(store, progress_cb=progress_cb)
+        )
         self.hour, self.minute = parse_analyze_time(ANALYZE_TIME)
         self.running = False
         self.last_error: dict[str, str] | None = None
@@ -76,6 +78,18 @@ class InsightsRuntime:
         self.next_run: float | None = None
         self._task: asyncio.Task[None] | None = None
         self._lock = asyncio.Lock()
+        # 最近一次分析的进度快照。整体替换 dict 更新（GIL 下单条赋值原子，
+        # 分析线程写、事件循环读，不需要锁），/api/progress 直接吐这份。
+        self.progress: dict = {
+            "running": False,
+            "phase": "",
+            "detail": "",
+            "done": 0,
+            "total": 0,
+            "started_at": None,
+            "finished_at": None,
+            "last_result": None,
+        }
 
     async def start(self) -> None:
         self._task = asyncio.create_task(self._schedule_loop())
@@ -101,11 +115,30 @@ class InsightsRuntime:
         asyncio.create_task(self.analyze())
         return True
 
+    def _on_progress(self, fields: dict) -> None:
+        """分析线程的进度回调：把阶段字段整体合进快照（整体替换，GIL 下原子）。
+
+        cb 只在工作线程里跑、且严格夹在开跑与收尾两次写之间，不存在读改写
+        交错，所以不需要锁。
+        """
+
+        self.progress = {**self.progress, **fields}
+
     async def analyze(self) -> bool:
         if self._lock.locked():
             return False
         async with self._lock:
             self.running = True
+            self.progress = {
+                "running": True,
+                "phase": "sync",
+                "detail": "",
+                "done": 0,
+                "total": 0,
+                "started_at": int(time.time()),
+                "finished_at": None,
+                "last_result": None,
+            }
             try:
                 result = await asyncio.to_thread(self._run_blocking)
             except Exception as exc:
@@ -120,16 +153,30 @@ class InsightsRuntime:
                 LOG.warning("分析失败（%s）", code, exc_info=True)
                 return False
             finally:
+                # 成功与异常都到这里：running 归位、记下结束时刻。
                 self.running = False
+                self.progress = {
+                    **self.progress,
+                    "running": False,
+                    "finished_at": int(time.time()),
+                }
             self.last_error = None
             self.last_duration = result.duration_seconds
+            self.progress = {
+                **self.progress,
+                "last_result": {
+                    "messages_read": result.messages_read,
+                    "scored": result.scored,
+                    "llm_scored": result.llm_scored,
+                },
+            }
             LOG.info("分析完成，用时 %.1f 秒", result.duration_seconds)
             return True
 
     def _run_blocking(self):
         """在工作线程里跑一轮分析；结束后释放该线程的 sqlite 连接。"""
 
-        analyzer = self.analyzer_factory()
+        analyzer = self.analyzer_factory(self._on_progress)
         try:
             return analyzer.run()
         finally:
@@ -313,6 +360,10 @@ def create_app(runtime: InsightsRuntime) -> web.Application:
             }
         )
 
+    async def progress(_: web.Request) -> web.Response:
+        # 快照是整体替换的，事件循环里直接读不需要拷贝。
+        return no_store({"ok": True, "progress": runtime.progress})
+
     async def refresh(_: web.Request) -> web.Response:
         if not await runtime.trigger():
             return web.json_response(
@@ -337,6 +388,7 @@ def create_app(runtime: InsightsRuntime) -> web.Application:
     app.router.add_get("/api/status", status)
     app.router.add_get("/api/contacts", contacts)
     app.router.add_get("/api/contact/{hash}", contact_detail)
+    app.router.add_get("/api/progress", progress)
     app.router.add_post("/api/refresh", refresh)
     app.router.add_static("/static/", STATIC_ROOT)
 

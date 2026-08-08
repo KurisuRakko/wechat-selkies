@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from wechat_history.reader import HistoryReader, _read_connection
@@ -284,12 +285,25 @@ class Analyzer:
         strategy: DepthStrategy | None = None,
         gap_seconds: int = SESSION_GAP_SECONDS,
         batch_size: int = BACKFILL_BATCH,
+        # 进度上报回调：每完成一个步骤收一次 {phase, detail, done, total}。
+        progress_cb: Callable[[dict], None] | None = None,
     ):
         self.store = store
         self.reader_factory = reader_factory
         self.strategy = strategy or get_depth_strategy()
         self.gap_seconds = gap_seconds
         self.batch_size = batch_size
+        self._progress_cb = progress_cb
+
+    def _report(self, **fields: object) -> None:
+        """进度上报：cb 缺省时零开销；cb 抛异常只记调试日志，绝不能弄挂分析。"""
+
+        if self._progress_cb is None:
+            return
+        try:
+            self._progress_cb(fields)
+        except Exception:
+            LOG.debug("进度上报回调异常", exc_info=True)
 
     def run(self, now: int | None = None) -> AnalysisResult:
         moment = int(time.time()) if now is None else int(now)
@@ -301,8 +315,15 @@ class Analyzer:
             sessions = scan_direct_rows(reader)
             contacts = reader._load_contacts()
             result.sessions = len(sessions)
-            for session_id in sorted(sessions):
+            self._report(phase="sync", done=0, total=len(sessions), detail="")
+            for done, session_id in enumerate(sorted(sessions)):
                 session = sessions[session_id]
+                self._report(
+                    phase="sync",
+                    done=done,
+                    total=len(sessions),
+                    detail=session.display_name,
+                )
                 try:
                     read = self._sync_session(
                         reader, session_id, session.display_name, contacts, moment
@@ -323,6 +344,7 @@ class Analyzer:
         finally:
             reader.close()
 
+        self._report(phase="score", done=0, total=0, detail="")
         result.scored = self._recompute(moment)
         result.duration_seconds = time.monotonic() - started
 
@@ -506,10 +528,16 @@ class Analyzer:
                 )
             )
 
+        selected = sorted(pending)[:LLM_MAX_CALLS_PER_RUN]
+        self._report(phase="llm", done=0, total=len(selected), detail="")
         scored = skipped = failed = 0
-        for _, _, _, contact, anomalies, key in sorted(pending)[
-            :LLM_MAX_CALLS_PER_RUN
-        ]:
+        for done, (_, _, _, contact, anomalies, key) in enumerate(selected, start=1):
+            self._report(
+                phase="llm",
+                done=done,
+                total=len(selected),
+                detail=contact.display_name,
+            )
             sample = self._llm_sample(
                 reader, contact.session_id, contact.display_name, sample_start
             )

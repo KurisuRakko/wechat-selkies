@@ -19,6 +19,17 @@
       </div>
     </header>
 
+    <!-- 手动刷新的进度条：分析进行中显示，结束后自动收起（默认隐藏） -->
+    <div id="progress-slot" class="progress-slot" hidden>
+      <div class="progress-slot__inner">
+        <div class="progress-track" role="progressbar" aria-label="分析进度">
+          <div class="progress-bar" id="progress-bar"></div>
+          <div class="progress-indeterminate" id="progress-indeterminate"></div>
+        </div>
+        <p class="progress-caption" id="progress-caption"></p>
+      </div>
+    </div>
+
     <!-- 后端上报的分析错误会以 MD2 警告条的形式插在这里 -->
     <div id="banner-slot"></div>
 

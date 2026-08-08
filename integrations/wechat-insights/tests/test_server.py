@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from aiohttp.test_utils import AioHTTPTestCase
 
+from wechat_insights.analyzer import AnalysisResult
 from wechat_insights.metrics import Metrics
 from wechat_insights.server import (
     InsightsRuntime,
@@ -18,6 +19,29 @@ from wechat_insights.storage import MetricsStore, contact_hash
 
 SESSION_ID = "friend"
 HASH = contact_hash(SESSION_ID)
+
+
+class FakeAnalyzer:
+    """跑一轮就返回的假分析器：按真实节奏上报 sync → score 阶段。"""
+
+    def __init__(self, progress_cb=None):
+        self.progress_cb = progress_cb
+        self.result = AnalysisResult(
+            started_at=1_700_000_000,
+            duration_seconds=1.5,
+            messages_read=12,
+            scored=7,
+            llm_scored=3,
+        )
+
+    def run(self):
+        if self.progress_cb is not None:
+            self.progress_cb({"phase": "sync", "done": 0, "total": 1, "detail": ""})
+            self.progress_cb(
+                {"phase": "sync", "done": 1, "total": 1, "detail": "Alice"}
+            )
+            self.progress_cb({"phase": "score", "done": 0, "total": 0, "detail": ""})
+        return self.result
 
 
 def payload(scored: bool = True) -> dict:
@@ -88,7 +112,14 @@ class ApiTests(AioHTTPTestCase):
         bucket.add_reply("incoming", 45)
         bucket.add_reply("incoming", 60)
         self.store.merge_daily(SESSION_ID, {"2026-03-10": bucket})
-        self.runtime = InsightsRuntime(self.store, analyzer_factory=lambda: None)
+        # 分析器工厂在测试里记录最后创建的实例，进度测试用它驱动一轮。
+        self.last_analyzer = None
+
+        def factory(progress_cb):
+            self.last_analyzer = FakeAnalyzer(progress_cb)
+            return self.last_analyzer
+
+        self.runtime = InsightsRuntime(self.store, analyzer_factory=factory)
         await super().asyncSetUp()
 
     async def test_status_reports_the_last_analysis(self) -> None:
@@ -126,6 +157,34 @@ class ApiTests(AioHTTPTestCase):
 
     async def test_malformed_hash_is_rejected(self) -> None:
         self.assertEqual((await self.client.get("/api/contact/nope")).status, 404)
+
+    async def test_progress_reports_idle_state_by_default(self) -> None:
+        body = await (await self.client.get("/api/progress")).json()
+        self.assertTrue(body["ok"])
+        progress = body["progress"]
+        self.assertFalse(progress["running"])
+        self.assertEqual(progress["phase"], "")
+        self.assertIsNone(progress["started_at"])
+        self.assertIsNone(progress["finished_at"])
+        self.assertIsNone(progress["last_result"])
+
+    async def test_progress_snapshot_after_an_analysis_round(self) -> None:
+        # 驱动一轮真实 analyze：工厂把 cb 传给假分析器，阶段字段合进快照。
+        self.assertTrue(await self.runtime.analyze())
+        self.assertIsNotNone(self.last_analyzer)
+        self.assertTrue(callable(self.last_analyzer.progress_cb))
+        body = await (await self.client.get("/api/progress")).json()
+        progress = body["progress"]
+        self.assertFalse(progress["running"])
+        # 阶段字段来自分析线程的上报，收尾后仍保留最后一次（score）。
+        self.assertEqual(progress["phase"], "score")
+        self.assertEqual(progress["done"], 0)
+        self.assertIsNotNone(progress["started_at"])
+        self.assertIsNotNone(progress["finished_at"])
+        self.assertEqual(
+            progress["last_result"],
+            {"messages_read": 12, "scored": 7, "llm_scored": 3},
+        )
 
     async def test_refresh_is_debounced(self) -> None:
         await self.runtime._lock.acquire()
@@ -171,6 +230,14 @@ class AuthTests(AioHTTPTestCase):
 
     async def test_static_assets_are_protected_too(self) -> None:
         self.assertEqual((await self.client.get("/static/app.css")).status, 401)
+
+    async def test_progress_requires_a_token(self) -> None:
+        self.assertEqual((await self.client.get("/api/progress")).status, 401)
+        response = await self.client.get(
+            "/api/progress", headers={"Authorization": "Bearer s3cret"}
+        )
+        self.assertEqual(response.status, 200)
+        self.assertFalse((await response.json())["progress"]["running"])
 
     async def test_bearer_header_is_accepted(self) -> None:
         response = await self.client.get(

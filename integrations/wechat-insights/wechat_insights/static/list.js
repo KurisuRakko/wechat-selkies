@@ -6,6 +6,8 @@
   var I = global.Insights;
 
   var POLL_INTERVAL = 5000;
+  var PROGRESS_INTERVAL = 1000;
+  var PROGRESS_FAIL_LIMIT = 10;
 
   var els = {
     statusLine: document.getElementById("status-line"),
@@ -13,7 +15,11 @@
     bannerSlot: document.getElementById("banner-slot"),
     sortSelect: document.getElementById("sort-select"),
     summaryLine: document.getElementById("summary-line"),
-    content: document.getElementById("content")
+    content: document.getElementById("content"),
+    progressSlot: document.getElementById("progress-slot"),
+    progressBar: document.getElementById("progress-bar"),
+    progressIndeterminate: document.getElementById("progress-indeterminate"),
+    progressCaption: document.getElementById("progress-caption")
   };
 
   // items 只在拉取时更新，排序是纯前端行为。
@@ -21,8 +27,130 @@
     items: [],
     running: false,
     pollTimer: 0,
+    progressTimer: 0,
+    progressFails: 0,
+    // 只有亲眼见过 running=true 才算「从 true 变 false」：POST /api/refresh
+    // 返回 202 后分析要等下一个事件循环才置 running，不能把开跑前那一瞬的
+    // running=false 当成「分析完成」。
+    progressSawRunning: false,
+    // 本轮完成收尾已由进度轮询做过（防止在途的旧状态轮询再重拉一次列表）。
+    progressDone: false,
+    hideTimer: 0,
     unauthorized: false
   };
+
+  var PROGRESS_LABELS = {
+    sync: "同步聊天记录",
+    llm: "AI 分析",
+    score: "重算打分"
+  };
+
+  /* ------------------------------------------------------------------ *
+   * 进度条：轮询 /api/progress 渲染确定/不确定态
+   * ------------------------------------------------------------------ */
+
+  function setProgressIndeterminate(indeterminate) {
+    els.progressBar.style.width = indeterminate ? "" : "0";
+    els.progressIndeterminate.style.display = indeterminate ? "block" : "none";
+  }
+
+  function renderProgress(progress) {
+    var phase = progress.phase || "";
+    var label = PROGRESS_LABELS[phase] || "";
+    if (phase === "score") {
+      // 重算打分没有逐项计数，只显示进行中的文案。
+      els.progressCaption.textContent = label ? label + "…" : "";
+      setProgressIndeterminate(true);
+      return;
+    }
+    var done = I.isNumber(progress.done) ? progress.done : 0;
+    var total = I.isNumber(progress.total) ? progress.total : 0;
+    if (total > 0) {
+      var pct = Math.max(0, Math.min(100, (done / total) * 100));
+      els.progressBar.style.width = pct.toFixed(2) + "%";
+      els.progressIndeterminate.style.display = "none";
+    } else {
+      // 不知道总量（还没开始计数）就用不确定态。
+      setProgressIndeterminate(true);
+    }
+    var text = label ? label + " " + done + "/" + total : "";
+    var detail = progress.detail || "";
+    if (detail) {
+      text += " · " + I.escapeHtml(detail);
+    }
+    els.progressCaption.innerHTML = text;
+  }
+
+  function showProgress() {
+    els.progressSlot.hidden = false;
+  }
+
+  function hideProgress() {
+    els.progressSlot.hidden = true;
+  }
+
+  function startProgressPolling() {
+    if (state.progressTimer) {
+      return;
+    }
+    state.progressFails = 0;
+    state.progressSawRunning = false;
+    state.progressDone = false;
+    showProgress();
+    state.progressTimer = global.setInterval(progressOnce, PROGRESS_INTERVAL);
+  }
+
+  function stopProgressPolling() {
+    global.clearInterval(state.progressTimer);
+    state.progressTimer = 0;
+  }
+
+  function finishProgress() {
+    // 分析结束：恢复按钮并停掉状态轮询，显示「分析完成」约 1.5 秒后收起
+    // 进度条，然后重新拉列表数据。
+    state.progressDone = true;
+    stopProgressPolling();
+    stopPolling();
+    els.progressCaption.textContent = "分析完成";
+    setProgressIndeterminate(true);
+    global.clearTimeout(state.hideTimer);
+    state.hideTimer = global.setTimeout(function () {
+      hideProgress();
+    }, 1500);
+    loadContacts();
+  }
+
+  async function progressOnce() {
+    var payload;
+    try {
+      payload = await I.api("/api/progress");
+    } catch (err) {
+      if (err.status === 401) {
+        // 令牌失效，停止轮询并提示，避免无意义的重试。
+        stopProgressPolling();
+        hideProgress();
+        showUnauthorized();
+        return;
+      }
+      // 网络抖动不终止轮询，跳过该次；连续失败太多次才放弃。
+      state.progressFails += 1;
+      if (state.progressFails >= PROGRESS_FAIL_LIMIT) {
+        stopProgressPolling();
+        hideProgress();
+        stopPolling();
+      }
+      return;
+    }
+    state.progressFails = 0;
+    var progress = payload.progress || {};
+    renderProgress(progress);
+    if (progress.running) {
+      state.progressSawRunning = true;
+    } else if (state.progressSawRunning) {
+      finishProgress();
+    }
+    // 开跑前的 running=false 只渲染、不当作完成，等下一轮再看。
+  }
 
   /* ------------------------------------------------------------------ *
    * App Bar：状态、错误条与刷新按钮
@@ -88,6 +216,13 @@
     }
     renderStatus(status);
     if (!status.running) {
+      // 完成收尾（重拉列表、恢复按钮）由 1 秒的进度轮询负责；状态轮询只
+      // 停掉自己，避免与进度轮询双重重拉列表。
+      if (state.progressTimer || state.progressDone) {
+        global.clearInterval(state.pollTimer);
+        state.pollTimer = 0;
+        return;
+      }
       stopPolling();
       loadContacts();
     }
@@ -109,7 +244,9 @@
       var status = await I.api("/api/status");
       renderStatus(status);
       if (status.running) {
+        // 分析在跑（每日定时或别的标签页触发的）：直接进入进度轮询。
         startPolling();
+        startProgressPolling();
       }
     } catch (err) {
       if (err.status === 401) {
@@ -444,13 +581,17 @@
       return;
     }
     if (result.status === 409) {
-      // 已经有一轮在跑，提示后直接进入轮询态。
+      // 已经有一轮在跑：提示后进入进度轮询；快照还没跟上（开跑前
+      // 的那一瞬）就先把进度条露出来。
       I.snackbar("分析正在进行中");
       startPolling();
+      showProgress();
+      startProgressPolling();
       return;
     }
     if (result.status === 202) {
       startPolling();
+      startProgressPolling();
       return;
     }
     setRefreshBusy(false);

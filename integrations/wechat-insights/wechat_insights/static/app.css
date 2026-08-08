@@ -339,6 +339,88 @@ body {
 }
 
 /* ==========================================================================
+   分析进度条（MD2 Linear Progress Indicator，4px）
+   ========================================================================== */
+
+.progress-slot {
+  background: var(--md-surface-1);
+  border-bottom: 1px solid var(--md-divider);
+}
+
+.progress-slot__inner {
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 16px 16px 8px;
+}
+
+/* 4px 高的轨道，容器用 surface 变体色做底 */
+.progress-track {
+  position: relative;
+  height: 4px;
+  border-radius: 2px;
+  overflow: hidden;
+  background: var(--md-surface-4);
+}
+
+/* 确定态：宽度由 JS 按 done/total 直接设置 */
+.progress-bar {
+  position: absolute;
+  inset: 0;
+  right: auto;
+  width: 0;
+  background: var(--md-primary);
+  transition: width 0.2s ease;
+}
+
+/* 不确定态：一段短条在轨道里来回滑动（total 为 0 或未知时） */
+.progress-indeterminate {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 40%;
+  border-radius: 2px;
+  background: var(--md-primary);
+  animation: progress-slide 1.4s ease-in-out infinite;
+}
+
+@keyframes progress-slide {
+  0% {
+    left: -40%;
+  }
+  50% {
+    left: 50%;
+  }
+  100% {
+    left: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .progress-indeterminate {
+    animation-duration: 3s;
+  }
+}
+
+.progress-caption {
+  margin: 4px 0 0;
+  font-size: 12px;
+  line-height: 16px;
+  letter-spacing: 0.0333333em;
+  color: var(--md-on-surface-medium);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+@media (max-width: 599px) {
+  .progress-slot__inner {
+    padding-left: 8px;
+    padding-right: 8px;
+  }
+}
+
+/* ==========================================================================
    警告条（MD2 Banner）
    ========================================================================== */
 

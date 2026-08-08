@@ -115,13 +115,17 @@ class AnalyzerTestCase(unittest.TestCase):
         self.reader = FakeReader({"message/message_0.db": self.database})
 
     def analyzer(
-        self, batch_size: int = 5000, strategy: DepthStrategy | None = None
+        self,
+        batch_size: int = 5000,
+        strategy: DepthStrategy | None = None,
+        progress_cb=None,
     ) -> Analyzer:
         return Analyzer(
             self.store,
             reader_factory=lambda: self.reader,
             strategy=strategy,
             batch_size=batch_size,
+            progress_cb=progress_cb,
         )
 
     def run_analysis(self, now: int = NOW, batch_size: int = 5000):
@@ -877,6 +881,92 @@ class LLMDepthRefreshTests(AnalyzerTestCase):
         self.assertTrue(payloads["A"]["scored"])
         self.assertAlmostEqual(payloads["A"]["dimensions"]["depth"], 75.0)
         self.assertAlmostEqual(payloads["B"]["dimensions"]["depth"], 25.0)
+
+
+class ProgressTests(AnalyzerTestCase):
+    """进度上报：阶段顺序、计数递增，以及 cb 异常绝不影响分析本身。"""
+
+    def run_with_progress(self, strategy=None, **kwargs):
+        events: list[dict] = []
+
+        def callback(fields: dict) -> None:
+            events.append(dict(fields))
+
+        sessions = {SESSION_ID: SimpleNamespace(display_name=DISPLAY_NAME)}
+        with patch(
+            "wechat_insights.analyzer.scan_direct_rows", return_value=sessions
+        ), patch("wechat_insights.llm.chat", side_effect=lambda s, u: '{"score": 60}'):
+            result = self.analyzer(strategy=strategy, progress_cb=callback).run(**kwargs)
+        return result, events
+
+    def test_lexical_run_reports_sync_then_score(self) -> None:
+        build_database(self.database, [them(1, 0), me(2, 60)])
+        _, events = self.run_with_progress()
+        self.assertEqual(
+            [event["phase"] for event in events], ["sync", "sync", "score"]
+        )
+        # sync 起点：total=会话数、done=0；随后每个会话前上报一次 display_name。
+        self.assertEqual(events[0], {"phase": "sync", "done": 0, "total": 1, "detail": ""})
+        self.assertEqual(
+            events[1],
+            {"phase": "sync", "done": 0, "total": 1, "detail": DISPLAY_NAME},
+        )
+        # score 阶段没有逐项计数：total=0。
+        self.assertEqual(events[2], {"phase": "score", "done": 0, "total": 0, "detail": ""})
+
+    def test_llm_run_reports_candidate_progress_between_sync_and_score(self) -> None:
+        shards: dict[str, Path] = {}
+        for index, session_id in enumerate(("c1", "c2", "c3")):
+            path = self.root / f"message_{index}.db"
+            build_database(
+                path,
+                [them(1, 0, "你好呀"), me(2, 60, "你好")],
+                session_id=session_id,
+            )
+            shards[f"message/message_{index}.db"] = path
+        self.reader = FakeReader(shards)
+        sessions = {
+            session_id: SimpleNamespace(display_name=session_id.upper())
+            for session_id in ("c1", "c2", "c3")
+        }
+        events: list[dict] = []
+        with patch(
+            "wechat_insights.analyzer.scan_direct_rows", return_value=sessions
+        ), patch("wechat_insights.llm.chat", side_effect=lambda s, u: '{"score": 40}'
+        ) as fake, patch("wechat_insights.analyzer.LLM_MAX_CALLS_PER_RUN", 2):
+            result = self.analyzer(
+                strategy=LLMDepth(), progress_cb=lambda fields: events.append(dict(fields))
+            ).run(now=NOW)
+        self.assertEqual(result.llm_scored, 2)
+        self.assertEqual(fake.call_count, 2)
+        phases = [event["phase"] for event in events]
+        # 阶段顺序：sync（起点 + 3 个会话）→ llm（起点 + 2 个候选）→ score。
+        self.assertEqual(
+            phases, ["sync"] * 4 + ["llm"] * 3 + ["score"]
+        )
+        llm = [event for event in events if event["phase"] == "llm"]
+        self.assertEqual(llm[0], {"phase": "llm", "done": 0, "total": 2, "detail": ""})
+        self.assertEqual(
+            [event["done"] for event in llm], [0, 1, 2]
+        )
+        self.assertEqual(
+            [event["detail"] for event in llm[1:]], ["C1", "C2"]
+        )
+        # 候选是「截断后的」数量，不是全部待评联系人。
+        self.assertTrue(all(event["total"] == 2 for event in llm))
+
+    def test_raising_callback_does_not_abort_the_run(self) -> None:
+        build_database(self.database, [them(1, 0), me(2, 60), them(3, 120)])
+
+        def exploding(fields: dict) -> None:
+            raise RuntimeError("callback boom")
+
+        with patch("wechat_insights.analyzer.scan_direct_rows", return_value={
+            SESSION_ID: SimpleNamespace(display_name=DISPLAY_NAME)
+        }), self.assertLogs("wechat-insights", level="DEBUG"):
+            result = self.analyzer(progress_cb=exploding).run(now=NOW)
+        # 上报失败只是记一条调试日志，读取与打分照常完成。
+        self.assertEqual(result.messages_read, 3)
 
 
 if __name__ == "__main__":
