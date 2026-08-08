@@ -1,0 +1,96 @@
+# 关系洞察看板的 compose 片段示例。
+#
+# 把下面的内容合并进你自己的 compose.local.yml（该文件不在仓库里），并按注释里的
+# 「⚠️ 需要替换」逐项核对。这个容器与主微信容器完全独立，不会改动主容器的行为。
+#
+#   docker compose -f docker-compose.yml -f compose.local.yml up -d --build wechat-insights
+---
+services:
+  wechat-insights:
+    build:
+      # 构建上下文必须是仓库根目录：镜像里同时需要 wechat_history 与 wechat_insights。
+      context: .
+      dockerfile: integrations/wechat-insights/Dockerfile
+      args:
+        # ⚠️ 需要替换：与主容器的 PUID/PGID 保持一致，否则读不到 0600 的密钥文件。
+        - PUID=${PUID:-1000}
+        - PGID=${PGID:-100}
+    image: wechat-insights:latest
+    container_name: wechat-insights
+    # 与构建参数一致；命名卷 /data 的属主也是这个 uid。
+    user: "${PUID:-1000}:${PGID:-100}"
+    restart: unless-stopped
+    ports:
+      # ⚠️ 看板展示高度隐私的聊天统计。只发布到回环地址与自己的 Tailscale 地址
+      #    （100.x 网段），任何情况下都不要暴露到局域网或公网。
+      - "127.0.0.1:8300:8300"
+      # ⚠️ 需要替换：换成你自己的 Tailscale 地址（ip addr 里 100.x 那条）。
+      - "100.65.58.76:8300:8300"
+    volumes:
+      # 生产挂载源是与主容器 /config 共用的 named volume（默认方式），这里只读。
+      # ⚠️ 需要替换：换成主 compose 里 /config 实际使用的卷名。
+      - wechat-selkies-config:/history-source:ro
+      # 备选：把微信数据目录复制到了宿主机某处时，改用 bind 挂载
+      # （注释掉上面那一行、启用下面这行，路径换成你自己的）：
+      # - /absolute/path/to/config:/history-source:ro
+      # 两种方式都没有「找不到就静默建空目录」以外的坑：bind 路径不存在时 Docker
+      # 也会自动建一个空目录，同样会「看起来健康但分析零条消息」——所以两种方式
+      # 都靠下面的 healthcheck 对空目录兜底，源目录里没有任何 *.db 就判不健康。
+      # ⚠️ 需要替换：keyscan profile 写入的那个 named volume 名字（照抄你现有
+      #    compose.local.yml 里 history-keyscan 用的卷名），同样只读。
+      - wechat-history-keys:/run/wechat-history:ro
+      # 分析结果持久化；重启容器不丢已算好的指标。
+      - wechat-insights-data:/data
+    tmpfs:
+      # 解密后的明文快照只落在 tmpfs，容器停止即消失。选项每个都有理由，不要随手删
+      # —— Docker 只要传了任何选项就会整体替换 tmpfs 默认挂载参数（而不是合并），
+      # 漏掉任何一个安全选项都会让明文缓存以 exec/suid 挂载，等于留了提权后门：
+      #   rw        —— SnapshotCache 要在这里建目录、写解密后的消息分片；
+      #   noexec    —— 明文聊天数据绝不可能是程序，禁止从这里执行任何东西；
+      #   nosuid    —— 禁止 setuid 位生效，配合上一条封死提权路径；
+      #   nodev     —— 不允许设备节点，防止造出特殊文件；
+      #   size=1g   —— 明文缓存上限 INSIGHTS_MAX_CACHE_BYTES 默认 960 MiB，九个
+      #                消息分片全量解密实测峰值 474.9 MiB，1g 留足余量；
+      #   mode=0700 —— 只有容器运行用户能读明文，其他 uid 一律拒之门外；
+      #   uid/gid   —— 必须与 user: 一致，否则进程写不进去、快照直接失败。
+      - /run/wechat-history-cache:rw,noexec,nosuid,nodev,size=1g,mode=0700,uid=${PUID:-1000},gid=${PGID:-100}
+    environment:
+      # 容器本地时区决定「按天/深夜/周末」的切分，建议与你自己一致。
+      - TZ=${TZ:-Asia/Shanghai}
+      # 每天固定时刻跑一轮增量分析（HH:MM）。
+      - INSIGHTS_ANALYZE_TIME=${INSIGHTS_ANALYZE_TIME:-04:30}
+      # ⚠️ 强烈建议设置：设置后所有请求（含静态资源）都需要
+      #    Authorization: Bearer <token> 或 ?token=<token>。留空则只打印一条警告。
+      - INSIGHTS_AUTH_TOKEN=${INSIGHTS_AUTH_TOKEN:-}
+      # 解密明文缓存上限（字节），默认 1006632960 = 960 MiB，必须 ≤ 上面 tmpfs 的
+      # size=——缓存写满前先撞 tmpfs 内存上限会硬失败，上限设得再大也没用。
+      - INSIGHTS_MAX_CACHE_BYTES=${INSIGHTS_MAX_CACHE_BYTES:-1006632960}
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python3 -c "import urllib.request,os;
+          req=urllib.request.Request('http://127.0.0.1:8300/api/status');
+          t=os.environ.get('INSIGHTS_AUTH_TOKEN');
+          t and req.add_header('Authorization','Bearer '+t);
+          urllib.request.urlopen(req, timeout=5)"
+          &&
+          find /history-source -name '*.db' -print -quit | grep -q .
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  # ⚠️ 需要替换：换成你现有 keyscan profile 实际使用的卷名，并声明为 external
+  #    （或直接删掉这一条，沿用主 compose 里已有的定义）。
+  wechat-history-keys:
+    external: true
+  # 微信数据卷：声明为 external 让 compose 在卷不存在时直接报错（和密钥卷一样
+  # 是「响亮」的失败），而不是静默创建一个空卷——空卷就是「一切正常但零条消息」
+  # 的隐藏失败。如果改用上面的 bind 挂载，删掉这一条即可。
+  # ⚠️ 需要替换：卷名带项目前缀，照抄主 compose 里实际定义的那个名字。
+  wechat-selkies-config:
+    external: true
+    name: wechat-selkies_wechat-selkies-config
+  wechat-insights-data:

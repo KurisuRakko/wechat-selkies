@@ -270,6 +270,15 @@ docker run -it -p 3001:3001 -v ./config:/config --device /dev/dri:/dev/dri nickr
 完整的构建、密钥扫描、MCP 配置、安全边界和测试说明见
 [本机微信聊天记录 MCP](docs/wechat-history.md)。请勿发布启用了该功能的公共镜像。
 
+### 可选：关系洞察看板
+
+在上面那套只读能力之上，还有一个**独立容器** `wechat-insights`：夜间离线统计私聊
+记录，算出每个联系人的五维关系指标，用一个 Material Design 2 网页展示。它不改动主
+微信容器的任何行为，只读挂载同一份数据，`metrics.db` 里只有统计数字、没有聊天内容。
+构建、compose 合并方法、环境变量与安全注意事项见
+[integrations/wechat-insights/README.md](integrations/wechat-insights/README.md)。
+看板展示的是高度隐私的数据，端口只发布到 `127.0.0.1`，不要暴露公网。
+
 ## 安装第三方应用（如 Telegram）
 
 本项目支持通过 [proot-apps](https://github.com/linuxserver/proot-apps) 安装第三方 Linux 应用。以 Telegram 为例：

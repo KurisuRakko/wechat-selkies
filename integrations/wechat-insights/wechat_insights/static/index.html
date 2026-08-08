@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>关系洞察</title>
+    <link rel="stylesheet" href="/static/app.css" />
+  </head>
+  <body>
+    <header class="app-bar">
+      <div class="app-bar__row">
+        <div class="app-bar__titles">
+          <h1 class="app-bar__title">关系洞察</h1>
+          <p class="app-bar__subtitle" id="status-line">加载中…</p>
+        </div>
+        <button class="btn btn--on-appbar" id="refresh-btn" type="button">刷新</button>
+      </div>
+    </header>
+
+    <!-- 后端上报的分析错误会以 MD2 警告条的形式插在这里 -->
+    <div id="banner-slot"></div>
+
+    <main class="page">
+      <div class="toolbar">
+        <span class="select">
+          <span class="select__label">排序</span>
+          <select id="sort-select" aria-label="排序方式">
+            <option value="overall">综合分</option>
+            <option value="recent">最近活跃</option>
+            <option value="trend">趋势</option>
+          </select>
+        </span>
+        <span class="toolbar__meta" id="summary-line"></span>
+      </div>
+
+      <div id="content"></div>
+    </main>
+
+    <script src="/static/vendor/echarts.min.js"></script>
+    <script src="/static/common.js"></script>
+    <script src="/static/list.js"></script>
+  </body>
+</html>

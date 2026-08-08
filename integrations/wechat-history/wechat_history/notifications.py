@@ -23,10 +23,9 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from pywebpush import WebPushException, webpush_async
 
 from .attach import AttachPreparer
-from .constants import TARGET_USERNAME
 from .errors import HistoryError
-from .formatting import decompress_content
 from .reader import HistoryReader, _read_connection
+from .sessions import scan_direct_rows
 
 
 LOG = logging.getLogger("wechat-notifications")
@@ -50,26 +49,6 @@ WEB_PUSH_TIMEOUT_SECONDS = 10
 VAPID_SUBJECT = "mailto:wechat-selkies@example.invalid"
 
 _WHITESPACE = re.compile(r"\s+")
-_SYSTEM_SESSION_IDS = {
-    "blogapp",
-    "facebookapp",
-    "feedsapp",
-    "filehelper",
-    "floatbottle",
-    "fmessage",
-    "masssendapp",
-    "medianote",
-    "newsapp",
-    "notifymessage",
-    "notification_messages",
-    "officialaccounts",
-    "qmessage",
-    "qqmail",
-    "tmessage",
-    "voip",
-    "weixin",
-    "weixinreminder",
-}
 
 
 class NotificationError(RuntimeError):
@@ -256,50 +235,18 @@ class CursorStore:
 
 
 def scan_direct_sessions(reader: HistoryReader) -> dict[str, DirectSession]:
-    reader.ensure_account_validated()
-    contacts = reader._load_contacts()
-    database = reader.cache.get("session/session.db")
-    with _read_connection(database) as connection:
-        rows = connection.execute(
-            """
-            SELECT username, unread_count, summary, last_timestamp,
-                   last_msg_locald_id, is_hidden
-            FROM SessionTable
-            WHERE last_timestamp > 0
-            """
-        ).fetchall()
+    """在共享的私聊扫描结果上补齐通知需要的游标与预览文本。"""
 
-    sessions: dict[str, DirectSession] = {}
-    for row in rows:
-        session_id = str(row["username"] or "")
-        if (
-            not session_id
-            or session_id == TARGET_USERNAME
-            or session_id in _SYSTEM_SESSION_IDS
-            or session_id.startswith("gh_")
-            or "@chatroom" in session_id
-            or session_id not in contacts
-            or int(row["is_hidden"] or 0) != 0
-        ):
-            continue
-        timestamp = int(row["last_timestamp"] or 0)
-        local_id = int(row["last_msg_locald_id"] or 0)
-        if timestamp <= 0 or local_id < 0:
-            continue
-        summary = decompress_content(
-            row["summary"], 4 if isinstance(row["summary"], bytes) else 0
+    return {
+        row.session_id: DirectSession(
+            session_id=row.session_id,
+            display_name=row.display_name,
+            cursor=MessageCursor(row.timestamp, row.local_id),
+            unread_count=row.unread_count,
+            preview=_safe_preview(row.summary),
         )
-        if summary and ":\n" in summary:
-            summary = summary.split(":\n", 1)[1]
-        display_name = str(contacts[session_id].get("display_name") or session_id)
-        sessions[session_id] = DirectSession(
-            session_id=session_id,
-            display_name=display_name,
-            cursor=MessageCursor(timestamp, local_id),
-            unread_count=max(0, int(row["unread_count"] or 0)),
-            preview=_safe_preview(summary),
-        )
-    return sessions
+        for row in scan_direct_rows(reader).values()
+    }
 
 
 def read_new_messages(

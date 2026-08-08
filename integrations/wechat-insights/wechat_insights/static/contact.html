@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>联系人详情 · 关系洞察</title>
+    <link rel="stylesheet" href="/static/app.css" />
+  </head>
+  <body>
+    <header class="app-bar">
+      <div class="app-bar__row">
+        <a class="icon-btn" id="back-link" href="/" aria-label="返回列表">←</a>
+        <div class="app-bar__titles">
+          <h1 class="app-bar__title" id="contact-name">联系人详情</h1>
+          <p class="app-bar__subtitle" id="contact-meta"></p>
+        </div>
+      </div>
+    </header>
+
+    <main class="page">
+      <div id="content"></div>
+    </main>
+
+    <script src="/static/vendor/echarts.min.js"></script>
+    <script src="/static/common.js"></script>
+    <script src="/static/detail.js"></script>
+  </body>
+</html>

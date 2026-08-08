@@ -1,0 +1,774 @@
+/* 微信关系洞察看板 —— Material Design 2 样式表
+ *
+ * 约定：
+ *   1. 所有间距都是 8dp 网格的倍数（4px 只用于图标与文字之间的微调）。
+ *   2. 颜色一律走 CSS 自定义属性，亮/暗两套在 :root 与 prefers-color-scheme 里各定义一次。
+ *   3. 暗色主题的 surface 基色是 #121212，更高的 elevation 用半透明白色叠加后的实色表达。
+ */
+
+/* ==========================================================================
+   设计令牌
+   ========================================================================== */
+
+:root {
+  /* 主色：靛蓝；次色：微信绿 */
+  --md-primary: #3f51b5;
+  --md-primary-dark: #303f9f;
+  --md-secondary: #07c160;
+
+  /* 表面与背景。surface-1 / -4 / -8 对应不同 elevation 下的实际底色 */
+  --md-background: #f5f5f5;
+  --md-surface: #ffffff;
+  --md-surface-1: #ffffff;
+  --md-surface-4: #ffffff;
+  --md-surface-8: #ffffff;
+
+  /* 文字与图标 */
+  --md-on-primary: #ffffff;
+  --md-on-surface: rgba(0, 0, 0, 0.87);
+  --md-on-surface-medium: rgba(0, 0, 0, 0.6);
+  --md-on-surface-disabled: rgba(0, 0, 0, 0.38);
+  --md-divider: rgba(0, 0, 0, 0.12);
+
+  /* 语义色 */
+  --md-error: #b00020;
+  --md-positive: #2e7d32;
+  --md-negative: #c62828;
+  --md-warning-bg: #fff8e1;
+  --md-warning-fg: #7a5c00;
+
+  /* 交互状态叠加层（MD2 state overlay） */
+  --md-state-hover: rgba(0, 0, 0, 0.04);
+  --md-state-focus: rgba(0, 0, 0, 0.12);
+  --md-state-hover-on-primary: rgba(255, 255, 255, 0.08);
+  --md-state-focus-on-primary: rgba(255, 255, 255, 0.24);
+
+  /* App Bar 在亮色下是主色底，暗色下是抬升的 surface */
+  --md-appbar-bg: var(--md-primary);
+  --md-appbar-on: #ffffff;
+  --md-appbar-on-medium: rgba(255, 255, 255, 0.72);
+
+  /* 图表辅助色 */
+  --md-chart-axis: rgba(0, 0, 0, 0.26);
+  --md-chart-split: rgba(0, 0, 0, 0.12);
+  --md-chart-reference: #9e9e9e;
+
+  /* MD2 阴影 */
+  --md-elevation-1: 0 1px 3px rgba(0, 0, 0, 0.12), 0 1px 2px rgba(0, 0, 0, 0.24);
+  --md-elevation-4: 0 4px 5px rgba(0, 0, 0, 0.14), 0 1px 10px rgba(0, 0, 0, 0.12),
+    0 2px 4px rgba(0, 0, 0, 0.2);
+  --md-elevation-8: 0 8px 10px rgba(0, 0, 0, 0.14), 0 3px 14px rgba(0, 0, 0, 0.12),
+    0 5px 5px rgba(0, 0, 0, 0.2);
+
+  --md-font: Roboto, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    /* 暗色下主色改用靛蓝 200，保证在深底上的对比度（MD2 对深色主题的建议） */
+    --md-primary: #9fa8da;
+    --md-primary-dark: #7986cb;
+    --md-secondary: #5bd98a;
+
+    --md-background: #121212;
+    --md-surface: #121212;
+    --md-surface-1: #1e1e1e; /* 5% 白色叠加 */
+    --md-surface-4: #272727; /* 9% 白色叠加 */
+    --md-surface-8: #2e2e2e; /* 12% 白色叠加 */
+
+    --md-on-primary: rgba(0, 0, 0, 0.87);
+    --md-on-surface: rgba(255, 255, 255, 0.87);
+    --md-on-surface-medium: rgba(255, 255, 255, 0.6);
+    --md-on-surface-disabled: rgba(255, 255, 255, 0.38);
+    --md-divider: rgba(255, 255, 255, 0.12);
+
+    --md-error: #cf6679;
+    --md-positive: #81c784;
+    --md-negative: #ef9a9a;
+    --md-warning-bg: #33291a;
+    --md-warning-fg: #ffcc80;
+
+    --md-state-hover: rgba(255, 255, 255, 0.04);
+    --md-state-focus: rgba(255, 255, 255, 0.12);
+
+    --md-appbar-bg: var(--md-surface-4);
+    --md-appbar-on: rgba(255, 255, 255, 0.87);
+    --md-appbar-on-medium: rgba(255, 255, 255, 0.6);
+
+    --md-chart-axis: rgba(255, 255, 255, 0.26);
+    --md-chart-split: rgba(255, 255, 255, 0.12);
+    --md-chart-reference: #757575;
+  }
+}
+
+/* ==========================================================================
+   基础
+   ========================================================================== */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  background: var(--md-background);
+  color: var(--md-on-surface);
+  font-family: var(--md-font);
+  font-size: 14px;
+  line-height: 20px;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* MD2 排版尺度 */
+.md-headline6 {
+  font-size: 20px;
+  line-height: 24px;
+  font-weight: 500;
+  letter-spacing: 0.0125em;
+}
+
+.md-subtitle1 {
+  font-size: 16px;
+  line-height: 24px;
+  font-weight: 400;
+  letter-spacing: 0.009375em;
+}
+
+.md-body2 {
+  font-size: 14px;
+  line-height: 20px;
+  font-weight: 400;
+  letter-spacing: 0.0178571em;
+}
+
+.md-caption {
+  font-size: 12px;
+  line-height: 16px;
+  font-weight: 400;
+  letter-spacing: 0.0333333em;
+  color: var(--md-on-surface-medium);
+}
+
+.md-overline {
+  font-size: 12px;
+  line-height: 16px;
+  font-weight: 500;
+  letter-spacing: 0.1666667em;
+  text-transform: uppercase;
+  color: var(--md-on-surface-medium);
+}
+
+/* ==========================================================================
+   App Bar
+   ========================================================================== */
+
+.app-bar {
+  position: sticky;
+  top: 0;
+  z-index: 4;
+  height: 64px;
+  background: var(--md-appbar-bg);
+  color: var(--md-appbar-on);
+  box-shadow: var(--md-elevation-4);
+}
+
+.app-bar__row {
+  height: 64px;
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 0 16px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.app-bar__titles {
+  min-width: 0;
+  flex: 1;
+}
+
+.app-bar__title {
+  margin: 0;
+  font-size: 20px;
+  line-height: 24px;
+  font-weight: 500;
+  letter-spacing: 0.0125em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.app-bar__subtitle {
+  margin: 0;
+  font-size: 12px;
+  line-height: 16px;
+  letter-spacing: 0.0333333em;
+  color: var(--md-appbar-on-medium);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 返回箭头：40px 触控区里放一个 24px 图标 */
+.icon-btn {
+  flex: none;
+  width: 40px;
+  height: 40px;
+  border: 0;
+  padding: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: inherit;
+  font-size: 24px;
+  line-height: 1;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-decoration: none;
+  transition: background-color 0.15s ease;
+}
+
+.icon-btn:hover {
+  background: var(--md-state-hover-on-primary);
+}
+
+.icon-btn:focus-visible {
+  outline: none;
+  background: var(--md-state-focus-on-primary);
+}
+
+/* ==========================================================================
+   按钮
+   ========================================================================== */
+
+.btn {
+  height: 36px;
+  min-width: 64px;
+  padding: 0 16px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--md-primary);
+  font-family: inherit;
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: 0.0892857em;
+  text-transform: uppercase;
+  cursor: pointer;
+  transition: background-color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.btn:hover {
+  background: var(--md-state-hover);
+}
+
+.btn:focus-visible {
+  outline: none;
+  background: var(--md-state-focus);
+}
+
+.btn:disabled {
+  color: var(--md-on-surface-disabled);
+  cursor: default;
+  background: transparent;
+}
+
+/* App Bar 上的文字按钮，配色跟随 App Bar 前景色 */
+.btn--on-appbar {
+  color: var(--md-appbar-on);
+  flex: none;
+}
+
+.btn--on-appbar:hover {
+  background: var(--md-state-hover-on-primary);
+}
+
+.btn--on-appbar:focus-visible {
+  background: var(--md-state-focus-on-primary);
+}
+
+.btn--on-appbar:disabled {
+  color: var(--md-appbar-on-medium);
+  background: transparent;
+}
+
+/* ==========================================================================
+   页面容器与卡片
+   ========================================================================== */
+
+.page {
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 24px 16px 48px;
+}
+
+.card {
+  position: relative;
+  background: var(--md-surface-1);
+  border-radius: 4px;
+  box-shadow: var(--md-elevation-1);
+  padding: 16px;
+}
+
+.card__title {
+  margin: 0 0 16px;
+  font-size: 16px;
+  line-height: 24px;
+  font-weight: 500;
+  letter-spacing: 0.009375em;
+}
+
+.card__subtitle {
+  margin: -8px 0 16px;
+  font-size: 12px;
+  line-height: 16px;
+  color: var(--md-on-surface-medium);
+}
+
+/* 详情页的卡片竖排 */
+.stack {
+  display: grid;
+  gap: 16px;
+}
+
+/* ==========================================================================
+   警告条（MD2 Banner）
+   ========================================================================== */
+
+.banner {
+  background: var(--md-warning-bg);
+  color: var(--md-warning-fg);
+  border-bottom: 1px solid var(--md-divider);
+}
+
+.banner__inner {
+  max-width: 1280px;
+  margin: 0 auto;
+  padding: 16px;
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+  font-size: 14px;
+  line-height: 20px;
+}
+
+.banner__icon {
+  flex: none;
+  font-size: 20px;
+  line-height: 20px;
+}
+
+/* ==========================================================================
+   工具条与下拉
+   ========================================================================== */
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 16px;
+  margin-bottom: 24px;
+}
+
+.select {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+.select__label {
+  position: absolute;
+  top: -8px;
+  left: 8px;
+  padding: 0 4px;
+  background: var(--md-background);
+  font-size: 12px;
+  line-height: 16px;
+  color: var(--md-on-surface-medium);
+  pointer-events: none;
+}
+
+.select select {
+  height: 40px;
+  padding: 0 32px 0 16px;
+  border: 1px solid var(--md-divider);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--md-on-surface);
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 20px;
+  cursor: pointer;
+  appearance: none;
+}
+
+.select select:hover {
+  border-color: var(--md-on-surface-medium);
+}
+
+.select select:focus {
+  outline: none;
+  border-color: var(--md-primary);
+  box-shadow: inset 0 0 0 1px var(--md-primary);
+}
+
+/* 下拉箭头 */
+.select::after {
+  content: "";
+  position: absolute;
+  right: 14px;
+  width: 0;
+  height: 0;
+  border-left: 5px solid transparent;
+  border-right: 5px solid transparent;
+  border-top: 5px solid var(--md-on-surface-medium);
+  pointer-events: none;
+}
+
+.toolbar__meta {
+  margin-left: auto;
+  font-size: 12px;
+  line-height: 16px;
+  color: var(--md-on-surface-medium);
+}
+
+/* ==========================================================================
+   联系人卡片网格
+   ========================================================================== */
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 16px;
+}
+
+.contact-card {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: 0;
+  font-family: inherit;
+  color: inherit;
+  cursor: pointer;
+  transition: box-shadow 0.15s ease, background-color 0.15s ease;
+}
+
+.contact-card:hover {
+  box-shadow: var(--md-elevation-8);
+  background-image: linear-gradient(var(--md-state-hover), var(--md-state-hover));
+}
+
+.contact-card:focus-visible {
+  outline: none;
+  box-shadow: var(--md-elevation-8);
+  background-image: linear-gradient(var(--md-state-focus), var(--md-state-focus));
+}
+
+.contact-card__head {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.avatar {
+  flex: none;
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  color: #fff;
+  font-size: 18px;
+  line-height: 40px;
+  font-weight: 500;
+  text-align: center;
+  user-select: none;
+}
+
+.contact-card__id {
+  flex: 1;
+  min-width: 0;
+}
+
+.contact-card__name {
+  display: block;
+  font-size: 16px;
+  line-height: 24px;
+  font-weight: 400;
+  letter-spacing: 0.009375em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.contact-card__meta {
+  display: block;
+  font-size: 12px;
+  line-height: 16px;
+  color: var(--md-on-surface-medium);
+}
+
+.contact-card__body {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-top: 16px;
+}
+
+.contact-card__radar {
+  flex: none;
+  width: 120px;
+  height: 120px;
+}
+
+.contact-card__side {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+/* 综合分环形 */
+.ring {
+  flex: none;
+  display: block;
+}
+
+.ring__track {
+  fill: none;
+  stroke: var(--md-divider);
+}
+
+.ring__value {
+  fill: none;
+  stroke-linecap: round;
+  transform: rotate(-90deg);
+  transform-origin: 50% 50%;
+}
+
+.ring__label {
+  font-size: 16px;
+  font-weight: 500;
+  fill: var(--md-on-surface);
+}
+
+/* 趋势 */
+.trend {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+  font-size: 14px;
+  line-height: 20px;
+  font-weight: 500;
+}
+
+.trend--up {
+  color: var(--md-positive);
+}
+
+.trend--down {
+  color: var(--md-negative);
+}
+
+.trend--flat {
+  color: var(--md-on-surface-medium);
+}
+
+.trend__arrow {
+  font-size: 16px;
+}
+
+/* 数据不足的占位块 */
+.insufficient {
+  margin-top: 16px;
+  padding: 16px;
+  border: 1px dashed var(--md-divider);
+  border-radius: 4px;
+  text-align: center;
+}
+
+.insufficient__title {
+  font-size: 12px;
+  line-height: 16px;
+  font-weight: 500;
+  color: var(--md-on-surface-disabled);
+}
+
+.insufficient__desc {
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 16px;
+  color: var(--md-on-surface-disabled);
+}
+
+/* ==========================================================================
+   详情页专用
+   ========================================================================== */
+
+.chart {
+  width: 100%;
+  height: 320px;
+}
+
+.chart--tall {
+  height: 360px;
+}
+
+.milestones {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 16px;
+}
+
+.milestone__label {
+  font-size: 12px;
+  line-height: 16px;
+  color: var(--md-on-surface-medium);
+}
+
+.milestone__value {
+  margin-top: 4px;
+  font-size: 20px;
+  line-height: 24px;
+  font-weight: 500;
+}
+
+.milestone__note {
+  margin-top: 4px;
+  font-size: 12px;
+  line-height: 16px;
+  color: var(--md-on-surface-medium);
+}
+
+.anomaly {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--md-divider);
+}
+
+.anomaly:last-child {
+  border-bottom: 0;
+}
+
+.anomaly__label {
+  flex: 1;
+  min-width: 0;
+  font-size: 14px;
+  line-height: 20px;
+}
+
+.anomaly__change {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  line-height: 20px;
+  font-variant-numeric: tabular-nums;
+}
+
+.anomaly__before {
+  color: var(--md-on-surface-medium);
+}
+
+.anomaly__arrow--worse {
+  color: var(--md-negative);
+}
+
+.anomaly__arrow--better {
+  color: var(--md-positive);
+}
+
+/* ==========================================================================
+   加载 / 空 / 错误状态
+   ========================================================================== */
+
+.state {
+  padding: 48px 16px;
+  text-align: center;
+  color: var(--md-on-surface-medium);
+}
+
+.state__title {
+  margin-top: 16px;
+  font-size: 16px;
+  line-height: 24px;
+  color: var(--md-on-surface);
+}
+
+.state__desc {
+  margin-top: 8px;
+  font-size: 14px;
+  line-height: 20px;
+}
+
+/* MD2 圆形进度指示器 */
+.spinner {
+  display: inline-block;
+  width: 40px;
+  height: 40px;
+  border: 4px solid var(--md-divider);
+  border-top-color: var(--md-primary);
+  border-radius: 50%;
+  animation: spinner-rotate 0.9s linear infinite;
+}
+
+@keyframes spinner-rotate {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation-duration: 3s;
+  }
+}
+
+/* ==========================================================================
+   Snackbar
+   ========================================================================== */
+
+.snackbar {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  z-index: 8;
+  transform: translate(-50%, 16px);
+  min-width: 288px;
+  max-width: calc(100vw - 32px);
+  padding: 16px;
+  border-radius: 4px;
+  background: #323232;
+  color: rgba(255, 255, 255, 0.87);
+  font-size: 14px;
+  line-height: 20px;
+  box-shadow: var(--md-elevation-8);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s ease, transform 0.15s ease;
+}
+
+.snackbar--open {
+  opacity: 1;
+  transform: translate(-50%, 0);
+}
+
+@media (max-width: 599px) {
+  .app-bar__row,
+  .page {
+    padding-left: 8px;
+    padding-right: 8px;
+  }
+
+  .contact-card__body {
+    flex-wrap: wrap;
+  }
+}
