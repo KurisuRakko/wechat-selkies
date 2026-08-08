@@ -140,7 +140,7 @@
   }
 
   /* ------------------------------------------------------------------ *
-   * 排序：未打分的一律沉底
+   * 排序：有分的 > 数据不足 > 归零（未打分的都沉底，归零沉到最深）
    * ------------------------------------------------------------------ */
 
   var SORT_KEYS = {
@@ -155,11 +155,20 @@
     }
   };
 
+  function itemTier(item) {
+    if (item.scored) {
+      return 2;
+    }
+    return item.zeroed ? 0 : 1;
+  }
+
   function sortedItems() {
     var pick = SORT_KEYS[els.sortSelect.value] || SORT_KEYS.overall;
     return state.items.slice().sort(function (a, b) {
-      if (a.scored !== b.scored) {
-        return a.scored ? -1 : 1;
+      var at = itemTier(a);
+      var bt = itemTier(b);
+      if (at !== bt) {
+        return bt - at;
       }
       var av = pick(a);
       var bv = pick(b);
@@ -272,7 +281,7 @@
     );
   }
 
-  /** 卡片里的五维 mini 雷达，无标题无图例、关动画。 */
+  /** 卡片里的七维 mini 雷达，无标题无图例、关动画。 */
   function miniRadarOption(dimensions) {
     return function (theme) {
       return {
@@ -335,15 +344,23 @@
       recent +
       "</span>" +
       "</span>" +
-      (item.scored ? ringSvg(item.overall) : "") +
+      // 归零的联系人同样显示 0 分圆环：灰色弱化，不占主色。
+      (item.scored || item.zeroed ? ringSvg(item.overall) : "") +
       "</div>";
 
-    if (!item.scored) {
+    if (item.zeroed) {
+      card.innerHTML =
+        head +
+        '<div class="insufficient">' +
+        '<div class="insufficient__title">已归零</div>' +
+        '<div class="insufficient__desc">两年内没有往来，已归零</div>' +
+        "</div>";
+    } else if (!item.scored) {
       card.innerHTML =
         head +
         '<div class="insufficient">' +
         '<div class="insufficient__title">数据不足</div>' +
-        '<div class="insufficient__desc">近 90 天往来消息不足</div>' +
+        '<div class="insufficient__desc">近两年往来消息不足</div>' +
         "</div>";
     } else {
       card.innerHTML =

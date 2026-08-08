@@ -7,13 +7,15 @@
    * 常量
    * ------------------------------------------------------------------ */
 
-  // 五维的固定顺序与中文名，雷达图、表格、排序都以此为准。
+  // 七维的固定顺序与中文名，雷达图、表格、排序都以此为准。
   var DIMENSIONS = [
     ["responsiveness", "响应"],
     ["initiative", "主动"],
     ["investment", "投入"],
     ["rhythm", "节奏"],
-    ["depth", "深度"]
+    ["depth", "深度"],
+    ["constancy", "恒常"],
+    ["reciprocity", "对等"]
   ];
 
   // Material Design 2 的 500 色板，用于生成首字母头像底色。
@@ -378,6 +380,148 @@
       });
     });
   });
+
+  /* ------------------------------------------------------------------ *
+   * 分数说明弹窗
+   * ------------------------------------------------------------------ */
+
+  // 文案与 scoring.py 的维度权重一一对应，改权重时记得同步这里。
+  var SCORING_HELP = {
+    title: "这些分数是怎么算的",
+    intro:
+      "所有分数都是「相对分」：每项指标先在你的全部联系人里取百分位（0–100），" +
+      "再按权重合成维度分；综合分是七个维度的平均。也就是说 80 分的意思是" +
+      "「比 80% 的联系人强」，不是绝对好坏。统计范围是近两年的聊天，并按时间" +
+      "衰减加权——昨天权重最高，三个月前约剩一半，一年前约 6%；两年内完全没有" +
+      "往来就归零。",
+    dimensions: [
+      {
+        name: "响应",
+        desc:
+          "TA 回复你的速度。回复延迟的中位数（占 60%，越短越好）＋ 秒回率" +
+          "（60 秒内回复的比例，占 40%）。"
+      },
+      {
+        name: "主动",
+        desc:
+          "谁在主动维系这段关系。TA 主动发起对话的占比（40%）＋ TA 连发多条" +
+          "「追加」的比例（30%）＋ 对话由 TA 说最后一句的占比（30%）。"
+      },
+      {
+        name: "投入",
+        desc:
+          "TA 每天花在你身上的「成本」。语音、通话、图片按等价条数加权" +
+          "（通话×8、语音/视频×3、图片/文件×1.5），文字每 20 字算 1 个单位，" +
+          "折成日均成本（45%）；再加日均消息条数（20%）、日均字数（20%）、" +
+          "表情包占比（15%）。"
+      },
+      {
+        name: "节奏",
+        desc:
+          "你们聊天的形态。深夜聊天占比（23:00–02:00，30%）＋ 周末聊天占比" +
+          "（20%）＋ 平均每段对话的轮次（30%）＋ 长对话占比（超过 20 轮，20%）。"
+      },
+      {
+        name: "深度",
+        desc:
+          "聊天内容的分量。TA 消息的平均长度（40%）＋ 疑问句占比（30%）＋" +
+          "长消息占比（超过 50 字，30%）。目前用文本特征做代理，不读取聊天" +
+          "内容本身含义。"
+      },
+      {
+        name: "恒常",
+        desc:
+          "联系是否细水长流。有往来的天数占比（40%）＋ 当前已经沉默了多少天" +
+          "（35%，越久越差）＋ 两年内最长的一次断联（25%，越长越差）。"
+      },
+      {
+        name: "对等",
+        desc:
+          "关系是不是双向的。双方消息量的均衡度（40%）＋ 字数均衡度（30%）＋" +
+          "谁发起对话的均衡度（30%）；完全对等记满值，一边倒则趋近于零。"
+      }
+    ],
+    footnote: "往来消息不足 50 条的联系人不打分；打分每天自动更新一次。"
+  };
+
+  var helpDialogEl = null;
+  var helpTrigger = null;
+
+  /** 关闭说明弹窗并把焦点还给打开它的按钮。 */
+  function closeScoringHelp() {
+    if (!helpDialogEl || !helpDialogEl.classList.contains("dialog-scrim--open")) {
+      return;
+    }
+    helpDialogEl.classList.remove("dialog-scrim--open");
+    if (helpTrigger) {
+      helpTrigger.focus();
+    }
+  }
+
+  /** 打开「分数怎么算」弹窗；内容只在第一次打开时构建。 */
+  function openScoringHelp() {
+    if (!helpDialogEl) {
+      helpDialogEl = document.createElement("div");
+      helpDialogEl.className = "dialog-scrim";
+      helpDialogEl.innerHTML =
+        '<div class="dialog" role="dialog" aria-modal="true" aria-labelledby="scoring-help-title">' +
+        '<div class="dialog__head">' +
+        '<h2 class="dialog__title" id="scoring-help-title">' +
+        escapeHtml(SCORING_HELP.title) +
+        "</h2>" +
+        '<button class="icon-btn dialog__close" type="button" aria-label="关闭">×</button>' +
+        "</div>" +
+        '<div class="dialog__body">' +
+        '<p class="dialog__intro">' +
+        escapeHtml(SCORING_HELP.intro) +
+        "</p>" +
+        '<div class="dialog__dims">' +
+        SCORING_HELP.dimensions
+          .map(function (dim) {
+            return (
+              '<div class="dialog-dim">' +
+              '<div class="dialog-dim__name">' +
+              escapeHtml(dim.name) +
+              "</div>" +
+              '<div class="dialog-dim__desc">' +
+              escapeHtml(dim.desc) +
+              "</div>" +
+              "</div>"
+            );
+          })
+          .join("") +
+        "</div>" +
+        '<p class="dialog__footnote">' +
+        escapeHtml(SCORING_HELP.footnote) +
+        "</p>" +
+        "</div>" +
+        "</div>";
+      document.body.appendChild(helpDialogEl);
+      // 点遮罩（scrim）本身也关闭；内容区点击不冒泡到关闭逻辑。
+      helpDialogEl.addEventListener("click", function (event) {
+        if (event.target === helpDialogEl) {
+          closeScoringHelp();
+        }
+      });
+      helpDialogEl
+        .querySelector(".dialog__close")
+        .addEventListener("click", closeScoringHelp);
+    }
+    helpDialogEl.classList.add("dialog-scrim--open");
+    helpDialogEl.querySelector(".dialog__close").focus();
+  }
+
+  global.addEventListener("keydown", function (event) {
+    if (event.key === "Escape" && helpDialogEl && helpDialogEl.classList.contains("dialog-scrim--open")) {
+      closeScoringHelp();
+    }
+  });
+
+  // 两个页面都在页头放一个 id="help-btn" 的「?」图标按钮，这里统一接线。
+  helpTrigger = document.getElementById("help-btn");
+  if (helpTrigger) {
+    helpTrigger.addEventListener("click", openScoringHelp);
+  }
 
   /* ------------------------------------------------------------------ *
    * 导出

@@ -109,23 +109,49 @@ def quantile(histogram: list[int], fraction: float) -> float | None:
     return float(2 ** HISTOGRAM_BUCKETS)
 
 
+# —— 打分窗口的指数衰减 ——
+
+
+def decayed_weight(age_days: int, half_life: int) -> float:
+    """窗口内一个天桶的权重：0.5^(天龄/半衰期)。
+
+    age_days 是距离「今天」的天数（今天为 0），半衰期处权重正好 0.5。
+    """
+
+    return 0.5 ** (age_days / half_life)
+
+
+def decayed_span(span_days: int, half_life: int) -> float:
+    """打分窗口的「等效天数」：Σ_{age=0..span-1} 0.5^(age/half_life)。
+
+    作为日均的除数替代 span 本身：均匀活跃的人加权后的日均与未加权相同，
+    所以「两年衰减窗口」里的日均仍然和近 30 天窗口可直接比较。
+    """
+
+    return sum(decayed_weight(age, half_life) for age in range(span_days))
+
+
 # —— 指标累加器 ——
 
 
 @dataclass(slots=True)
 class Metrics:
-    """一个（联系人, 时间桶）下的全部可加指标。"""
+    """一个（联系人, 时间桶）下的全部可加指标。
 
-    counts: dict[str, int] = field(default_factory=dict)
-    reply_hist_them: list[int] = field(default_factory=empty_histogram)
-    reply_hist_me: list[int] = field(default_factory=empty_histogram)
+    counts 与直方图写成 float：加权合成（merge_weighted）只存在于内存打分
+    路径；写库路径仍走整数（merge），dump_histogram 不受影响。
+    """
+
+    counts: dict[str, float] = field(default_factory=dict)
+    reply_hist_them: list[float] = field(default_factory=empty_histogram)
+    reply_hist_me: list[float] = field(default_factory=empty_histogram)
 
     def add(self, name: str, value: int = 1) -> None:
         if name not in _METRIC_SET:
             raise KeyError(f"unknown metric column: {name}")
         self.counts[name] = self.counts.get(name, 0) + value
 
-    def get(self, name: str) -> int:
+    def get(self, name: str) -> float:
         return self.counts.get(name, 0)
 
     def add_reply(self, direction: str, delay: int) -> None:
@@ -145,7 +171,20 @@ class Metrics:
             self.reply_hist_them[index] += other.reply_hist_them[index]
             self.reply_hist_me[index] += other.reply_hist_me[index]
 
-    def messages_total(self) -> int:
+    def merge_weighted(self, other: Metrics, weight: float) -> None:
+        """按指数衰减权重并入另一个桶：所有计数与直方图逐项乘 weight 再相加。
+
+        与 merge 一样只进内存，绝不落库：加权后的浮点值只有在打分窗口合成时
+        才会出现，写库路径（_write_daily 的 merge）永远是整数。
+        """
+
+        for name, value in other.counts.items():
+            self.counts[name] = self.counts.get(name, 0) + value * weight
+        for index in range(HISTOGRAM_BUCKETS):
+            self.reply_hist_them[index] += other.reply_hist_them[index] * weight
+            self.reply_hist_me[index] += other.reply_hist_me[index] * weight
+
+    def messages_total(self) -> float:
         return self.get("msgs_them") + self.get("msgs_me")
 
     def cost(self, side: str) -> float:
@@ -261,6 +300,8 @@ __all__ = [
     "bucket_of",
     "day_key",
     "day_span",
+    "decayed_span",
+    "decayed_weight",
     "dump_histogram",
     "empty_histogram",
     "late_night_offset",

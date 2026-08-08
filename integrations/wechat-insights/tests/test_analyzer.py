@@ -417,9 +417,9 @@ class ScoreTests(AnalyzerTestCase):
         payload = payloads[DISPLAY_NAME]
         self.assertTrue(payload["scored"])
         self.assertIsNotNone(payload["overall"])
-        self.assertEqual(len(payload["dimensions"]), 5)
+        self.assertEqual(len(payload["dimensions"]), 7)
         self.assertEqual(payload["window_messages"], 20)
-        self.assertEqual(self.store.get_json("medians", {}).keys().__len__(), 5)
+        self.assertEqual(self.store.get_json("medians", {}).keys().__len__(), 7)
 
     def test_single_contact_cohort_is_not_scored(self) -> None:
         # 只有一个人时百分位恒为 50，分数不代表任何相对位置；宁可不打分，
@@ -437,6 +437,131 @@ class ScoreTests(AnalyzerTestCase):
         payload = self.store.all_scores()[0]
         self.assertFalse(payload["scored"])
         self.assertIsNone(payload["overall"])
+
+
+class DecayWindowTests(AnalyzerTestCase):
+    """两年衰减打分窗口的行为，直接验证分析产物而不是内部函数。"""
+
+    def test_stale_activity_invests_less_than_steady_activity(self) -> None:
+        # stale：每天 3 条消息，只发生在约一年前（NOW−365 天，天龄 ≈ 360 天、
+        # 权重 ≈ 0.06）；steady：同样每天 3 条，集中在最近 30 天（权重 ≈ 1）。
+        # 两人 raw 消息数都是 90，达标线一致，可以比 investment。
+        stale_start = NOW - 395 * 86400
+        steady_start = NOW - 29 * 86400
+        self.seed_messages(
+            "stale", "Stale", {stale_start + offset * 86400: 3 for offset in range(30)}
+        )
+        self.seed_messages(
+            "steady",
+            "Steady",
+            {steady_start + offset * 86400: 3 for offset in range(30)},
+        )
+        self.seed_messages("friend2", "Bob", {BASE + 5 * 86400: 15})
+
+        with patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10):
+            self.run_analysis()
+
+        payloads = {p["display_name"]: p for p in self.store.all_scores()}
+        self.assertTrue(payloads["Stale"]["scored"])
+        self.assertTrue(payloads["Steady"]["scored"])
+        # 原始计数不受衰减影响：双方在窗口内都是 90 条。
+        self.assertEqual(payloads["Stale"]["window_messages"], 90)
+        self.assertEqual(payloads["Steady"]["window_messages"], 90)
+        self.assertGreater(
+            payloads["Steady"]["dimensions"]["investment"],
+            payloads["Stale"]["dimensions"]["investment"],
+        )
+        self.assertGreater(payloads["Steady"]["overall"], payloads["Stale"]["overall"])
+
+    def test_no_messages_in_window_is_zeroed(self) -> None:
+        # 没有任何 stats_daily 行（联系人存在但从未在窗口内活跃）。
+        self.store.ensure_contact("ghost", "Ghost")
+
+        with patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10):
+            self.run_analysis()
+
+        payloads = {p["display_name"]: p for p in self.store.all_scores()}
+        ghost = payloads["Ghost"]
+        self.assertFalse(ghost["scored"])
+        self.assertTrue(ghost["zeroed"])
+        self.assertEqual(ghost["overall"], 0)
+        self.assertEqual(set(ghost["dimensions"].values()), {0.0})
+        self.assertIsNone(ghost["trends"])
+        self.assertEqual(ghost["anomalies"], [])
+        self.assertEqual(ghost["sample_note"], "两年内没有往来")
+        self.assertEqual(ghost["window_messages"], 0)
+
+    def test_few_messages_without_zeroing_keep_data_insufficient(self) -> None:
+        # 有消息但远低于门槛：维持「数据不足」，不归零。
+        self.seed_messages("thin", "Thin", {BASE + 5 * 86400: 2})
+        self.seed_messages("friend2", "Bob", {BASE + 5 * 86400: 15})
+
+        with patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10):
+            self.run_analysis()
+
+        payloads = {p["display_name"]: p for p in self.store.all_scores()}
+        self.assertFalse(payloads["Thin"]["scored"])
+        self.assertNotIn("zeroed", payloads["Thin"])
+        self.assertEqual(payloads["Thin"]["sample_note"], "数据不足")
+
+    def test_current_gap_days_reflects_the_last_message(self) -> None:
+        # last_message_at 落在窗口内但很早（NOW 前 200 天），current_gap_days
+        # 应该远大于窗口内最后活跃天到现在的距离。
+        self.seed_messages(
+            "early",
+            "Early",
+            {BASE - 200 * 86400 + offset * 86400: 3 for offset in range(30)},
+        )
+        self.seed_messages(
+            "recent",
+            "Recent",
+            {BASE - 30 * 86400 + offset * 86400: 3 for offset in range(30)},
+        )
+        self.seed_messages("friend2", "Bob", {BASE + 5 * 86400: 15})
+
+        with patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10):
+            self.run_analysis()
+
+        payloads = {p["display_name"]: p for p in self.store.all_scores()}
+        self.assertTrue(payloads["Early"]["scored"])
+        self.assertTrue(payloads["Recent"]["scored"])
+        # Early 的最后消息在 NOW 前 200 天（current_gap_days ≈ 200），
+        # Recent 的最后消息在 NOW 前 1 天（current_gap_days ≈ 1）。
+        # 恒常维度里 Early 明显更差。
+        self.assertGreater(
+            payloads["Recent"]["dimensions"]["constancy"],
+            payloads["Early"]["dimensions"]["constancy"],
+        )
+
+
+class LeadingGapTests(AnalyzerTestCase):
+    """前导空档规则：认识早于窗口起点要计入，首条消息在窗口内的不算。"""
+
+    def test_first_message_before_window_start_counts_the_leading_gap(self) -> None:
+        # 认识早于窗口起点（first_message_at = 两年半前），但窗口内第一个活跃天
+        # 在窗口起点 100 天后。longest_gap_days = 100。
+        self.seed_messages("old_friend", "OldFriend", {BASE - 630 * 86400: 50})
+        self.seed_messages("friend2", "Bob", {BASE + 5 * 86400: 15})
+
+        with patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10):
+            self.run_analysis()
+
+        scores = {p["display_name"]: p for p in self.store.all_scores()}
+        self.assertTrue(scores["OldFriend"]["scored"])
+        self.assertGreater(scores["OldFriend"]["dimensions"]["constancy"], 0.0)
+
+    def test_first_message_inside_the_window_ignores_the_leading_gap(self) -> None:
+        # 首条消息在窗口内（认识于 300 天前），前导空档不算沉默。
+        self.seed_messages("new_friend", "NewFriend", {BASE - 300 * 86400: 50})
+        self.seed_messages("friend2", "Bob", {BASE + 5 * 86400: 15})
+
+        with patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10):
+            self.run_analysis()
+
+        scores = {p["display_name"]: p for p in self.store.all_scores()}
+        self.assertTrue(scores["NewFriend"]["scored"])
+        # 尾部空档（认识后 300 天都没聊）不算前导空档：new_friend 唯一活跃日在窗口内。
+        self.assertGreater(scores["NewFriend"]["dimensions"]["constancy"], 0.0)
 
 
 if __name__ == "__main__":

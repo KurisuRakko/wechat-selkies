@@ -5,8 +5,8 @@
 - stats_daily 按天分桶的可加指标（数值列由 constants.METRIC_COLUMNS 生成）
 - scores     分析结束时预计算好的看板数据，HTTP 处理器直接吐 JSON
 
-按天而不是按自然月分桶，是为了让「近 30 天 / 近 90 天」这类滚动窗口是精确的；
-自然月视图由 SQL 之外的 Python 聚合从同一批天桶合成，没有第二份真相。
+按天而不是按自然月分桶，是为了让「近 30 天 / 近 90 天 / 近两年」这类滚动窗口是
+精确的；自然月视图由 SQL 之外的 Python 聚合从同一批天桶合成，没有第二份真相。
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ import json
 import logging
 import sqlite3
 import threading
+from collections.abc import Callable
 from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,7 +26,7 @@ from .constants import (
     METRIC_COLUMNS,
     SCHEMA_VERSION,
 )
-from .metrics import Metrics, dump_histogram, parse_histogram
+from .metrics import Metrics, day_span, dump_histogram, parse_histogram
 
 
 LOG = logging.getLogger("wechat-insights")
@@ -124,6 +125,24 @@ class ContactRow:
             "latest_night_clock": clock,
             "max_haha_run": self.max_laugh_run,
         }
+
+
+@dataclass(slots=True)
+class WindowStats:
+    """打分窗口内一个联系人的两种合计与活跃度轨迹。
+
+    raw 是无权重的合计（门槛判定用）；weighted 按 weight_of(day) 加权
+    （打分用）。active_weight 是「有消息的天的权重之和」，longest_gap_days
+    是窗口内相邻活跃天之间的最大间隔天数（不含首尾外侧的空档），两者共同
+    支撑恒常维度。
+    """
+
+    raw: Metrics
+    weighted: Metrics
+    active_weight: float
+    first_day: str | None
+    last_day: str | None
+    longest_gap_days: int
 
 
 def row_to_metrics(row: sqlite3.Row) -> Metrics:
@@ -335,6 +354,48 @@ class MetricsStore:
                 """,
                 (session_id, day, *values),
             )
+
+    def load_window_stats(
+        self,
+        start_day: str,
+        end_day: str,
+        weight_of: Callable[[str], float],
+    ) -> dict[str, WindowStats]:
+        """打分窗口专用加载：一次扫描同时产出加权与未加权合计。
+
+        weight_of(day) 返回该日键的衰减权重；行按 day 升序返回，窗口内
+        相邻活跃天之间的最大间隔（不含首尾外侧空档）在扫描过程中就地累计。
+        只有消息数为 0 的天桶行理论上不存在，但防御性地跳过全零行的活跃天
+        判定（以 messages_total() > 0 为准）。
+        """
+
+        totals: dict[str, WindowStats] = {}
+        rows = self.connection.execute(
+            "SELECT * FROM stats_daily WHERE day >= ? AND day <= ? ORDER BY day ASC",
+            (start_day, end_day),
+        )
+        for row in rows:
+            session_id = str(row["session_id"])
+            day = str(row["day"])
+            entry = totals.get(session_id)
+            if entry is None:
+                entry = WindowStats(Metrics(), Metrics(), 0.0, None, None, 0)
+                totals[session_id] = entry
+            metrics = row_to_metrics(row)
+            entry.raw.merge(metrics)
+            weight = weight_of(day)
+            entry.weighted.merge_weighted(metrics, weight)
+            if metrics.messages_total() <= 0:
+                continue
+            entry.active_weight += weight
+            if entry.last_day is not None:
+                gap = day_span(entry.last_day, day) - 1
+                if gap > entry.longest_gap_days:
+                    entry.longest_gap_days = gap
+            if entry.first_day is None:
+                entry.first_day = day
+            entry.last_day = day
+        return totals
 
     def load_window(self, start_day: str, end_day: str) -> dict[str, Metrics]:
         """[start_day, end_day] 区间内每个联系人的合计指标。"""

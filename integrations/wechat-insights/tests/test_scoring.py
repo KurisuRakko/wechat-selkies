@@ -65,6 +65,43 @@ class RawMetricTests(unittest.TestCase):
         self.assertIsNone(values["started_rate_them"])
         self.assertIsNone(values["avg_len_them"])
 
+    def test_balance_metrics_are_min_over_max(self) -> None:
+        values = raw_metrics(
+            window(
+                msgs_them=3,
+                msgs_me=6,
+                chars_them=100,
+                chars_me=400,
+                conv_started_them=1,
+                conv_started_me=3,
+            ),
+            STRATEGY,
+            30,
+        )
+        self.assertAlmostEqual(values["balance_msgs"], 0.5)
+        self.assertAlmostEqual(values["balance_chars"], 0.25)
+        self.assertAlmostEqual(values["balance_started"], 1 / 3)
+        # 一边完全没数据时是 None，而不是 0——不能把「没数据」当成「一边倒」。
+        self.assertIsNone(
+            raw_metrics(
+                window(msgs_them=1, msgs_me=1, chars_them=1, chars_me=1),
+                STRATEGY,
+                30,
+            )["balance_started"]
+        )
+
+    def test_extras_are_merged_into_the_raw_values(self) -> None:
+        values = raw_metrics(
+            window(msgs_them=1), STRATEGY, 30, extras={"active_day_rate": 0.4}
+        )
+        self.assertEqual(values["active_day_rate"], 0.4)
+        # 不传 extras 时没有该键。
+        self.assertNotIn("active_day_rate", raw_metrics(window(msgs_them=1), STRATEGY, 30))
+
+    def test_days_accept_a_float_equivalent_span(self) -> None:
+        values = raw_metrics(window(msgs_them=3), STRATEGY, 2.5)
+        self.assertAlmostEqual(values["msgs_them_per_day"], 1.2)
+
     def test_ratio_metrics_use_their_own_denominators(self) -> None:
         values = raw_metrics(
             window(
@@ -90,6 +127,54 @@ class RawMetricTests(unittest.TestCase):
         self.assertAlmostEqual(values["long_conv_rate"], 0.2)
         self.assertAlmostEqual(values["avg_len_them"], 30.0)
         self.assertAlmostEqual(values["question_rate_them"], 0.3)
+
+
+class DimensionTests(unittest.TestCase):
+    def test_dimension_names_have_all_seven(self) -> None:
+        self.assertEqual(
+            DIMENSION_NAMES,
+            (
+                "responsiveness",
+                "initiative",
+                "investment",
+                "rhythm",
+                "depth",
+                "constancy",
+                "reciprocity",
+            ),
+        )
+
+    def test_constancy_dimension_without_any_data_is_neutral(self) -> None:
+        # 不传 extras（recent/baseline 窗口就是如此）时恒常整维缺值退回 50，
+        # 趋势恒为 0 是有意的。
+        scores = score_cohort({"a": {}, "b": {}}, STRATEGY)
+        self.assertEqual(scores["a"]["constancy"], 50.0)
+        self.assertEqual(scores["b"]["constancy"], 50.0)
+        self.assertEqual(scores["a"]["overall"], 50.0)
+
+    def test_reciprocity_ranks_balanced_contacts_higher(self) -> None:
+        balanced = {
+            "balance_msgs": 0.9,
+            "balance_chars": 0.9,
+            "balance_started": 0.9,
+        }
+        one_sided = {
+            "balance_msgs": 0.1,
+            "balance_chars": 0.1,
+            "balance_started": 0.1,
+        }
+        scores = score_cohort({"balanced": balanced, "one_sided": one_sided}, STRATEGY)
+        self.assertGreater(
+            scores["balanced"]["reciprocity"], scores["one_sided"]["reciprocity"]
+        )
+        self.assertEqual(scores["balanced"]["reciprocity"], 75.0)
+        self.assertEqual(scores["one_sided"]["reciprocity"], 25.0)
+
+    def test_constancy_ranks_active_contacts_higher(self) -> None:
+        steady = {"active_day_rate": 0.8, "current_gap_days": 1.0, "longest_gap_days": 3.0}
+        fading = {"active_day_rate": 0.2, "current_gap_days": 120.0, "longest_gap_days": 100.0}
+        scores = score_cohort({"steady": steady, "fading": fading}, STRATEGY)
+        self.assertGreater(scores["steady"]["constancy"], scores["fading"]["constancy"])
 
 
 class CohortScoreTests(unittest.TestCase):
@@ -125,7 +210,7 @@ class CohortScoreTests(unittest.TestCase):
             score_cohort({"a": {"msgs_them_per_day": 10.0}}, STRATEGY), {}
         )
 
-    def test_overall_is_the_mean_of_the_five_dimensions(self) -> None:
+    def test_overall_is_the_mean_of_the_seven_dimensions(self) -> None:
         scores = score_cohort(
             {
                 "a": {"msgs_them_per_day": 10.0},
@@ -133,7 +218,7 @@ class CohortScoreTests(unittest.TestCase):
             },
             STRATEGY,
         )
-        expected = sum(scores["a"][name] for name in DIMENSION_NAMES) / 5
+        expected = sum(scores["a"][name] for name in DIMENSION_NAMES) / 7
         self.assertAlmostEqual(scores["a"]["overall"], expected)
 
 

@@ -8,7 +8,7 @@ from pathlib import Path
 from wechat_insights.constants import SCHEMA_VERSION
 from wechat_insights.metrics import Metrics, quantile
 from wechat_insights.reporting import monthly_series, total_metrics, type_composition
-from wechat_insights.storage import MetricsStore, contact_hash
+from wechat_insights.storage import MetricsStore, WindowStats, contact_hash
 
 
 def bucket(**counts: int) -> Metrics:
@@ -79,6 +79,45 @@ class DailyMergeTests(StoreTestCase):
         totals = self.store.load_window("2026-03-01", "2026-03-31")
         self.assertEqual(totals["a"].messages_total(), 3)
         self.assertEqual(totals["b"].messages_total(), 5)
+
+
+class WindowStatsTests(StoreTestCase):
+    def test_window_stats_accumulates_raw_weighted_and_activity(self) -> None:
+        # 隔天活跃（2026-03-10 与 03-12），中间空 03-11：最长间隔 = 2 天。
+        self.store.merge_daily(
+            "friend", {"2026-03-10": bucket(msgs_them=3), "2026-03-12": bucket(msgs_them=5)}
+        )
+        weights = {"2026-03-10": 0.5, "2026-03-11": 0.25, "2026-03-12": 1.0}
+
+        stats = self.store.load_window_stats("2026-03-01", "2026-03-31", weights.get)
+        entry = stats["friend"]
+        self.assertIsInstance(entry, WindowStats)
+        self.assertEqual(entry.raw.messages_total(), 8)
+        self.assertEqual(entry.weighted.get("msgs_them"), 3 * 0.5 + 5 * 1.0)
+        self.assertEqual(entry.active_weight, 1.5)
+        self.assertEqual(entry.first_day, "2026-03-10")
+        self.assertEqual(entry.last_day, "2026-03-12")
+        self.assertEqual(entry.longest_gap_days, 2)
+
+    def test_window_limits_and_ordering_bound_the_scan(self) -> None:
+        self.store.merge_daily("friend", {"2026-03-10": bucket(msgs_them=1)})
+        self.store.merge_daily("friend", {"2026-03-20": bucket(msgs_them=2)})
+        weights = {"2026-03-10": 0.5, "2026-03-20": 0.25}
+
+        stats = self.store.load_window_stats("2026-03-11", "2026-03-19", weights.get)
+        self.assertNotIn("friend", stats)
+        self.assertEqual(self.store.load_window_stats("2026-04-01", "2026-04-30", weights.get), {})
+
+    def test_zero_message_rows_do_not_count_as_active_days(self) -> None:
+        empty = bucket()
+        self.store.merge_daily("friend", {"2026-03-10": empty, "2026-03-12": bucket(msgs_them=1)})
+        weights = {"2026-03-10": 1.0, "2026-03-12": 1.0}
+
+        stats = self.store.load_window_stats("2026-03-01", "2026-03-31", weights.get)
+        entry = stats["friend"]
+        self.assertEqual(entry.first_day, "2026-03-12")
+        self.assertEqual(entry.active_weight, 1.0)
+        self.assertEqual(entry.longest_gap_days, 0)
 
 
 class ContactTests(StoreTestCase):

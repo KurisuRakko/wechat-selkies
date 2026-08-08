@@ -15,6 +15,7 @@ from wechat_history.sessions import scan_direct_rows
 
 from .constants import (
     BACKFILL_BATCH,
+    DECAY_HALF_LIFE_DAYS,
     MIN_SCORE_MESSAGES,
     SCORE_WINDOW_DAYS,
     SESSION_GAP_SECONDS,
@@ -29,6 +30,8 @@ from .metrics import (
     aggregate,
     day_key,
     day_span,
+    decayed_span,
+    decayed_weight,
     late_night_offset,
 )
 from .scoring import (
@@ -38,7 +41,7 @@ from .scoring import (
     raw_metrics,
     score_cohort,
 )
-from .storage import ContactRow, MetricsStore
+from .storage import ContactRow, MetricsStore, WindowStats
 
 
 LOG = logging.getLogger("wechat-insights")
@@ -352,39 +355,86 @@ class Analyzer:
         contact.display_name = display_name
         self.store.commit_batch(contact.session_id, buckets, contact)
 
+    def _weight_of(self, today: str, day: str) -> float:
+        """打分窗口内一个天桶的衰减权重：天龄 = 距今天数（今天为 0）。"""
+
+        age = day_span(day, today) - 1
+        return decayed_weight(age, DECAY_HALF_LIFE_DAYS)
+
+    @staticmethod
+    def _longest_gap(
+        stats: WindowStats, contact: ContactRow, score_start: str, score_start_ts: int
+    ) -> int:
+        """窗口内最大沉默间隔，认识早于窗口起点的纳入前导空档。
+
+        首条消息在窗口内的新朋友不算前导空档——认识之前不存在沉默。
+        尾部空档不算：那是 current_gap_days 的职责，分开避免双重计罚。
+        """
+
+        longest = stats.longest_gap_days
+        if (
+            stats.first_day is not None
+            and contact.first_message_at is not None
+            and contact.first_message_at < score_start_ts
+        ):
+            longest = max(longest, day_span(score_start, stats.first_day) - 1)
+        return longest
+
     def _recompute(self, moment: int) -> int:
-        """重算所有联系人的五维分、趋势与异动，整体替换 scores 表。"""
+        """重算所有联系人的七维分、趋势与异动，整体替换 scores 表。"""
 
         # 窗口起点用「N 天前的同一时刻」折算，跨 DST 切换时本地时间会偏移
         # 一小时、日键偶尔差一天（生产容器在澳大利亚/悉尼，有夏令时），
         # 目前按秒数近似，不做逐天修正。
         today = day_key(moment)
         score_start = day_key(moment - SCORE_WINDOW_DAYS * 86400)
+        score_start_ts = moment - SCORE_WINDOW_DAYS * 86400
         recent_start = day_key(moment - TREND_RECENT_DAYS * 86400)
         baseline_end = day_key(moment - (TREND_RECENT_DAYS + 1) * 86400)
         baseline_start = day_key(
             moment - (TREND_RECENT_DAYS + TREND_BASELINE_DAYS) * 86400
         )
 
-        score_windows = self.store.load_window(score_start, today)
+        score_stats = self.store.load_window_stats(
+            score_start, today, lambda day: self._weight_of(today, day)
+        )
         recent_windows = self.store.load_window(recent_start, today)
         baseline_windows = self.store.load_window(baseline_start, baseline_end)
+        contacts_by_id = {
+            contact.session_id: contact for contact in self.store.all_contacts()
+        }
 
+        # 门槛只看未加权的原始消息数：衰减是「远记忆变淡」，不是「远消息作废」。
         eligible = sorted(
             session_id
-            for session_id, window in score_windows.items()
-            if window.messages_total() >= MIN_SCORE_MESSAGES
+            for session_id, stats in score_stats.items()
+            if stats.raw.messages_total() >= MIN_SCORE_MESSAGES
         )
 
         empty = Metrics()
-        # 日均的除数取窗口实际覆盖的天数（load_window 两端闭区间）：少除一天
-        # 会让近期窗口的日均比基线凭空大 31/30，异动判定跟着失真。
-        raw_score = {
-            session_id: raw_metrics(
-                score_windows[session_id], self.strategy, day_span(score_start, today)
+        # 打分窗口的日均除数用 decayed_span 的「等效天数」：均匀活跃的人加权前后
+        # 日均一致，两年的衰减窗口与近 30 天窗口的日均仍可直接比较。
+        equivalent_days = decayed_span(day_span(score_start, today), DECAY_HALF_LIFE_DAYS)
+        raw_score: dict[str, dict[str, float | None]] = {}
+        for session_id in eligible:
+            stats = score_stats[session_id]
+            contact = contacts_by_id[session_id]
+            raw_score[session_id] = raw_metrics(
+                stats.weighted,
+                self.strategy,
+                equivalent_days,
+                {
+                    "active_day_rate": stats.active_weight / equivalent_days,
+                    "current_gap_days": (
+                        (moment - contact.last_message_at) / 86400
+                        if contact.last_message_at is not None
+                        else None
+                    ),
+                    "longest_gap_days": self._longest_gap(
+                        stats, contact, score_start, score_start_ts
+                    ),
+                },
             )
-            for session_id in eligible
-        }
         raw_recent = {
             session_id: raw_metrics(
                 recent_windows.get(session_id, empty),
@@ -408,8 +458,30 @@ class Analyzer:
         baseline_scores = score_cohort(raw_baseline, self.strategy)
 
         payloads: list[tuple[str, dict[str, object]]] = []
-        for contact in self.store.all_contacts():
+        for contact in contacts_by_id.values():
             session_id = contact.session_id
+            stats = score_stats.get(session_id)
+            if stats is None or stats.raw.messages_total() <= 0:
+                # 打分窗口里一条消息都没有（或根本没有天桶）：两年内没有往来，
+                # 全部归零；有消息但不够门槛的仍走下面的「数据不足」。
+                payload: dict[str, object] = {
+                    "hash": contact.hash,
+                    "display_name": contact.display_name,
+                    "scored": False,
+                    "zeroed": True,
+                    "overall": 0,
+                    "dimensions": {name: 0.0 for name in DIMENSION_NAMES},
+                    "trends": None,
+                    "recent_messages": recent_windows.get(
+                        session_id, empty
+                    ).messages_total(),
+                    "window_messages": 0,
+                    "last_message_at": contact.last_message_at,
+                    "sample_note": "两年内没有往来",
+                    "anomalies": [],
+                }
+                payloads.append((session_id, payload))
+                continue
             scored = session_id in scores
             dimension_scores = scores.get(session_id)
             # 趋势要基线窗口样本足够才成立：基线窗口不足时基线分恒为 50，
@@ -421,7 +493,7 @@ class Analyzer:
                 and baseline_windows.get(session_id, empty).messages_total()
                 >= MIN_SCORE_MESSAGES
             )
-            payload: dict[str, object] = {
+            payload = {
                 "hash": contact.hash,
                 "display_name": contact.display_name,
                 "scored": scored,
@@ -443,7 +515,7 @@ class Analyzer:
                     else None
                 ),
                 "recent_messages": recent_windows.get(session_id, empty).messages_total(),
-                "window_messages": score_windows.get(session_id, empty).messages_total(),
+                "window_messages": stats.raw.messages_total(),
                 "last_message_at": contact.last_message_at,
                 "sample_note": "" if scored else "数据不足",
                 "anomalies": (

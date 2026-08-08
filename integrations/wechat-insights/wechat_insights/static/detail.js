@@ -112,10 +112,15 @@
 
     var radarBody = contact.scored
       ? '<div class="chart chart--tall" id="radar-chart"></div>'
-      : '<div class="insufficient">' +
-        '<div class="insufficient__title">数据不足</div>' +
-        '<div class="insufficient__desc">近 90 天往来消息不足，暂不打分</div>' +
-        "</div>";
+      : contact.zeroed
+        ? '<div class="insufficient">' +
+          '<div class="insufficient__title">已归零</div>' +
+          '<div class="insufficient__desc">两年内没有往来，已归零</div>' +
+          "</div>"
+        : '<div class="insufficient">' +
+          '<div class="insufficient__title">数据不足</div>' +
+          '<div class="insufficient__desc">近两年往来消息不足，暂不打分</div>' +
+          "</div>";
 
     var monthlyBody = monthly.length
       ? '<div class="chart" id="reply-chart"></div>'
@@ -129,7 +134,7 @@
 
     els.content.innerHTML =
       '<div class="stack">' +
-      card("五维画像", radarBody, contact.scored ? "与全联系人中位数对比" : "") +
+      card("七维画像", radarBody, contact.scored ? "与全联系人中位数对比" : "") +
       card("回复延迟中位数", monthlyBody, "按月，越低越快") +
       card("月度消息量", volumeBody) +
       card("消息类型构成", typesBody) +
@@ -153,7 +158,7 @@
   }
 
   /* ------------------------------------------------------------------ *
-   * 1. 五维大雷达（联系人 + 全联系人中位数参考层）
+   * 1. 七维大雷达（联系人 + 全联系人中位数参考层）
    * ------------------------------------------------------------------ */
 
   function dimensionValues(source) {

@@ -47,7 +47,10 @@ NIGHT_HOURS = frozenset({23, 0, 1})
 LATE_NIGHT_MAX_HOUR = 6
 
 # —— 打分窗口 ——
-SCORE_WINDOW_DAYS = _int_env("INSIGHTS_SCORE_WINDOW_DAYS", 90, 7, 3650)
+SCORE_WINDOW_DAYS = _int_env("INSIGHTS_SCORE_WINDOW_DAYS", 730, 7, 3650)
+# 打分窗口内每个天桶按 0.5^(天龄/半衰期) 加权：两年窗口 + 90 天半衰期下，
+# 两年前的一天权重约 0.4%。「很久没聊」会自然滑向归零，不需要单独的截断补丁。
+DECAY_HALF_LIFE_DAYS = _int_env("INSIGHTS_DECAY_HALF_LIFE_DAYS", 90, 7, 3650)
 TREND_RECENT_DAYS = _int_env("INSIGHTS_TREND_RECENT_DAYS", 30, 3, 365)
 # 趋势基线取「近期窗口之前」的这么多天。
 TREND_BASELINE_DAYS = _int_env("INSIGHTS_TREND_BASELINE_DAYS", 90, 7, 3650)

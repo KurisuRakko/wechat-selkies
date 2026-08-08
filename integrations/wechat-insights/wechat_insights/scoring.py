@@ -1,4 +1,4 @@
-"""五维原始指标、百分位归一化、趋势与异动。
+"""七维原始指标、百分位归一化、趋势与异动。
 
 绝对分没有意义：同一个人在「爱发消息的朋友圈」和「都很沉默的朋友圈」里应该得到
 不同的分。所以每个原始指标先在联系人群体内取百分位，再按权重合成维度分。
@@ -17,16 +17,36 @@ from .depth import Component, DepthStrategy
 from .metrics import Metrics, quantile
 
 
-#: 五维的固定顺序，前端雷达图也按这个顺序。
-DIMENSION_NAMES = ("responsiveness", "initiative", "investment", "rhythm", "depth")
+#: 七维的固定顺序，前端雷达图也按这个顺序。
+DIMENSION_NAMES = (
+    "responsiveness",
+    "initiative",
+    "investment",
+    "rhythm",
+    "depth",
+    "constancy",
+    "reciprocity",
+)
 
 
 def _rate(numerator: float, denominator: float) -> float | None:
     return numerator / denominator if denominator else None
 
 
-def reply_median(histogram: list[int], samples: int) -> float | None:
-    """回复延迟中位数；样本太少时不给值，避免一两次回复决定一个维度。"""
+def _balance(them: float, me: float) -> float | None:
+    """双方量级之比：min/max，偏科越严重越接近 0；两边都没有时无定义。"""
+
+    if them <= 0 and me <= 0:
+        return None
+    return min(them, me) / max(them, me)
+
+
+def reply_median(histogram: list[int], samples: float) -> float | None:
+    """回复延迟中位数；样本太少时不给值，避免一两次回复决定一个维度。
+
+    samples 在打分窗口里是加权后的回复数，与 MIN_REPLY_SAMPLES 比较是有意的：
+    一年前的回复只值约 0.06 个完整样本，不该和今天的回复同权凑数。
+    """
 
     if samples < MIN_REPLY_SAMPLES:
         return None
@@ -34,16 +54,26 @@ def reply_median(histogram: list[int], samples: int) -> float | None:
 
 
 def raw_metrics(
-    window: Metrics, strategy: DepthStrategy, days: int
+    window: Metrics,
+    strategy: DepthStrategy,
+    days: float,
+    extras: dict[str, float | None] | None = None,
 ) -> dict[str, float | None]:
     """把一个窗口的累加指标换算成可比的原始值。
 
     绝对量（消息数、字数、加权成本）一律除以窗口天数变成日均，这样近 30 天和
-    近 90 天两个不等长窗口之间也能直接比较。days 是窗口实际覆盖的天数
-    （闭区间含首尾两天），由调用方用 day_span 算好传入。
+    近 90 天两个不等长趋势窗口、以及两年衰减打分窗口之间也能直接比较。days 是
+    窗口实际覆盖的天数（闭区间含首尾两天），由调用方用 day_span 算好传入；
+    衰减打分窗口传 decayed_span 的「等效天数」（float），均匀活跃的人日均与
+    未加权一致。
+
+    extras 由调用方补充窗口外信息才能算的原始值（目前是恒常维度）。recent 与
+    baseline 窗口不传 extras，恒常整维缺值、按现有机制退回 50——恒常维度的
+    趋势因此恒为 0，这是有意的：恒常反映的是「很长一段时间的习惯」，30 天
+    窗口里没有意义。
     """
 
-    span = max(1, days)
+    span = max(1.0, days)
     total = window.messages_total()
     conversations = window.get("conversations")
     values: dict[str, float | None] = {
@@ -76,13 +106,21 @@ def raw_metrics(
         ),
         "avg_turns": _rate(window.get("turns_total"), conversations),
         "long_conv_rate": _rate(window.get("long_convs"), conversations),
+        # 对等维度：双方量级之比，纯 Metrics 可算。
+        "balance_msgs": _balance(window.get("msgs_them"), window.get("msgs_me")),
+        "balance_chars": _balance(window.get("chars_them"), window.get("chars_me")),
+        "balance_started": _balance(
+            window.get("conv_started_them"), window.get("conv_started_me")
+        ),
     }
     values.update(strategy.raw_metrics(window))
+    if extras is not None:
+        values.update(extras)
     return values
 
 
 def dimensions(strategy: DepthStrategy) -> tuple[tuple[str, tuple[Component, ...]], ...]:
-    """五维的组成项定义。深度维度由策略提供，其余四维在这里固定。"""
+    """七维的组成项定义。深度维度由策略提供，其余六维在这里固定。"""
 
     return (
         (
@@ -119,6 +157,24 @@ def dimensions(strategy: DepthStrategy) -> tuple[tuple[str, tuple[Component, ...
             ),
         ),
         ("depth", strategy.components()),
+        (
+            # 恒常：只在打分窗口算（analyzer 经 extras 注入原始值），recent/
+            # baseline 不注入 → 整维缺值退回 50，趋势恒为 0，见 raw_metrics。
+            "constancy",
+            (
+                Component("active_day_rate", 0.4, True),
+                Component("current_gap_days", 0.35, False),
+                Component("longest_gap_days", 0.25, False),
+            ),
+        ),
+        (
+            "reciprocity",
+            (
+                Component("balance_msgs", 0.4, True),
+                Component("balance_chars", 0.3, True),
+                Component("balance_started", 0.3, True),
+            ),
+        ),
     )
 
 
@@ -135,7 +191,7 @@ def percentile_rank(cohort: list[float], value: float) -> float:
 def score_cohort(
     raws: dict[str, dict[str, float | None]], strategy: DepthStrategy
 ) -> dict[str, dict[str, float]]:
-    """把一组联系人的原始值换算成 0–100 的五维分与综合分。
+    """把一组联系人的原始值换算成 0–100 的七维分与综合分。
 
     某个组成项缺值（例如回复样本不足）时，该项的权重在同一维度内按比例分给
     其余项；整维都缺值才退回中性的 50 分。

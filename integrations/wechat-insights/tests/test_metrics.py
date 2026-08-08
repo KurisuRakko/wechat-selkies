@@ -5,10 +5,13 @@ from datetime import datetime
 
 from wechat_insights.conversation import ME, THEM, Message
 from wechat_insights.metrics import (
+    Metrics,
     aggregate,
     bucket_of,
     day_key,
     day_span,
+    decayed_span,
+    decayed_weight,
     late_night_offset,
     quantile,
 )
@@ -178,6 +181,39 @@ class AggregateTests(unittest.TestCase):
             [[message(start, THEM, "哈哈哈"), message(start + 5, ME, "哈哈哈哈哈")]]
         )
         self.assertEqual(result.max_laugh_run, 5)
+
+
+class MergeWeightedTests(unittest.TestCase):
+    def test_counts_and_histograms_are_scaled_by_the_weight(self) -> None:
+        base = Metrics()
+        base.add("msgs_them", 10)
+        base.reply_hist_them[5] = 4
+
+        weighted = Metrics()
+        weighted.merge_weighted(base, 0.5)
+        weighted.merge_weighted(base, 0.25)
+
+        self.assertEqual(weighted.get("msgs_them"), 7.5)
+        self.assertEqual(weighted.reply_hist_them[5], 3.0)
+        self.assertEqual(weighted.reply_hist_me[5], 0.0)
+
+    def test_missing_counts_stay_zero(self) -> None:
+        weighted = Metrics()
+        weighted.merge_weighted(Metrics(), 0.5)
+        self.assertEqual(weighted.get("msgs_me"), 0.0)
+        self.assertEqual(sum(weighted.reply_hist_them), 0.0)
+
+
+class DecayTests(unittest.TestCase):
+    def test_today_has_full_weight(self) -> None:
+        self.assertEqual(decayed_weight(0, 90), 1.0)
+        self.assertEqual(decayed_span(1, 90), 1.0)
+
+    def test_weight_halves_at_the_half_life(self) -> None:
+        self.assertAlmostEqual(decayed_weight(90, 90), 0.5)
+
+    def test_equivalent_span_is_the_weighted_sum(self) -> None:
+        self.assertAlmostEqual(decayed_span(3, 90), 1.0 + 0.5 ** (1 / 90) + 0.5 ** (2 / 90))
 
 
 class LateNightTests(unittest.TestCase):
