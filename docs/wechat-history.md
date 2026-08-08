@@ -18,7 +18,7 @@ docker compose up -d --build
 ```
 
 在微信界面手动切换到目标旧账户（即 `WECHAT_HISTORY_ACCOUNT_DIR` 指定的账户），
-并保持微信运行，随后执行：
+**等它真正登录进主界面之后**，再执行：
 
 ```powershell
 pwsh -NoProfile -File .\integrations\wechat-history\scripts\keyscan.ps1
@@ -31,6 +31,27 @@ pwsh -NoProfile -File .\integrations\wechat-history\scripts\keyscan.ps1
 密钥目录权限为 `0700`、密钥文件为 `0600`，所有者是主容器中的非特权 `abc`
 用户。当前不是目标旧账户时，扫描器会在读取任何进程内存前返回
 `TARGET_ACCOUNT_NOT_ACTIVE`。
+
+### 扫描前必须确认微信已经打开数据库
+
+密钥是微信解密数据库时才写进自己内存的，**进程活着 ≠ 已登录 ≠ 数据库已打开**。
+在登录还没完成时扫，会拿到 `KEY_NOT_FOUND`，而这时旧密钥往往已经因为重启失效了
+——等于既没有新密钥、也没有旧密钥。重启微信之后不要按秒数猜（实测重启后约 90 秒
+扫就太早），要看数据库是不是真的在被写：
+
+```sh
+find /config/xwechat_files/*/db_storage -name '*.db*' -newermt '-5 minutes' | head -5
+```
+
+（在容器里跑：`docker exec wechat-selkies sh`。登录完成后微信会持续同步消息，
+`db_storage` 下的 `.db` / `.db-wal` 文件 mtime 会不断更新；有输出就可以扫了。）
+
+两个看似更直接的判据实际都不可用，别踩：
+
+- **数 `/proc/<pid>/fd` 里打开的 `.db`**：主容器没有 `SYS_PTRACE` 且
+  `yama ptrace_scope=1`，连 root 都读不了别的进程的 fd 链接——错误一旦被
+  `2>/dev/null` 吞掉，计数就永远是 0，看起来像「没登录」，其实是权限假阴性。
+- **X11 窗口标题**：登录页和主界面都叫 `WeChat`，区分不出来。
 
 ## 环境变量
 
