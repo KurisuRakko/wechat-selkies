@@ -12,9 +12,11 @@ from dataclasses import dataclass, field
 
 from wechat_history.reader import HistoryReader, _read_connection
 from wechat_history.sessions import scan_direct_rows
+from wechat_history.snapshot import KeyStore, SnapshotCache
 
 from .constants import (
     BACKFILL_BATCH,
+    INSIGHTS_MAX_CACHE_BYTES,
     MIN_SCORE_MESSAGES,
     SCORE_WINDOW_DAYS,
     SESSION_GAP_SECONDS,
@@ -23,7 +25,14 @@ from .constants import (
 )
 from .conversation import Message, split_conversations
 from .depth import DepthStrategy, get_depth_strategy
-from .metrics import Aggregation, Metrics, aggregate, day_key, late_night_offset
+from .metrics import (
+    Aggregation,
+    Metrics,
+    aggregate,
+    day_key,
+    day_span,
+    late_night_offset,
+)
 from .scoring import (
     DIMENSION_NAMES,
     detect_anomalies,
@@ -39,9 +48,14 @@ LOG = logging.getLogger("wechat-insights")
 
 @dataclass(frozen=True, slots=True)
 class Cursor:
-    """已提交的最后一条消息位置；(0, -1) 表示还没读过任何消息。"""
+    """已提交的最后一条消息位置；(0, "", -1) 表示还没读过任何消息。
+
+    local_id 只在单个分片内唯一，必须带上分片路径才能构成全局唯一的全序；
+    空分片排在一切真实分片之前。排序键与恢复谓词都用这个三元组。
+    """
 
     timestamp: int
+    shard: str
     local_id: int
 
 
@@ -61,10 +75,30 @@ class MessageBatch:
 
     #: 已剔除无方向系统噪声的消息，按时间升序。
     messages: list[Message]
+    #: 与 messages 一一对应的游标位置；对话被截断时按前缀取最后一条。
+    positions: list[Cursor]
     #: 本批最后一行（含被剔除的行）的位置；一行都没有时为 None。
     last: Cursor | None
     #: 数据库里还有更多行没读。
     has_more: bool
+
+
+def _resume_where(cursor: Cursor, shard: str) -> tuple[str, tuple[object, ...]]:
+    """按 (时间戳, 分片, local_id) 全序生成单个分片的恢复谓词。
+
+    分片之间共享 local_id，游标必须带上分片，否则同刻同号的两行会互相
+    吞掉。游标分片之后的分片，同一时间戳下的行都在游标之后，全部要读；
+    游标分片之前的分片则整片已读完，只有更晚的时间戳才有效。
+    """
+
+    if shard > cursor.shard:
+        return "create_time >= ?", (cursor.timestamp,)
+    if shard == cursor.shard:
+        return (
+            "create_time > ? OR (create_time = ? AND local_id > ?)",
+            (cursor.timestamp, cursor.timestamp, cursor.local_id),
+        )
+    return "create_time > ?", (cursor.timestamp,)
 
 
 def read_messages_after(
@@ -88,7 +122,7 @@ def read_messages_after(
         "alias": "",
         "kind": "direct",
     }
-    collected: list[tuple[tuple[int, int, str], Message | None]] = []
+    collected: list[tuple[tuple[int, str, int], Message | None]] = []
     for relative_db in reader._message_database_keys():
         database = reader.cache.get(relative_db)
         with _read_connection(database) as connection:
@@ -99,16 +133,17 @@ def read_messages_after(
             if not exists:
                 continue
             names = reader._name_map(connection)
+            where, parameters = _resume_where(cursor, relative_db)
             rows = connection.execute(
                 f"""
                 SELECT local_id, local_type, create_time, real_sender_id,
                        message_content, WCDB_CT_message_content
                 FROM [{table}]
-                WHERE create_time > ? OR (create_time = ? AND local_id > ?)
+                WHERE {where}
                 ORDER BY create_time ASC, local_id ASC
                 LIMIT ?
                 """,
-                (cursor.timestamp, cursor.timestamp, cursor.local_id, limit + 1),
+                (*parameters, limit + 1),
             ).fetchall()
             for row in rows:
                 item = reader._message_item(row, relative_db, session, contacts, names)
@@ -127,13 +162,15 @@ def read_messages_after(
                         text=str(item["text"] or ""),
                     )
                 )
-                collected.append(((timestamp, local_id, relative_db), message))
+                collected.append(((timestamp, relative_db, local_id), message))
 
     collected.sort(key=lambda entry: entry[0])
     window = collected[:limit]
+    kept = [entry for entry in window if entry[1] is not None]
     return MessageBatch(
-        messages=[entry[1] for entry in window if entry[1] is not None],
-        last=Cursor(window[-1][0][0], window[-1][0][1]) if window else None,
+        messages=[entry[1] for entry in kept],
+        positions=[Cursor(*entry[0]) for entry in kept],
+        last=Cursor(*window[-1][0]) if window else None,
         has_more=len(collected) > limit,
     )
 
@@ -168,13 +205,24 @@ def update_milestones(
     contact.max_laugh_run = max(contact.max_laugh_run, aggregation.max_laugh_run)
 
 
+def default_reader_factory() -> HistoryReader:
+    """生产读取器：给 SnapshotCache 换上 wechat-insights 自己的缓存上限。
+
+    wechat_history 的默认上限是 512 MiB，九个消息分片解密后的实际占用已达
+    约 465 MiB，历史再增长一点就会在扫描会话时抛 CACHE_LIMIT。这里换一个
+    更大的上限，主容器行为完全不变。
+    """
+    cache = SnapshotCache(KeyStore(), max_bytes=INSIGHTS_MAX_CACHE_BYTES)
+    return HistoryReader(cache=cache)
+
+
 class Analyzer:
     """一轮完整分析：拉新消息 → 聚合落库 → 重算全部看板数据。"""
 
     def __init__(
         self,
         store: MetricsStore,
-        reader_factory=HistoryReader,
+        reader_factory=default_reader_factory,
         strategy: DepthStrategy | None = None,
         gap_seconds: int = SESSION_GAP_SECONDS,
         batch_size: int = BACKFILL_BATCH,
@@ -238,7 +286,9 @@ class Analyzer:
         moment: int,
     ) -> int:
         contact = self.store.ensure_contact(session_id, display_name)
-        cursor = Cursor(contact.cursor_timestamp, contact.cursor_local_id)
+        cursor = Cursor(
+            contact.cursor_timestamp, contact.cursor_shard, contact.cursor_local_id
+        )
         committed = 0
 
         while True:
@@ -271,7 +321,9 @@ class Analyzer:
                 conversations = []
                 held_tail = True
             # still_open 且只有一段又被截断：这段对话比一个批次还长，只能就地
-            # 提交，否则游标永远推不动。
+            # 提交，否则游标永远推不动。代价是这段超长对话被从中间拆成两段，
+            # 对话级指标（轮次、平均长度）按两段分别统计；6 小时会话间隔下
+            # 日常睡眠就会切段，单段超过一个批次（默认 5000 条）实际不常见。
 
             if not conversations:
                 break
@@ -281,10 +333,11 @@ class Analyzer:
             update_milestones(contact, messages, aggregation)
 
             # 留了尾巴就只能停在最后一条已统计的消息上；整批提交时可以直接跨到
-            # 本批最后一行，把尾部被过滤掉的系统噪声一并跳过。
-            last = messages[-1]
+            # 本批最后一行，把尾部被过滤掉的系统噪声一并跳过。对话是分批消息的
+            # 连续切片，截断后已提交消息仍是 batch.messages 的前缀，所以最后一条
+            # 的位置是 positions[len(messages) - 1]。
             cursor = (
-                Cursor(last.timestamp, last.local_id) if held_tail else batch.last
+                batch.positions[len(messages) - 1] if held_tail else batch.last
             )
             self._advance(contact, cursor, display_name, aggregation.buckets)
             committed += len(messages)
@@ -306,12 +359,16 @@ class Analyzer:
 
         contact.cursor_timestamp = cursor.timestamp
         contact.cursor_local_id = cursor.local_id
+        contact.cursor_shard = cursor.shard
         contact.display_name = display_name
         self.store.commit_batch(contact.session_id, buckets, contact)
 
     def _recompute(self, moment: int) -> int:
         """重算所有联系人的五维分、趋势与异动，整体替换 scores 表。"""
 
+        # 窗口起点用「N 天前的同一时刻」折算，跨 DST 切换时本地时间会偏移
+        # 一小时、日键偶尔差一天（生产容器在澳大利亚/悉尼，有夏令时），
+        # 目前按秒数近似，不做逐天修正。
         today = day_key(moment)
         score_start = day_key(moment - SCORE_WINDOW_DAYS * 86400)
         recent_start = day_key(moment - TREND_RECENT_DAYS * 86400)
@@ -331,15 +388,19 @@ class Analyzer:
         )
 
         empty = Metrics()
+        # 日均的除数取窗口实际覆盖的天数（load_window 两端闭区间）：少除一天
+        # 会让近期窗口的日均比基线凭空大 31/30，异动判定跟着失真。
         raw_score = {
             session_id: raw_metrics(
-                score_windows[session_id], self.strategy, SCORE_WINDOW_DAYS
+                score_windows[session_id], self.strategy, day_span(score_start, today)
             )
             for session_id in eligible
         }
         raw_recent = {
             session_id: raw_metrics(
-                recent_windows.get(session_id, empty), self.strategy, TREND_RECENT_DAYS
+                recent_windows.get(session_id, empty),
+                self.strategy,
+                day_span(recent_start, today),
             )
             for session_id in eligible
         }
@@ -347,7 +408,7 @@ class Analyzer:
             session_id: raw_metrics(
                 baseline_windows.get(session_id, empty),
                 self.strategy,
-                TREND_BASELINE_DAYS,
+                day_span(baseline_start, baseline_end),
             )
             for session_id in eligible
         }
@@ -362,6 +423,15 @@ class Analyzer:
             session_id = contact.session_id
             scored = session_id in scores
             dimension_scores = scores.get(session_id)
+            # 趋势要基线窗口样本足够才成立：基线窗口不足时基线分恒为 50，
+            # 趋势退化成「近期百分位 − 50」的假数字。此时置 null 让前端显示
+            # 数据不足，而不是 0——「没有变化」和「没有数据」是两种说法。
+            # 近期窗口不设门槛：最近淡出的人近期分本身就是真实的低百分位。
+            has_trend = (
+                scored
+                and baseline_windows.get(session_id, empty).messages_total()
+                >= MIN_SCORE_MESSAGES
+            )
             payload: dict[str, object] = {
                 "hash": contact.hash,
                 "display_name": contact.display_name,
@@ -371,18 +441,18 @@ class Analyzer:
                     name: round(dimension_scores[name], 1) if scored else None
                     for name in DIMENSION_NAMES
                 },
-                "trends": {
-                    name: (
-                        round(
+                "trends": (
+                    {
+                        name: round(
                             recent_scores[session_id][name]
                             - baseline_scores[session_id][name],
                             1,
                         )
-                        if scored
-                        else None
-                    )
-                    for name in (*DIMENSION_NAMES, "overall")
-                },
+                        for name in (*DIMENSION_NAMES, "overall")
+                    }
+                    if has_trend
+                    else None
+                ),
                 "recent_messages": recent_windows.get(session_id, empty).messages_total(),
                 "window_messages": score_windows.get(session_id, empty).messages_total(),
                 "last_message_at": contact.last_message_at,
@@ -401,15 +471,21 @@ class Analyzer:
             payloads.append((session_id, payload))
 
         self.store.save_scores(payloads)
+        # 中位数随分数一起落库；一个人没有参照系时不写任何中位数。
         self.store.set_json(
             "medians",
-            {
-                name: round(
-                    median([scores[session_id][name] for session_id in eligible]), 1
-                )
-                for name in DIMENSION_NAMES
-            },
+            (
+                {
+                    name: round(
+                        median([scores[session_id][name] for session_id in eligible]),
+                        1,
+                    )
+                    for name in DIMENSION_NAMES
+                }
+                if scores
+                else {}
+            ),
         )
         self.store.set_meta("last_analyzed_at", str(moment))
         LOG.info("完成打分：%d/%d 个联系人样本达标", len(eligible), len(payloads))
-        return len(eligible)
+        return len(scores)

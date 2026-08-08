@@ -245,10 +245,12 @@
     );
   }
 
-  /** 综合分趋势箭头：±8 以内视为持平。 */
+  /** 综合分趋势箭头：±8 以内视为持平（阈值只在 JS 里维护）。 */
   function trendHtml(delta) {
     if (!I.isNumber(delta)) {
-      return '<span class="trend trend--flat"><span class="trend__arrow">→</span>' + I.DASH + "</span>";
+      // 基线窗口样本不足时后端不提供趋势：不画箭头、不写数值，沿用「数据
+      // 不足」的说法——没有数据不能假装成持平。
+      return '<span class="trend trend--flat">数据不足</span>';
     }
     var modifier = "flat";
     var arrow = "→";

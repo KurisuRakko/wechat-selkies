@@ -50,6 +50,12 @@ class RawMetricTests(unittest.TestCase):
         self.assertAlmostEqual(values["msgs_them_per_day"], 1.0)
         self.assertAlmostEqual(values["chars_them_per_day"], 10.0)
 
+    def test_recent_window_divides_by_its_actual_day_span(self) -> None:
+        # 近期窗口 [D−30, D] 覆盖 31 个日键，除数必须用 31 而不是 30，
+        # 否则 31 条消息会被算成日均 1.03 条。
+        values = raw_metrics(window(msgs_them=31), STRATEGY, 31)
+        self.assertAlmostEqual(values["msgs_them_per_day"], 1.0)
+
     def test_reply_median_needs_enough_samples(self) -> None:
         self.assertIsNone(reply_median([1] + [0] * 23, 1))
         self.assertIsNotNone(reply_median([5] + [0] * 23, 5))
@@ -107,10 +113,17 @@ class CohortScoreTests(unittest.TestCase):
         self.assertEqual(scores["b"]["responsiveness"], 25.0)
 
     def test_dimension_without_any_data_is_neutral(self) -> None:
-        scores = score_cohort({"a": {}}, STRATEGY)
+        scores = score_cohort({"a": {}, "b": {}}, STRATEGY)
         for name in DIMENSION_NAMES:
             self.assertEqual(scores["a"][name], 50.0)
         self.assertEqual(scores["a"]["overall"], 50.0)
+
+    def test_cohort_of_one_is_not_scored(self) -> None:
+        # 只有一个人时没有任何「他人」可参照，百分位恒为 50，不构成测量，
+        # 返回空表让上层按未打分处理。
+        self.assertEqual(
+            score_cohort({"a": {"msgs_them_per_day": 10.0}}, STRATEGY), {}
+        )
 
     def test_overall_is_the_mean_of_the_five_dimensions(self) -> None:
         scores = score_cohort(

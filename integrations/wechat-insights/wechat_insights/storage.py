@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import sqlite3
 import threading
 from contextlib import closing
@@ -26,6 +27,8 @@ from .constants import (
 )
 from .metrics import Metrics, dump_histogram, parse_histogram
 
+
+LOG = logging.getLogger("wechat-insights")
 
 _ROW_COLUMNS = METRIC_COLUMNS + HISTOGRAM_COLUMNS
 
@@ -42,6 +45,8 @@ CREATE TABLE IF NOT EXISTS contacts (
     cursor_timestamp         INTEGER NOT NULL DEFAULT 0,
     -- -1 让首轮能读到 local_id = 0 的第一条消息。
     cursor_local_id          INTEGER NOT NULL DEFAULT -1,
+    -- 游标所在消息分片；local_id 只在单个分片内唯一，不带分片会漏消息。
+    cursor_shard             TEXT NOT NULL DEFAULT '',
     first_message_at         INTEGER,
     last_message_at          INTEGER,
     total_messages           INTEGER NOT NULL DEFAULT 0,
@@ -84,6 +89,7 @@ class ContactRow:
     display_name: str
     cursor_timestamp: int
     cursor_local_id: int
+    cursor_shard: str
     first_message_at: int | None
     last_message_at: int | None
     total_messages: int
@@ -141,12 +147,38 @@ class MetricsStore:
         self._local = threading.local()
         if not read_only:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            with closing(sqlite3.connect(self.path)) as setup, setup:
-                setup.executescript(_SCHEMA)
-                setup.execute(
-                    "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)",
-                    (str(SCHEMA_VERSION),),
-                )
+            self._initialize()
+
+    def _initialize(self) -> None:
+        """建表并写入 schema 版本；遇到旧版本或损坏的库直接整体重建。
+
+        metrics.db 只是统计结果，没有值得保留的历史数据，版本不匹配时
+        重建比迁移简单可靠：下一轮分析会从零开始回填。
+        """
+        if self.path.exists() and self._stale_schema():
+            LOG.warning(
+                "metrics.db 的 schema 版本与当前不兼容，整体重建后重新回填"
+            )
+            for suffix in ("", "-wal", "-shm"):
+                self.path.with_name(self.path.name + suffix).unlink(missing_ok=True)
+        with closing(sqlite3.connect(self.path)) as setup, setup:
+            setup.executescript(_SCHEMA)
+            setup.execute(
+                "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)",
+                (str(SCHEMA_VERSION),),
+            )
+
+    def _stale_schema(self) -> bool:
+        """库文件已存在，但 schema 版本不是当前版本（含读不出版本的损坏库）。"""
+
+        try:
+            with closing(sqlite3.connect(self.path)) as connection:
+                row = connection.execute(
+                    "SELECT value FROM meta WHERE key = 'schema_version'"
+                ).fetchone()
+        except sqlite3.Error:
+            return True
+        return row is None or str(row[0]) != str(SCHEMA_VERSION)
 
     @property
     def connection(self) -> sqlite3.Connection:
@@ -237,6 +269,7 @@ class MetricsStore:
             """
             UPDATE contacts SET
                 display_name = ?, cursor_timestamp = ?, cursor_local_id = ?,
+                cursor_shard = ?,
                 first_message_at = ?, last_message_at = ?, total_messages = ?,
                 longest_silence_seconds = ?, longest_silence_ended_at = ?,
                 latest_night_at = ?, latest_night_offset = ?, max_laugh_run = ?
@@ -246,6 +279,7 @@ class MetricsStore:
                 contact.display_name,
                 contact.cursor_timestamp,
                 contact.cursor_local_id,
+                contact.cursor_shard,
                 contact.first_message_at,
                 contact.last_message_at,
                 contact.total_messages,

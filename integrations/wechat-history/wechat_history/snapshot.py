@@ -195,7 +195,9 @@ class SnapshotCache:
                 before = _source_state(database, wal)
                 required = before.database.size + (before.wal.size if before.wal else 0)
                 if self._current_size() + (required * 2) > self.max_bytes:
-                    raise fail("CACHE_LIMIT", "临时解密缓存超过 512 MiB 限制")
+                    raise fail(
+                        "CACHE_LIMIT", f"临时解密缓存超过 {self.max_bytes} 字节限制"
+                    )
                 shutil.copyfile(database, encrypted_database)
                 if before.wal is not None:
                     shutil.copyfile(wal, encrypted_wal)

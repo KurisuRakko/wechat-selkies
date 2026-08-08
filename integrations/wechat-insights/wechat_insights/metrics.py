@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 
 from .constants import (
     COST_WEIGHTS,
@@ -32,6 +32,17 @@ def day_key(timestamp: int) -> str:
     """Unix 秒 → 容器本地时区的 YYYY-MM-DD。"""
 
     return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d")
+
+
+def day_span(start_day: str, end_day: str) -> int:
+    """闭区间 [start_day, end_day] 覆盖的天数，含首尾两天。
+
+    存储层的窗口查询是两端闭区间，日均的除数必须等于实际加载的日键个数，
+    否则「近 30 天」的 31 个日键会被除以 30，近期与基线之间凭空多出
+    31/30 的比值偏差。
+    """
+
+    return (date.fromisoformat(end_day) - date.fromisoformat(start_day)).days + 1
 
 
 def side_of(direction: str) -> str:
@@ -134,9 +145,6 @@ class Metrics:
             self.reply_hist_them[index] += other.reply_hist_them[index]
             self.reply_hist_me[index] += other.reply_hist_me[index]
 
-    def is_empty(self) -> bool:
-        return not any(self.counts.values())
-
     def messages_total(self) -> int:
         return self.get("msgs_them") + self.get("msgs_me")
 
@@ -147,15 +155,6 @@ class Metrics:
         for kind, weight in COST_WEIGHTS.items():
             total += self.get(f"kind_{kind}_{side}") * weight
         return total
-
-
-def merged(chunks: list[Metrics]) -> Metrics:
-    """把若干个桶合成一个。"""
-
-    result = Metrics()
-    for chunk in chunks:
-        result.merge(chunk)
-    return result
 
 
 # —— 从消息序列聚合 ——
@@ -245,7 +244,8 @@ def aggregate(conversations: list[list[Message]]) -> Aggregation:
 def late_night_offset(timestamp: int) -> int:
     """凌晨消息距离当天 00:00 的秒数；不在凌晨窗口内返回 -1。
 
-    「聊到最晚的一次」只在 00:00–06:00 之间比较，否则 23:59 会永远压过 02:00。
+    「聊到最晚的一次」只在 00:00–05:59:59 之间比较（06:00 整点除外），
+    否则 23:59 会永远压过 02:00。
     """
 
     moment = datetime.fromtimestamp(timestamp)
@@ -260,10 +260,10 @@ __all__ = [
     "aggregate",
     "bucket_of",
     "day_key",
+    "day_span",
     "dump_histogram",
     "empty_histogram",
     "late_night_offset",
-    "merged",
     "parse_histogram",
     "quantile",
     "side_of",

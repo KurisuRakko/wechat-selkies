@@ -8,6 +8,7 @@ from wechat_insights.metrics import (
     aggregate,
     bucket_of,
     day_key,
+    day_span,
     late_night_offset,
     quantile,
 )
@@ -58,6 +59,24 @@ class HistogramTests(unittest.TestCase):
         histogram[10] = 1  # 1 个很慢的
         value = quantile(histogram, 0.5)
         self.assertLess(value, 2.0)
+
+
+class DaySpanTests(unittest.TestCase):
+    def test_day_span_counts_both_ends(self) -> None:
+        self.assertEqual(day_span("2026-03-01", "2026-03-31"), 31)
+        self.assertEqual(day_span("2026-03-01", "2026-03-01"), 1)
+
+    def test_rolling_window_spans_match_the_configuration(self) -> None:
+        # 「近 30 天」窗口从 30 天前的同一时刻起算，日键含首尾共 31 个；
+        # 打分窗口 91 个、基线窗口 90 个。日均的除数必须按实际日键数来，
+        # 否则近期窗口的日均比基线凭空大 31/30。
+        moment = at(2026, 3, 31, 12)
+        self.assertEqual(day_span(day_key(moment - 30 * 86400), day_key(moment)), 31)
+        self.assertEqual(day_span(day_key(moment - 90 * 86400), day_key(moment)), 91)
+        self.assertEqual(
+            day_span(day_key(moment - 120 * 86400), day_key(moment - 31 * 86400)),
+            90,
+        )
 
 
 class AggregateTests(unittest.TestCase):

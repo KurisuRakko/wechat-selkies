@@ -45,6 +45,8 @@ RUN set -eu; \
 # 解密、快照、账户白名单与私聊过滤全部复用主仓库的这个包，本镜像不重复实现。
 COPY integrations/wechat-history/wechat_history ./wechat_history
 COPY integrations/wechat-insights/wechat_insights ./wechat_insights
+# 测试只服务 README / scripts/test.ps1 的 docker exec 工作流，运行时不会 import，
+# 体积只有几 KB；不要随手删，删了那两个命令就跑不了。
 COPY integrations/wechat-insights/tests ./tests
 
 # 命名卷首次创建时会继承镜像里同路径目录的属主，分析结果因此能被非 root 进程写入。

@@ -178,12 +178,76 @@ class AuthTests(AioHTTPTestCase):
         )
         self.assertEqual(response.status, 200)
 
-    async def test_query_token_is_accepted_and_stored_in_a_cookie(self) -> None:
-        response = await self.client.get("/api/status?token=s3cret")
-        self.assertEqual(response.status, 200)
+    async def test_query_token_redirects_and_sets_a_cookie(self) -> None:
+        # ?token= 只该出现在地址栏一次：校验通过后 302 到不带参数的同一个 URL，
+        # 并在响应里写 cookie；token 不进浏览器历史，也不会出现在复制出去的链接里。
+        response = await self.client.get(
+            "/api/status?token=s3cret", allow_redirects=False
+        )
+        self.assertEqual(response.status, 302)
+        self.assertEqual(response.headers["Location"], "/api/status")
         self.assertIn("wechat_insights_token", response.cookies)
-        # cookie 之后可以单独通过。
+        # 重定向后的请求不带 token，靠 cookie 单独通过；也不会再重定向（无死循环）。
         self.assertEqual((await self.client.get("/api/status")).status, 200)
+
+    async def test_redirect_keeps_other_query_params(self) -> None:
+        response = await self.client.get(
+            "/api/status?foo=1&token=s3cret", allow_redirects=False
+        )
+        self.assertEqual(response.status, 302)
+        self.assertEqual(response.headers["Location"], "/api/status?foo=1")
+
+    async def test_pages_redirect_too(self) -> None:
+        response = await self.client.get("/?token=s3cret", allow_redirects=False)
+        self.assertEqual(response.status, 302)
+        self.assertEqual(response.headers["Location"], "/")
+        # 跟随重定向后页面正常返回，且地址栏不再有 token。
+        self.assertEqual((await self.client.get("/?token=s3cret")).status, 200)
+
+    async def test_bearer_header_does_not_redirect(self) -> None:
+        response = await self.client.get(
+            "/api/status", headers={"Authorization": "Bearer s3cret"}
+        )
+        self.assertEqual(response.status, 200)
+        self.assertNotIn("wechat_insights_token", response.cookies)
+
+    async def test_post_with_query_token_is_not_redirected(self) -> None:
+        # 302 会把 POST 转成 GET、破坏接口语义，所以非 GET/HEAD 只写 cookie。
+        with patch.object(InsightsRuntime, "analyze", return_value=True):
+            response = await self.client.post("/api/refresh?token=s3cret")
+        self.assertEqual(response.status, 202)
+        self.assertIn("wechat_insights_token", response.cookies)
+
+    async def test_unknown_paths_require_auth_too(self) -> None:
+        # 404 响应同样要过鉴权，不能成为未授权探测的信息源。
+        self.assertEqual((await self.client.get("/api/nope")).status, 401)
+        response = await self.client.get(
+            "/api/nope", headers={"Authorization": "Bearer s3cret"}
+        )
+        self.assertEqual(response.status, 404)
+
+    async def test_head_requests_require_auth(self) -> None:
+        self.assertEqual(
+            (await self.client.request("HEAD", "/api/status")).status, 401
+        )
+        response = await self.client.request(
+            "HEAD", "/api/status", headers={"Authorization": "Bearer s3cret"}
+        )
+        self.assertEqual(response.status, 200)
+        # HEAD 查询参数同样会 302 清掉 token。
+        redirected = await self.client.request(
+            "HEAD", "/api/status?token=s3cret", allow_redirects=False
+        )
+        self.assertEqual(redirected.status, 302)
+        self.assertEqual(redirected.headers["Location"], "/api/status")
+
+    async def test_options_requests_require_auth(self) -> None:
+        self.assertEqual((await self.client.options("/")).status, 401)
+        response = await self.client.options(
+            "/", headers={"Authorization": "Bearer s3cret"}
+        )
+        # 路径存在但没注册 OPTIONS：aiohttp 回 405（带 Allow 头），而不是放行。
+        self.assertEqual(response.status, 405)
 
     async def test_wrong_token_is_rejected(self) -> None:
         self.assertEqual((await self.client.get("/api/status?token=nope")).status, 401)

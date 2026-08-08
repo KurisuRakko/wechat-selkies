@@ -34,18 +34,8 @@
    * 网络请求
    * ------------------------------------------------------------------ */
 
-  // 首次访问可能带 ?token=xxx；服务端校验通过后会写 cookie，但在同一次会话里
-  // 继续透传更稳妥（用户可能在 cookie 被拒的环境下使用）。
-  var TOKEN = new URLSearchParams(global.location.search).get("token");
-
-  /** 给请求路径或页面链接补上 token 查询参数（若当前页面带了 token）。 */
-  function withToken(path) {
-    if (!TOKEN) {
-      return path;
-    }
-    var sep = path.indexOf("?") === -1 ? "?" : "&";
-    return path + sep + "token=" + encodeURIComponent(TOKEN);
-  }
+  // ?token= 首次访问时由服务端校验并写 cookie，然后 302 到不带参数的地址；
+  // 之后的请求全部靠 cookie 带凭证，前端不需要再碰 token。
 
   /** 构造带 status / code 的错误对象，页面据此区分展示哪种空状态。 */
   function makeError(message, status, code) {
@@ -61,7 +51,7 @@
   async function request(path, init) {
     var res;
     try {
-      res = await fetch(withToken(path), Object.assign({ credentials: "same-origin" }, init));
+      res = await fetch(path, Object.assign({ credentials: "same-origin" }, init));
     } catch (e) {
       throw makeError("无法连接到服务", 0, "NETWORK_ERROR");
     }
@@ -100,6 +90,11 @@
    */
   async function apiPost(path) {
     return request(path, { method: "POST" });
+  }
+
+  /** 页面链接原样返回：鉴权靠 cookie，链接里不需要再拼任何参数。 */
+  function linkTo(path) {
+    return path;
   }
 
   /* ------------------------------------------------------------------ *
@@ -393,7 +388,7 @@
     DASH: DASH,
     api: api,
     apiPost: apiPost,
-    linkTo: withToken,
+    linkTo: linkTo,
     formatDuration: formatDuration,
     formatDateTime: formatDateTime,
     formatDate: formatDate,

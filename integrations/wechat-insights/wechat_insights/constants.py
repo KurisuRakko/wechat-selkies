@@ -41,7 +41,7 @@ FAST_REPLY_SECONDS = 60
 LONG_MESSAGE_CHARS = 50
 # 对话轮次（同向连续块数）超过该值记为「长对话」。
 LONG_CONVERSATION_TURNS = 20
-# 深夜窗口 23:00–02:00：小时数落在这个集合里即算深夜。
+# 深夜窗口 23:00–01:59:59（小时 23/0/1）：落在这个集合里即算深夜。
 NIGHT_HOURS = frozenset({23, 0, 1})
 # 「聊到最晚的一次」只在凌晨窗口里比较，避免 23:59 永远压过 02:00。
 LATE_NIGHT_MAX_HOUR = 6
@@ -55,8 +55,6 @@ TREND_BASELINE_DAYS = _int_env("INSIGHTS_TREND_BASELINE_DAYS", 90, 7, 3650)
 MIN_SCORE_MESSAGES = _int_env("INSIGHTS_MIN_SCORE_MESSAGES", 50, 1, 100000)
 # 回复延迟中位数至少要有这么多个回复样本才可信。
 MIN_REPLY_SAMPLES = 3
-# 维度分变化超过该点数才显示升/降箭头。
-TREND_DELTA_THRESHOLD = 8.0
 # 「近期异动」判定：原始值相对变化超过该倍数，且样本量达标。
 ANOMALY_MIN_RATIO = 2.0
 ANOMALY_MIN_SAMPLES = 10
@@ -80,6 +78,12 @@ TEXT_CHARS_PER_COST_UNIT = 20.0
 # —— 增量读取 ——
 # 单批读取的消息条数上限；首轮回填靠多批循环推进。
 BACKFILL_BATCH = _int_env("INSIGHTS_BACKFILL_BATCH", 5000, 100, 200000)
+# 解密后的明文缓存上限（字节）。wechat_history 默认 512 MiB，九个消息分片
+# 全量解密后实测已达约 465 MiB（88.5%），历史再长一点就会抛 CACHE_LIMIT；
+# 这里把上限提到 960 MiB（1006632960 字节）留足余量。
+INSIGHTS_MAX_CACHE_BYTES = _int_env(
+    "INSIGHTS_MAX_CACHE_BYTES", 1006632960, 512 * 1024 * 1024, 4 * 1024 * 1024 * 1024
+)
 
 # —— 指标列 ——
 # 与 wechat_history.formatting.message_kind 的返回值一一对应。
@@ -145,4 +149,4 @@ HISTOGRAM_COLUMNS = ("reply_hist_them", "reply_hist_me")
 # 对数直方图桶数：桶 i 覆盖 [2^i, 2^(i+1)) 秒，最后一桶约 97 天封顶。
 HISTOGRAM_BUCKETS = 24
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2

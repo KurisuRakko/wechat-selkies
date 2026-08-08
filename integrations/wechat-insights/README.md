@@ -57,10 +57,17 @@ ECharts 在构建时从 npm registry 下载并校验 sha256，运行时不依赖
 部署时把 [`compose.example.yml`](compose.example.yml) 的内容合并进你自己的
 `compose.local.yml`（该文件不在仓库里），逐项核对带 `⚠️ 需要替换` 注释的地方：
 
-- 微信数据目录**只读**挂到 `/history-source`（挂载源与主容器 `/config` 相同）
+- 微信数据卷**只读**挂到 `/history-source`。默认是 named volume（与主容器 `/config`
+  共用同一个卷），并在 `volumes:` 里声明为 `external`——卷不存在时 compose 直接报错，
+  而不是静默建一个空卷让看板「一切正常但零条消息」。只有当你把微信数据目录复制到
+  宿主机某处、想对着副本分析时，才改用注释里备选的 bind 挂载。两种方式下
+  healthcheck 都会检查源目录里有没有任何 `*.db`，空目录判为不健康。
 - keyscan 写密钥的那个 named volume **只读**挂到 `/run/wechat-history`
   （卷名照抄你现有 compose 里 `history-keyscan` profile 用的那个）
 - tmpfs 挂到 `/run/wechat-history-cache`，明文快照只落在这里
+  （完整参数 `rw,noexec,nosuid,nodev,size=1g,mode=0700,uid=…,gid=…`，每一项都有安全
+  理由，见示例里的逐项注释；Docker 传任何选项都会整体替换 tmpfs 默认挂载参数，
+  所以必须显式写全安全选项，否则明文缓存会以 exec/suid 挂载）
 - 新的 named volume 挂 `/data`，存放 `metrics.db`
 
 ```bash
@@ -68,8 +75,25 @@ docker compose -f docker-compose.yml -f compose.local.yml up -d --build wechat-i
 ```
 
 密钥文件权限是 0600、属主是主容器里的 `abc` 用户，所以本容器的运行 uid/gid 必须与
-主容器的 `PUID`/`PGID` 一致——compose 示例里同时通过构建参数和 `user:` 指定，两处要
-保持相同。`/data` 命名卷首次创建时会继承镜像里该目录的属主，因此非 root 进程也能写。
+主容器的 `PUID`/`PGID` 一致（默认 1000:100）——compose 示例里同时通过构建参数、
+`user:` 和 tmpfs 的 `uid=`/`gid=` 三处指定，必须全部保持相同，否则读不到密钥、
+也写不进缓存目录。`/data` 命名卷首次创建时会继承镜像里该目录的属主，因此非 root
+进程也能写。
+
+### 端口发布
+
+看板展示的是**极其私密的聊天统计**，只允许通过回环地址或你自己的 Tailscale 地址
+（100.x 网段）访问，示例里发布到 `127.0.0.1:8300` 与你的 Tailscale 地址。**不要**
+发布成 `0.0.0.0:8300` 或 `192.168.x.x:8300`——局域网里任何人都能看到它，等于把
+微信聊天记录挂在公网上。需要远程访问就走 Tailscale，不要开端口转发。
+
+### 内存与 tmpfs 的取舍
+
+tmpfs 的大小直接决定明文缓存的写满点：缓存数据量达到 `size=` 上限后，任何写入都会
+硬失败（`CACHE_LIMIT`）。`size=1g` 配合默认 960 MiB 的 `INSIGHTS_MAX_CACHE_BYTES`，
+实测九个消息分片全量解密峰值 474.9 MiB（约 46%），留足了余量。tmpfs 只在实际写入
+时才占用内存，不会启动即占满 1g——但宿主机 Docker VM 总共只有 8 GiB，主微信容器
+已经用掉约 4.5 GiB，所以这 1g 是真实预算，调大上限前先看看内存余量。
 
 ## 环境变量
 
@@ -88,6 +112,7 @@ docker compose -f docker-compose.yml -f compose.local.yml up -d --build wechat-i
 | `INSIGHTS_MIN_SCORE_MESSAGES` | `50` | 打分窗口内的最低消息数，不够就是「数据不足」 |
 | `INSIGHTS_BACKFILL_BATCH` | `5000` | 单批读取的消息条数 |
 | `INSIGHTS_DEPTH_STRATEGY` | `lexical` | 深度维度策略，v1 只有词法策略 |
+| `INSIGHTS_MAX_CACHE_BYTES` | `1006632960` | 解密明文缓存上限（字节，默认 960 MiB）。必须 ≤ tmpfs 的 `size=`，否则缓存写满前先撞 tmpfs 上限 |
 | `TZ` | 容器默认 | 决定「按天 / 深夜 / 周末」的切分，建议设成你自己的时区 |
 
 `wechat_history` 自身的路径变量（`WECHAT_HISTORY_SOURCE_ROOT`、
@@ -96,18 +121,22 @@ compose 示例里的挂载点与它们一一对应。
 
 ## 安全注意事项
 
-- **不要暴露公网。** 看板展示的是高度隐私的关系统计。端口只发布到
-  `127.0.0.1:8300`，需要远程访问就走 SSH 端口转发或 VPN。
+- **不要暴露公网或局域网。** 看板展示的是**极其私密的聊天统计**——谁在什么时候、
+  以什么频率和你聊天、聊到多晚、沉默多久，这些都能从页面上看出来。端口只发布到
+  `127.0.0.1:8300` 和你的 Tailscale 地址（100.x），需要远程访问就走 Tailscale；
+  不要把端口发布到 `0.0.0.0` 或局域网地址，也不要放在没有鉴权的反向代理后面。
 - **设置 `INSIGHTS_AUTH_TOKEN`。** 设置后所有请求（包括静态资源）都必须携带
-  `Authorization: Bearer <token>` 或 `?token=<token>`；查询参数第一次通过后会写一个
-  HttpOnly cookie，之后不必再带。用一段足够长的随机串：
+  `Authorization: Bearer <token>`（API 客户端）或 `?token=<token>`（浏览器首次访问）。
+  查询参数通过校验后，服务端会写一个 HttpOnly cookie 并 302 到不带参数的同一个
+  URL——token 不会留在地址栏、浏览器历史或复制出去的链接里。用一段足够长的随机串：
 
   ```bash
   openssl rand -hex 32
   ```
 
 - **源数据严格只读。** `/history-source` 与 `/run/wechat-history` 都以 `:ro` 挂载，
-  容器永远不会写微信数据目录。解密出的明文只存在于 tmpfs，容器停止即消失。
+  容器永远不会写微信数据目录。解密出的明文只存在于 tmpfs（`noexec,nosuid,nodev`，
+  且 `mode=0700`），容器停止即消失。
 - **URL 里没有 wxid。** 详情页用 `sha256(session_id)` 的前 24 位做标识，
   API 响应里也不包含 session_id。
 - 只分析私聊：群聊、公众号、系统会话、隐藏会话、不在通讯录里的会话全部排除，

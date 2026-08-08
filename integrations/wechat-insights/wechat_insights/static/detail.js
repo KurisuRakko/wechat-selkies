@@ -38,7 +38,16 @@
   /** 路由是 /contact/<hash>，取路径最后一段。 */
   function readHash() {
     var parts = global.location.pathname.split("/").filter(Boolean);
-    return parts.length ? decodeURIComponent(parts[parts.length - 1]) : "";
+    if (!parts.length) {
+      return "";
+    }
+    try {
+      return decodeURIComponent(parts[parts.length - 1]);
+    } catch (e) {
+      // 畸形的百分号转义会让 decodeURIComponent 抛 URIError，
+      // 按「没有联系人标识」处理，走下面的错误占位而不是卡在加载态。
+      return "";
+    }
   }
 
   async function load() {

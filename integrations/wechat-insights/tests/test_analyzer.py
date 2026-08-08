@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import sqlite3
 import tempfile
 import unittest
@@ -9,8 +10,15 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from wechat_history.formatting import message_kind
+from wechat_history.reader import HistoryReader
 
-from wechat_insights.analyzer import Analyzer, Cursor, read_messages_after
+from wechat_insights.analyzer import (
+    Analyzer,
+    Cursor,
+    default_reader_factory,
+    read_messages_after,
+)
+from wechat_insights.metrics import Metrics, day_key
 from wechat_insights.storage import MetricsStore
 
 
@@ -26,11 +34,15 @@ _NAMES = {1: SESSION_ID, 2: "me"}
 
 
 class FakeReader:
-    """只提供分析器实际用到的那几个 reader 接口，底下是一张真实的 sqlite 表。"""
+    """只提供分析器实际用到的那几个 reader 接口，底下是真实的 sqlite 表。
 
-    def __init__(self, database: Path):
-        self.database = database
-        self.cache = SimpleNamespace(get=lambda _: database)
+    databases 按相对路径映射到各分片文件，和真实 reader 的
+    message/message_N.db 布局一致。
+    """
+
+    def __init__(self, databases: dict[str, Path]):
+        self.databases = databases
+        self.cache = SimpleNamespace(get=lambda key: databases[key])
         self.closed = False
 
     @staticmethod
@@ -38,7 +50,7 @@ class FakeReader:
         return f"Msg_{hashlib.md5(session_id.encode('utf-8')).hexdigest()}"
 
     def _message_database_keys(self) -> list[str]:
-        return ["message/message_0.db"]
+        return sorted(self.databases)
 
     def _name_map(self, _: sqlite3.Connection) -> dict[int, str]:
         return dict(_NAMES)
@@ -102,7 +114,7 @@ class AnalyzerTestCase(unittest.TestCase):
         self.database = self.root / "message_0.db"
         self.store = MetricsStore(self.root / "metrics.db")
         self.addCleanup(self.store.close)
-        self.reader = FakeReader(self.database)
+        self.reader = FakeReader({"message/message_0.db": self.database})
 
     def analyzer(self, batch_size: int = 5000) -> Analyzer:
         return Analyzer(
@@ -116,41 +128,57 @@ class AnalyzerTestCase(unittest.TestCase):
         ):
             return self.analyzer(batch_size).run(now=now)
 
+    def seed_messages(self, session_id: str, name: str, days: dict[int, int]) -> None:
+        """绕过读取器，直接把 (时间戳 → 当天 TA 的消息数) 写进 stats_daily。"""
+
+        contact = self.store.ensure_contact(session_id, name)
+        buckets = {}
+        for timestamp, count in days.items():
+            metrics = Metrics()
+            metrics.add("msgs_them", count)
+            buckets[day_key(timestamp)] = metrics
+        self.store.commit_batch(session_id, buckets, contact)
+
 
 class ReadWindowTests(AnalyzerTestCase):
     def test_cursor_window_excludes_already_read_messages(self) -> None:
         build_database(self.database, [them(1, 0), me(2, 60), them(3, 120)])
         batch = read_messages_after(
-            self.reader, SESSION_ID, DISPLAY_NAME, {}, Cursor(BASE + 60, 2), 100
+            self.reader,
+            SESSION_ID,
+            DISPLAY_NAME,
+            {},
+            Cursor(BASE + 60, "message/message_0.db", 2),
+            100,
         )
         self.assertEqual([message.local_id for message in batch.messages], [3])
 
     def test_fresh_cursor_includes_local_id_zero(self) -> None:
         build_database(self.database, [them(0, 0)])
         batch = read_messages_after(
-            self.reader, SESSION_ID, DISPLAY_NAME, {}, Cursor(0, -1), 100
+            self.reader, SESSION_ID, DISPLAY_NAME, {}, Cursor(0, "", -1), 100
         )
         self.assertEqual(len(batch.messages), 1)
 
     def test_messages_without_a_sender_are_dropped(self) -> None:
         build_database(self.database, [them(1, 0), (2, 10000, BASE + 10, 99, "系统")])
         batch = read_messages_after(
-            self.reader, SESSION_ID, DISPLAY_NAME, {}, Cursor(0, -1), 100
+            self.reader, SESSION_ID, DISPLAY_NAME, {}, Cursor(0, "", -1), 100
         )
         self.assertEqual([message.local_id for message in batch.messages], [1])
 
     def test_batch_reports_more_rows_and_the_last_position(self) -> None:
         build_database(self.database, [them(1, 0), me(2, 60), them(3, 120)])
         batch = read_messages_after(
-            self.reader, SESSION_ID, DISPLAY_NAME, {}, Cursor(0, -1), 2
+            self.reader, SESSION_ID, DISPLAY_NAME, {}, Cursor(0, "", -1), 2
         )
         self.assertTrue(batch.has_more)
-        self.assertEqual(batch.last, Cursor(BASE + 60, 2))
+        self.assertEqual(batch.last, Cursor(BASE + 60, "message/message_0.db", 2))
 
     def test_missing_message_table_reads_nothing(self) -> None:
         build_database(self.database, [them(1, 0)])
         batch = read_messages_after(
-            self.reader, "stranger", "Bob", {}, Cursor(0, -1), 100
+            self.reader, "stranger", "Bob", {}, Cursor(0, "", -1), 100
         )
         self.assertEqual(batch.messages, [])
         self.assertIsNone(batch.last)
@@ -237,6 +265,26 @@ class IncrementalTests(AnalyzerTestCase):
         self.assertEqual(self.run_analysis(batch_size=2).messages_read, 1)
         self.assertEqual(self.store.get_contact(SESSION_ID).cursor_local_id, 5)
 
+    def test_colliding_rows_across_shards_are_never_lost(self) -> None:
+        # 微信把消息分到九个分片，local_id 只在单个分片内唯一：两个分片里
+        # 会出现完全相同的 (create_time, local_id)。批边界恰好卡在两条冲突
+        # 行之间时，游标必须带上分片，否则下轮谓词永远匹配不到另一条，
+        # 那条消息会被静默跳过。
+        shard0 = self.root / "message_0.db"
+        shard1 = self.root / "message_1.db"
+        build_database(shard0, [them(1, 0), me(2, 60)])
+        build_database(shard1, [them(2, 60), me(3, 120)])
+        self.reader = FakeReader(
+            {"message/message_0.db": shard0, "message/message_1.db": shard1}
+        )
+
+        first = self.run_analysis(batch_size=2)
+        self.assertEqual(first.messages_read, 4)
+        # 4 条一条都不能少，也不能被重复计入。
+        second = self.run_analysis(batch_size=2)
+        self.assertEqual(second.messages_read, 0)
+        self.assertEqual(self.store.get_contact(SESSION_ID).total_messages, 4)
+
     def test_a_failing_session_does_not_abort_the_whole_run(self) -> None:
         build_database(self.database, [them(1, 0)])
         sessions = {
@@ -277,6 +325,104 @@ class MilestoneTests(AnalyzerTestCase):
         self.assertEqual(self.store.get_contact(SESSION_ID).max_laugh_run, 4)
 
 
+class CacheCeilingTests(unittest.TestCase):
+    def test_default_reader_factory_injects_the_insights_cache_ceiling(self) -> None:
+        import wechat_insights.analyzer as analyzer
+        import wechat_insights.constants as constants
+
+        with patch("wechat_insights.analyzer.KeyStore") as keys_cls, patch(
+            "wechat_insights.analyzer.SnapshotCache"
+        ) as cache_cls, patch("wechat_history.reader.KeyStore"):
+            reader = default_reader_factory()
+        self.assertIsInstance(reader, HistoryReader)
+        cache_cls.assert_called_once_with(
+            keys_cls.return_value, max_bytes=constants.INSIGHTS_MAX_CACHE_BYTES
+        )
+
+    def test_cache_ceiling_reads_the_environment_override(self) -> None:
+        import wechat_insights.constants as constants
+
+        with patch.dict(
+            "os.environ", {"INSIGHTS_MAX_CACHE_BYTES": "1234567890"}
+        ):
+            importlib.reload(constants)
+            self.assertEqual(constants.INSIGHTS_MAX_CACHE_BYTES, 1234567890)
+        importlib.reload(constants)
+
+
+class TrendTests(AnalyzerTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        # 建一个空的真实分片表：增量读取会打开这个文件，空文件会被当成坏库。
+        build_database(self.database, [])
+
+    def test_empty_baseline_window_suppresses_the_trend(self) -> None:
+        # 两个联系人都达标，但 newer 的基线窗口 [D−120, D−31] 一条消息都
+        # 没有：全空基线下基线分恒为 50，趋势就是「近期分 − 50」的假数字，
+        # 必须置 null，而不是给出一个误导的箭头或「持平」。
+        self.seed_messages(
+            "older",
+            "Older",
+            {
+                BASE - 80 * 86400: 5,
+                BASE - 70 * 86400: 5,
+                BASE - 60 * 86400: 5,
+                BASE - 50 * 86400: 5,
+                BASE - 40 * 86400: 5,
+                BASE + 5 * 86400: 4,
+            },
+        )
+        # newer 的消息全部落在近期窗口（基线窗口在 D−31 之前就结束了）。
+        self.seed_messages(
+            "newer", "Newer", {BASE: 10, BASE + 5 * 86400: 10}
+        )
+
+        with patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10):
+            self.run_analysis()
+
+        scores = {p["display_name"]: p for p in self.store.all_scores()}
+        self.assertTrue(scores["Older"]["scored"])
+        self.assertIsInstance(scores["Older"]["trends"], dict)
+        self.assertTrue(
+            all(isinstance(v, float) for v in scores["Older"]["trends"].values())
+        )
+        self.assertTrue(scores["Newer"]["scored"])
+        self.assertIsNone(scores["Newer"]["trends"])
+
+    def test_window_day_counts_calibrate_the_per_day_numbers(self) -> None:
+        # 近期窗口 [D−30, D] 是 31 个日键、基线 [D−120, D−31] 是 90 个：
+        # 50 条 / 31 天 = 每天 1.6 条、50 条 / 90 天 = 每天 0.6 条。
+        # 若近期窗口误除以 30，会显示成每天 1.7 条。
+        self.seed_messages(
+            "active",
+            "Active",
+            {
+                BASE - 80 * 86400: 10,
+                BASE - 70 * 86400: 10,
+                BASE - 60 * 86400: 10,
+                BASE - 50 * 86400: 10,
+                BASE - 40 * 86400: 10,
+                BASE: 10,
+                BASE + 5 * 86400: 10,
+                BASE + 10 * 86400: 10,
+                BASE + 15 * 86400: 10,
+                BASE + 20 * 86400: 10,
+            },
+        )
+        self.seed_messages(
+            "steady", "Steady", {BASE - 60 * 86400: 10, BASE + 10 * 86400: 10}
+        )
+
+        with patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10):
+            self.run_analysis()
+
+        scores = {p["display_name"]: p for p in self.store.all_scores()}
+        anomalies = {item["metric"]: item for item in scores["Active"]["anomalies"]}
+        per_day = anomalies["msgs_them_per_day"]
+        self.assertEqual(per_day["before"], "每天 0.6 条")
+        self.assertEqual(per_day["after"], "每天 1.6 条")
+
+
 class ScoreTests(AnalyzerTestCase):
     def test_thin_contacts_are_marked_as_lacking_data(self) -> None:
         build_database(self.database, [them(1, 0), me(2, 60)])
@@ -292,17 +438,37 @@ class ScoreTests(AnalyzerTestCase):
             offset = index * 120
             rows.append(them(index, offset) if index % 2 else me(index, offset))
         build_database(self.database, rows)
+        # 百分位至少需要两个联系人做参照，第二个直接写库。
+        self.seed_messages("friend2", "Bob", {BASE + 5 * 86400: 15})
 
         with patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10):
             result = self.run_analysis(now=BASE + 10 * 86400)
 
-        self.assertEqual(result.scored, 1)
-        payload = self.store.all_scores()[0]
+        self.assertEqual(result.scored, 2)
+        payloads = {p["display_name"]: p for p in self.store.all_scores()}
+        payload = payloads[DISPLAY_NAME]
         self.assertTrue(payload["scored"])
         self.assertIsNotNone(payload["overall"])
         self.assertEqual(len(payload["dimensions"]), 5)
         self.assertEqual(payload["window_messages"], 20)
         self.assertEqual(self.store.get_json("medians", {}).keys().__len__(), 5)
+
+    def test_single_contact_cohort_is_not_scored(self) -> None:
+        # 只有一个人时百分位恒为 50，分数不代表任何相对位置；宁可不打分，
+        # 也不能交出一个看着像「平均」的假分。
+        rows = []
+        for index in range(1, 21):
+            offset = index * 120
+            rows.append(them(index, offset) if index % 2 else me(index, offset))
+        build_database(self.database, rows)
+
+        with patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10):
+            result = self.run_analysis(now=BASE + 10 * 86400)
+
+        self.assertEqual(result.scored, 0)
+        payload = self.store.all_scores()[0]
+        self.assertFalse(payload["scored"])
+        self.assertIsNone(payload["overall"])
 
 
 if __name__ == "__main__":

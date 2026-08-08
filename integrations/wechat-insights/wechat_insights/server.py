@@ -14,6 +14,7 @@ import signal
 import time
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlencode
 
 from aiohttp import web
 
@@ -162,6 +163,16 @@ def _extract_token(request: web.Request) -> tuple[str, bool]:
     return request.cookies.get(AUTH_COOKIE, ""), False
 
 
+def _tokenless_url(request: web.Request) -> str:
+    """同一路径、去掉 token 参数的 URL，作为 ?token= 通过后的 302 落点。"""
+
+    pairs = [(key, value) for key, value in request.query.items() if key != "token"]
+    target = request.path
+    if pairs:
+        target += "?" + urlencode(pairs)
+    return target
+
+
 @web.middleware
 async def auth_middleware(request: web.Request, handler):
     """启用 token 后，包括静态资源在内的所有请求都要带凭证。"""
@@ -175,9 +186,27 @@ async def auth_middleware(request: web.Request, handler):
             status=401,
             headers={"Cache-Control": "no-store"},
         )
+    if from_query and request.method in ("GET", "HEAD"):
+        # ?token= 只在地址栏里出现这一次：写 cookie 后 302 到不带参数的同一个
+        # URL，token 不会留在浏览器历史里、也不会出现在复制出去的链接中。
+        # 只对幂等的 GET/HEAD 重定向——POST 等被 302 会按规范转成 GET，会弄坏接口。
+        # cookie 被拒绝/禁用时，重定向后的请求没有 token 也没有 cookie，只会得到
+        # 401，不会绕回重定向，所以不存在死循环。
+        response = web.HTTPFound(_tokenless_url(request))
+        response.set_cookie(
+            AUTH_COOKIE,
+            AUTH_TOKEN,
+            httponly=True,
+            samesite="Lax",
+            path="/",
+            max_age=30 * 86400,
+        )
+        response.headers["Cache-Control"] = "no-store"
+        raise response
     response = await handler(request)
     if from_query:
-        # 第一次用 ?token= 通过后写 cookie，之后的静态资源请求就不必再带参数。
+        # 非 GET/HEAD（目前只有 POST /api/refresh）没法安全重定向，
+        # 那就照旧在响应里写 cookie，之后同样靠 cookie 带凭证。
         response.set_cookie(
             AUTH_COOKIE,
             AUTH_TOKEN,

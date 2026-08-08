@@ -15,9 +15,13 @@ from .constants import LONG_MESSAGE_CHARS
 # 计算「哈哈哈」这类连击时，笑声字符按一个集合处理，长度取最长的一段。
 _LAUGH_RUN = re.compile(r"[哈嘻嘿呵]{2,}")
 # 判定疑问句前先剥掉句尾的语气符号和空白，避免「吗。」「?~」漏判。
+# 问号不在这个集合里，整条消息只剩一个「?」「？」也不会被剥空。
 _TRAILING_NOISE = re.compile(r"[\s。\.!！~～、,，…·\-—]+$")
 # 中文里没有标点的疑问句主要靠这几个句末助词。
-_QUESTION_TAILS = ("？", "?", "吗", "呢")
+_QUESTION_TAILS = ("？", "?", "吗")
+# 「呢」既可以是疑问语气（然后呢？/在干嘛呢）也可以是附和语气（好的呢/
+# 没关系呢/嗯呢），只有句子里同时出现这些疑问词时才按提问算。
+_INTERROGATIVE_WORDS = ("哪", "什", "啥", "咋", "怎", "谁", "嘛", "然后", "所以", "后来")
 
 
 @dataclass(frozen=True, slots=True)
@@ -37,10 +41,19 @@ def longest_laugh_run(text: str) -> int:
 
 
 def is_question(text: str) -> bool:
-    """粗规则判定疑问句：剥掉句尾噪声后以 ？/? /吗/呢 结尾。"""
+    """粗规则判定疑问句：剥掉句尾噪声后以 ？/?/吗 结尾即为提问。
 
-    stripped = _TRAILING_NOISE.sub("", text.strip())
-    return stripped.endswith(_QUESTION_TAILS)
+    以「呢」结尾的不一定在提问（「好的呢」「没关系呢」是附和），所以「呢」
+    只在句子里同时出现疑问词时才算；「你说呢？」这类带问号的仍直接命中。
+    """
+
+    stripped = text.strip()
+    if not stripped:
+        return False
+    tail = _TRAILING_NOISE.sub("", stripped)
+    if tail.endswith(_QUESTION_TAILS):
+        return True
+    return tail.endswith("呢") and any(word in tail for word in _INTERROGATIVE_WORDS)
 
 
 def analyze_text(text: str) -> TextFeatures:

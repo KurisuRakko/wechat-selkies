@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 
+from wechat_insights.constants import SCHEMA_VERSION
 from wechat_insights.metrics import Metrics, quantile
 from wechat_insights.reporting import monthly_series, total_metrics, type_composition
 from wechat_insights.storage import MetricsStore, contact_hash
@@ -62,11 +64,14 @@ class DailyMergeTests(StoreTestCase):
         contact = self.store.ensure_contact("friend", "Alice")
         contact.cursor_timestamp = 1_700_000_000
         contact.cursor_local_id = 42
+        contact.cursor_shard = "message/message_3.db"
         self.store.commit_batch(
             "friend", {"2026-03-10": bucket(msgs_them=3)}, contact
         )
+        stored = self.store.get_contact("friend")
         self.assertEqual(self.store.load_days("friend")[0][1].get("msgs_them"), 3)
-        self.assertEqual(self.store.get_contact("friend").cursor_local_id, 42)
+        self.assertEqual(stored.cursor_local_id, 42)
+        self.assertEqual(stored.cursor_shard, "message/message_3.db")
 
     def test_window_query_sums_across_contacts(self) -> None:
         self.store.merge_daily("a", {"2026-03-10": bucket(msgs_them=1, msgs_me=2)})
@@ -88,6 +93,8 @@ class ContactTests(StoreTestCase):
         contact = self.store.ensure_contact("friend", "Alice")
         self.assertEqual(contact.cursor_timestamp, 0)
         self.assertEqual(contact.cursor_local_id, -1)
+        # 空分片排在一切真实分片之前，保证首轮全量读取。
+        self.assertEqual(contact.cursor_shard, "")
 
     def test_milestones_derive_days_known_and_night_clock(self) -> None:
         contact = self.store.ensure_contact("friend", "Alice")
@@ -129,6 +136,32 @@ class ScoreTests(StoreTestCase):
         self.store.set_json("medians", {"depth": 42.0})
         self.assertEqual(self.store.get_json("medians"), {"depth": 42.0})
         self.assertEqual(self.store.get_json("missing", {}), {})
+
+
+class SchemaMigrationTests(unittest.TestCase):
+    def test_stale_schema_is_rebuilt_from_scratch(self) -> None:
+        # 模拟旧版本 metrics.db：contacts 没有 cursor_shard 列。
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        path = Path(temporary.name) / "metrics.db"
+        with sqlite3.connect(path) as connection:
+            connection.execute(
+                "CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+            connection.execute(
+                "CREATE TABLE contacts (session_id TEXT PRIMARY KEY)"
+            )
+            connection.execute(
+                "INSERT INTO meta (key, value) VALUES ('schema_version', '1')"
+            )
+
+        store = MetricsStore(path)
+        self.addCleanup(store.close)
+        columns = {
+            row[1] for row in store.connection.execute("PRAGMA table_info(contacts)")
+        }
+        self.assertIn("cursor_shard", columns)
+        self.assertEqual(store.get_meta("schema_version"), str(SCHEMA_VERSION))
 
 
 class ReportingTests(StoreTestCase):
