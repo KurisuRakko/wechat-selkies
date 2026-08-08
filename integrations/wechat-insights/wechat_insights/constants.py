@@ -78,6 +78,33 @@ COST_WEIGHTS = {
 # 文字消息按字数折算成本：每这么多字算一个成本单位。
 TEXT_CHARS_PER_COST_UNIT = 20.0
 
+# —— 大模型深度打分（可选，默认关闭）——
+# 为空 = 禁用 LLM 深度打分，完全离线；给出发送端点才启用，例如
+# http://localhost:11434/v1（OpenAI 兼容）。末尾斜杠在 llm.py 里容错。
+INSIGHTS_LLM_BASE_URL = os.environ.get("INSIGHTS_LLM_BASE_URL", "")
+INSIGHTS_LLM_API_KEY = os.environ.get("INSIGHTS_LLM_API_KEY", "")
+INSIGHTS_LLM_MODEL = os.environ.get("INSIGHTS_LLM_MODEL", "")
+# 单次 LLM 请求的超时（秒）；超时按失败处理并重试一次。
+INSIGHTS_LLM_TIMEOUT_SECONDS = _int_env("INSIGHTS_LLM_TIMEOUT_SECONDS", 30, 5, 300)
+
+# —— 出站敏感词屏蔽 ——
+# 可选用户词表文件（UTF-8，每行一词，# 开头为注释、空行忽略），与内置种子
+# 词表合并去重；读不到时记 WARNING 并只用种子词表。任何要离开容器的聊天
+# 文本都必须过 masking.mask()。
+INSIGHTS_MASK_WORDS_FILE = os.environ.get("INSIGHTS_MASK_WORDS_FILE", "")
+
+# —— LLM 深度打分采样与刷新 ——
+# 采样回看天数：候选联系人在这么多天内有消息才会送评。
+LLM_SAMPLE_DAYS = _int_env("INSIGHTS_LLM_SAMPLE_DAYS", 60, 7, 730)
+# 分数保鲜期：超过这么多天没有重新评过分就重评。
+LLM_REFRESH_DAYS = _int_env("INSIGHTS_LLM_REFRESH_DAYS", 30, 1, 365)
+# 新增消息门槛：联系人累计消息数比打分时多出这么多条就重评。
+LLM_REFRESH_MESSAGES = _int_env("INSIGHTS_LLM_REFRESH_MESSAGES", 200, 10, 100000)
+# 单轮分析里最多调用多少次 LLM（成本控制上限，超出部分下一轮再评）。
+LLM_MAX_CALLS_PER_RUN = _int_env("INSIGHTS_LLM_MAX_CALLS_PER_RUN", 40, 1, 1000)
+# 一次采样最多送多少字的聊天文本（越长越贵；达到即停，不足就送全部）。
+LLM_SAMPLE_MAX_CHARS = _int_env("INSIGHTS_LLM_SAMPLE_MAX_CHARS", 4000, 500, 20000)
+
 # —— 增量读取 ——
 # 单批读取的消息条数上限；首轮回填靠多批循环推进。
 BACKFILL_BATCH = _int_env("INSIGHTS_BACKFILL_BATCH", 5000, 100, 200000)

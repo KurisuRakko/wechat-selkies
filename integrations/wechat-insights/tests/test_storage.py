@@ -177,6 +177,42 @@ class ScoreTests(StoreTestCase):
         self.assertEqual(self.store.get_json("missing", {}), {})
 
 
+class LLMDepthTests(StoreTestCase):
+    def test_set_and_get_round_trip(self) -> None:
+        self.assertIsNone(self.store.get_llm_depth("friend"))
+        self.store.set_llm_depth("friend", 66.0, 1_700_000_000, 120)
+        row = self.store.get_llm_depth("friend")
+        self.assertEqual(row.score, 66.0)
+        self.assertEqual(row.scored_at, 1_700_000_000)
+        self.assertEqual(row.total_messages, 120)
+
+    def test_setting_twice_is_an_upsert(self) -> None:
+        self.store.set_llm_depth("friend", 66.0, 1_700_000_000, 120)
+        self.store.set_llm_depth("friend", 80.0, 1_700_000_100, 150)
+        self.assertEqual(len(self.store.all_llm_depth()), 1)
+        row = self.store.get_llm_depth("friend")
+        self.assertEqual(
+            (row.score, row.scored_at, row.total_messages),
+            (80.0, 1_700_000_100, 150),
+        )
+
+    def test_all_llm_depth_maps_session_ids_to_scores(self) -> None:
+        self.store.set_llm_depth("a", 10.0, 1, 10)
+        self.store.set_llm_depth("b", 20.0, 2, 20)
+        self.assertEqual(self.store.all_llm_depth(), {"a": 10.0, "b": 20.0})
+
+    def test_table_survives_reinitializing_an_existing_database(self) -> None:
+        # 对既有库再走一次 _initialize：executescript 全部 IF NOT EXISTS，
+        # 新表照常补齐、旧数据不动。
+        self.store.set_llm_depth("friend", 30.0, 1, 10)
+        self.store.close()
+        reopened = MetricsStore(self.store.path)
+        self.addCleanup(reopened.close)
+        self.assertEqual(reopened.get_llm_depth("friend").score, 30.0)
+        reopened.set_llm_depth("friend", 40.0, 2, 20)
+        self.assertEqual(reopened.get_llm_depth("friend").score, 40.0)
+
+
 class SchemaMigrationTests(unittest.TestCase):
     def test_stale_schema_is_rebuilt_from_scratch(self) -> None:
         # 模拟旧版本 metrics.db：contacts 没有 cursor_shard 列。

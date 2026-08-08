@@ -1,9 +1,11 @@
 """metrics.db：只存统计结果，不存任何消息原文。
 
-三张表：
+四张表：
 - contacts   每个私聊联系人的游标与里程碑
 - stats_daily 按天分桶的可加指标（数值列由 constants.METRIC_COLUMNS 生成）
 - scores     分析结束时预计算好的看板数据，HTTP 处理器直接吐 JSON
+- llm_depth  可选的大模型深度分缓存（session_id → 分数 + 打分时刻 +
+             打分时的累计消息数，做新鲜度基准）
 
 按天而不是按自然月分桶，是为了让「近 30 天 / 近 90 天 / 近两年」这类滚动窗口是
 精确的；自然月视图由 SQL 之外的 Python 聚合从同一批天桶合成，没有第二份真相。
@@ -74,6 +76,15 @@ CREATE TABLE IF NOT EXISTS scores (
     hash       TEXT NOT NULL UNIQUE,
     payload    TEXT NOT NULL
 );
+
+-- LLM 深度分缓存；total_messages 是打分时联系人的累计消息数，
+-- 与 contacts.total_messages 的差值做「新增多少条就重评」的基准。
+CREATE TABLE IF NOT EXISTS llm_depth (
+    session_id     TEXT PRIMARY KEY,
+    score          REAL NOT NULL,
+    scored_at      INTEGER NOT NULL,
+    total_messages INTEGER NOT NULL
+);
 """
 
 
@@ -125,6 +136,15 @@ class ContactRow:
             "latest_night_clock": clock,
             "max_haha_run": self.max_laugh_run,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class LLMDepthRow:
+    """一条 LLM 深度分缓存。"""
+
+    score: float
+    scored_at: int
+    total_messages: int
 
 
 @dataclass(slots=True)
@@ -310,6 +330,41 @@ class MetricsStore:
                 contact.session_id,
             ),
         )
+
+    # —— llm_depth ——
+
+    def get_llm_depth(self, session_id: str) -> LLMDepthRow | None:
+        row = self.connection.execute(
+            "SELECT score, scored_at, total_messages FROM llm_depth "
+            "WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        return None if row is None else LLMDepthRow(**row)
+
+    def set_llm_depth(
+        self, session_id: str, score: float, scored_at: int, total_messages: int
+    ) -> None:
+        """写入或覆盖一条 LLM 深度分缓存（UPSERT）。"""
+
+        with self.connection as connection:
+            connection.execute(
+                "INSERT INTO llm_depth (session_id, score, scored_at, total_messages) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(session_id) DO UPDATE SET "
+                "score = excluded.score, scored_at = excluded.scored_at, "
+                "total_messages = excluded.total_messages",
+                (session_id, score, scored_at, total_messages),
+            )
+
+    def all_llm_depth(self) -> dict[str, float]:
+        """全部联系人的 LLM 深度分，供打分窗口注入用。"""
+
+        return {
+            str(row["session_id"]): float(row["score"])
+            for row in self.connection.execute(
+                "SELECT session_id, score FROM llm_depth"
+            )
+        }
 
     # —— stats_daily ——
 

@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -13,16 +14,23 @@ from dataclasses import dataclass, field
 from wechat_history.reader import HistoryReader, _read_connection
 from wechat_history.sessions import scan_direct_rows
 
+from . import llm
 from .constants import (
     BACKFILL_BATCH,
     DECAY_HALF_LIFE_DAYS,
+    LLM_MAX_CALLS_PER_RUN,
+    LLM_REFRESH_DAYS,
+    LLM_REFRESH_MESSAGES,
+    LLM_SAMPLE_DAYS,
+    LLM_SAMPLE_MAX_CHARS,
     MIN_SCORE_MESSAGES,
     SCORE_WINDOW_DAYS,
     SESSION_GAP_SECONDS,
     TREND_BASELINE_DAYS,
     TREND_RECENT_DAYS,
 )
-from .conversation import Message, split_conversations
+from .conversation import ME, Message, split_conversations
+from .masking import mask
 from .depth import DepthStrategy, get_depth_strategy
 from .metrics import (
     Aggregation,
@@ -67,6 +75,7 @@ class AnalysisResult:
     sessions: int = 0
     messages_read: int = 0
     scored: int = 0
+    llm_scored: int = 0
     per_session: dict[str, int] = field(default_factory=dict)
 
 
@@ -206,6 +215,36 @@ def update_milestones(
     contact.max_laugh_run = max(contact.max_laugh_run, aggregation.max_laugh_run)
 
 
+_LLM_SYSTEM_PROMPT = (
+    "你是一个亲密关系分析助手。用户会给你他和一位朋友最近的聊天记录（已做隐私脱敏，"
+    "部分词被替换成星号）。请从话题实质性、情感袒露程度、相互追问与回应的质量三个方面，"
+    "评估这段对话关系的深度，给出 0 到 100 的整数分：日常寒暄、斗图、纯事务性沟通在 "
+    "30 以下；有实质话题讨论在 30–60；有情感袒露、深度交流在 60 以上。只回复 JSON，"
+    "格式 {\"score\": 整数}，不要任何其他文字。"
+)
+
+
+def _parse_llm_score(reply: str) -> int | None:
+    """从模型回复里截取第一个 JSON 块解析整数分并夹到 [0, 100]；失败返回 None。
+
+    不把回复内容写进日志：回复虽然是模型生成的，但日志里出现任何聊天相关
+    文本都违背「原文不出容器」的原则。
+    """
+
+    start = reply.find("{")
+    end = reply.rfind("}")
+    if start < 0 or end <= start:
+        LOG.warning("LLM 深度分回复里没有 JSON 块")
+        return None
+    try:
+        data = json.loads(reply[start : end + 1])
+        score = int(data["score"])
+    except (ValueError, KeyError, TypeError):
+        LOG.warning("LLM 深度分回复里解析不出 score")
+        return None
+    return max(0, min(100, score))
+
+
 class Analyzer:
     """一轮完整分析：拉新消息 → 聚合落库 → 重算全部看板数据。"""
 
@@ -247,6 +286,13 @@ class Analyzer:
                 if read:
                     result.messages_read += read
                     result.per_session[session.display_name] = read
+            # LLM 深度打分要在 reader 关闭前做（它还要从快照里读采样文本）。
+            # 它是可选的加分项：出任何意外都不能拖垮整轮打分，隔离处理。
+            if self.strategy.name == "llm":
+                try:
+                    result.llm_scored = self._refresh_llm_depth(reader, moment)
+                except Exception:
+                    LOG.exception("LLM 深度打分失败，本轮跳过")
         finally:
             reader.close()
 
@@ -355,6 +401,101 @@ class Analyzer:
         contact.display_name = display_name
         self.store.commit_batch(contact.session_id, buckets, contact)
 
+    def _refresh_llm_depth(self, reader: HistoryReader, moment: int) -> int:
+        """给候选联系人补上/刷新 LLM 深度分，写进 llm_depth 缓存表。
+
+        只在深度策略是 llm 时被调用。所有调用都是出站流量：样本必须先
+        整体过 masking.mask() 再交给 llm.chat——这是聊天原文离开容器的
+        唯一出口。
+
+        候选 = 采样窗口内有消息，且（从未评过 / 分数过了保鲜期 / 打分后
+        新增消息数达标）的联系人；从未评过的排最前，其余按最陈旧在前，
+        截断到单轮调用上限，剩下的下一轮再评。
+        """
+
+        sample_start = moment - LLM_SAMPLE_DAYS * 86400
+        pending: list[tuple[int, int, str, ContactRow]] = []
+        for contact in self.store.all_contacts():
+            if contact.last_message_at is None or contact.last_message_at < sample_start:
+                continue
+            cached = self.store.get_llm_depth(contact.session_id)
+            if not (
+                cached is None
+                or moment - cached.scored_at >= LLM_REFRESH_DAYS * 86400
+                or contact.total_messages - cached.total_messages >= LLM_REFRESH_MESSAGES
+            ):
+                continue
+            pending.append(
+                (
+                    0 if cached is None else 1,
+                    cached.scored_at if cached is not None else 0,
+                    contact.session_id,
+                    contact,
+                )
+            )
+
+        scored = skipped = failed = 0
+        for _, _, _, contact in sorted(pending)[:LLM_MAX_CALLS_PER_RUN]:
+            sample = self._llm_sample(
+                reader, contact.session_id, contact.display_name, sample_start
+            )
+            if sample is None:
+                skipped += 1
+                continue
+            reply = llm.chat(_LLM_SYSTEM_PROMPT, mask(sample))
+            score = _parse_llm_score(reply) if reply is not None else None
+            if score is None:
+                failed += 1
+                continue
+            self.store.set_llm_depth(
+                contact.session_id, score, moment, contact.total_messages
+            )
+            scored += 1
+        LOG.info(
+            "LLM 深度打分：评分 %d 个，跳过 %d 个，失败 %d 个", scored, skipped, failed
+        )
+        return scored
+
+    def _llm_sample(
+        self,
+        reader: HistoryReader,
+        session_id: str,
+        display_name: str,
+        sample_start: int,
+    ) -> str | None:
+        """从采样窗口读一批消息，从最晚往前拼最近几段对话；没有 text 返回 None。
+
+        只取 text 类消息，每行「我: 内容 / TA: 内容」，段与段之间空行分隔，
+        总字数达到 LLM_SAMPLE_MAX_CHARS 就停。窗口内消息超过一个批次时只
+        覆盖最旧的那一批（读接口只支持从游标向前读），采样质量足够。
+        """
+
+        batch = read_messages_after(
+            reader,
+            session_id,
+            display_name,
+            {},
+            Cursor(sample_start, "", -1),
+            BACKFILL_BATCH,
+        )
+        blocks: list[str] = []
+        total = 0
+        for conversation in reversed(
+            split_conversations(batch.messages, self.gap_seconds)
+        ):
+            lines = [
+                f"{'我' if message.direction == ME else 'TA'}: {message.text}"
+                for message in conversation
+                if message.kind == "text" and message.text
+            ]
+            if not lines:
+                continue
+            blocks.append("\n".join(lines))
+            total += sum(len(line) for line in lines)
+            if total >= LLM_SAMPLE_MAX_CHARS:
+                break
+        return None if not blocks else "\n\n".join(blocks)
+
     def _weight_of(self, today: str, day: str) -> float:
         """打分窗口内一个天桶的衰减权重：天龄 = 距今天数（今天为 0）。"""
 
@@ -415,25 +556,28 @@ class Analyzer:
         # 打分窗口的日均除数用 decayed_span 的「等效天数」：均匀活跃的人加权前后
         # 日均一致，两年的衰减窗口与近 30 天窗口的日均仍可直接比较。
         equivalent_days = decayed_span(day_span(score_start, today), DECAY_HALF_LIFE_DAYS)
+        llm_scores = self.store.all_llm_depth() if self.strategy.name == "llm" else {}
         raw_score: dict[str, dict[str, float | None]] = {}
         for session_id in eligible:
             stats = score_stats[session_id]
             contact = contacts_by_id[session_id]
+            extras: dict[str, float | None] = {
+                "active_day_rate": stats.active_weight / equivalent_days,
+                "current_gap_days": (
+                    (moment - contact.last_message_at) / 86400
+                    if contact.last_message_at is not None
+                    else None
+                ),
+                "longest_gap_days": self._longest_gap(
+                    stats, contact, score_start, score_start_ts
+                ),
+            }
+            if self.strategy.name == "llm":
+                # LLM 分可能还没评出来（None）：缺值权重回流给词法三项，
+                # 深度维度自动退化成纯词法，不需要特判。
+                extras["llm_depth_score"] = llm_scores.get(session_id)
             raw_score[session_id] = raw_metrics(
-                stats.weighted,
-                self.strategy,
-                equivalent_days,
-                {
-                    "active_day_rate": stats.active_weight / equivalent_days,
-                    "current_gap_days": (
-                        (moment - contact.last_message_at) / 86400
-                        if contact.last_message_at is not None
-                        else None
-                    ),
-                    "longest_gap_days": self._longest_gap(
-                        stats, contact, score_start, score_start_ts
-                    ),
-                },
+                stats.weighted, self.strategy, equivalent_days, extras
             )
         raw_recent = {
             session_id: raw_metrics(

@@ -4,8 +4,10 @@
 再用一个 Material Design 2 风格的网页展示。它不改动主微信容器的任何行为，也不会向
 微信写入任何东西。
 
-v1 只做纯统计分析，不接任何 LLM；深度维度用词法代理，扩展点留在
-[`wechat_insights/depth.py`](wechat_insights/depth.py)。
+v1 只做纯统计分析，不接任何 LLM；深度维度用词法代理。v2 深度维度可插拔为
+`llm` 策略：把抽样对话交给你自己配置的 OpenAI 兼容端点打分，词法代理仍然
+作为兜底保留。扩展点在 [`wechat_insights/depth.py`](wechat_insights/depth.py)。
+默认配置下一切照旧，完全离线。
 
 ## 它做了什么
 
@@ -25,7 +27,7 @@ v1 只做纯统计分析，不接任何 LLM；深度维度用词法代理，扩�
 | 主动 Initiative | TA 发起对话占比（0.4）、TA 的追加率（0.3）、TA 说最后一句的占比（0.3） |
 | 投入 Investment | 类型加权成本日均（0.45）、消息量日均（0.2）、字数日均（0.2）、双方表情包互发频率（0.15） |
 | 节奏 Rhythm | 深夜 23:00–02:00 占比（0.3）、周末占比（0.2）、平均对话轮次（0.3）、长对话（>20 轮）占比（0.2） |
-| 深度 Depth | TA 消息平均长度（0.4）、疑问句占比（0.3）、长消息 >50 字占比（0.3） |
+| 深度 Depth | TA 消息平均长度（0.4）、疑问句占比（0.3）、长消息 >50 字占比（0.3）<br>（llm 策略下：词法三项各 ×0.5，另加 LLM 对话深度分占 0.5） |
 | 恒常 Constancy | 有往来的天数占比（0.4）、当前已沉默的天数（0.35，越久越差）、窗口内最长断联（0.25，越长越差） |
 | 对等 Reciprocity | 消息量均衡度（0.4）、字数均衡度（0.3）、发起对话均衡度（0.3） |
 
@@ -53,6 +55,50 @@ v1 只做纯统计分析，不接任何 LLM；深度维度用词法代理，扩�
 指标按**天**分桶存储，月度视图由天桶合成。（任务书原本写的是按自然月存储，但那样
 「近 30 天 / 近两年」只能退化成整月窗口；按天存既满足滚动窗口的精确性，也能无损地
 合成出月度图表，存储量对单机来说完全不是问题。）
+
+## 大模型深度打分（可选）
+
+默认关闭，开箱即用的是上面的纯词法深度代理。想用大模型给「对话深度」打分时：
+
+1. 配置一个 OpenAI 兼容端点：`INSIGHTS_LLM_BASE_URL`（例如 Ollama 的
+   `http://host.docker.internal:11434/v1`）、`INSIGHTS_LLM_API_KEY`、
+   `INSIGHTS_LLM_MODEL`。
+2. `INSIGHTS_DEPTH_STRATEGY=llm`。配了 `llm` 但端点为空时自动回退词法策略
+   并打印告警，不会启动后悄悄不发请求。
+
+开启后，每轮分析会给候选联系人（采样窗口内聊过天，且分数过期或新增消息
+达标）采样最近几段对话，送到配置的端点打 0–100 分，分数缓存在
+`metrics.db` 的 `llm_depth` 表里，与词法三项各占一半权重合成深度维度。
+某个联系人还没有 LLM 分（没采样过 / API 挂了）时，缺值的权重自动回流给
+词法三项，深度维度退化成纯词法，不需要任何特判。
+
+刷新与成本控制旋钮：
+
+- `INSIGHTS_LLM_SAMPLE_DAYS`：采样回看天数，默认 60。
+- `INSIGHTS_LLM_REFRESH_DAYS`：分数保鲜期，默认 30 天。
+- `INSIGHTS_LLM_REFRESH_MESSAGES`：打分后新增这么多条消息就重评，默认 200。
+- `INSIGHTS_LLM_MAX_CALLS_PER_RUN`：单轮分析最多调用次数，默认 40——
+  候选超出时按「从未评过 > 最陈旧」排序截断，剩下的下一轮再评。
+- `INSIGHTS_LLM_SAMPLE_MAX_CHARS`：一次采样最多送出的字数，默认 4000。
+- `INSIGHTS_LLM_TIMEOUT_SECONDS`：单次请求超时，默认 30 秒，失败自动重试
+  一次（共至多两次请求）。
+
+### 隐私
+
+**不开启 `INSIGHTS_DEPTH_STRATEGY=llm` 时，本容器完全离线：聊天原文只在
+内存里过一遍统计后丢弃，不出容器、不落库。** 开启后，聊天原文会经过
+敏感词星号化处理（见下），然后发送到你配置的端点。端点与密钥由你自己
+掌控（建议用本地 Ollama/vLLM，或自建网关转发到模型服务商），本容器不
+向任何第三方直接上报。请求体与日志里不会出现聊天原文。
+
+### 出站敏感词屏蔽
+
+任何要离开容器的聊天文本都必须过 `mask()`（`wechat_insights/masking.py`
+是唯一出口）。内置一份政治高危词表，把命中词替换成等长星号——这是为了
+避免触发端点侧的内容风控导致拒答/封号，不是价值判断。用户词表通过
+`INSIGHTS_MASK_WORDS_FILE` 指定：UTF-8 文本文件，每行一个词，`#` 开头
+为注释、空行忽略，与内置词表合并去重。文件读不到时只记一条告警、仍用
+内置词表。
 
 ## 构建与部署
 
@@ -123,7 +169,17 @@ tmpfs 的大小直接决定明文缓存的写满点：缓存数据量达到 `siz
 | `INSIGHTS_TREND_BASELINE_DAYS` | `90` | 趋势的基线窗口（紧邻近期窗口之前） |
 | `INSIGHTS_MIN_SCORE_MESSAGES` | `50` | 打分窗口内的最低消息数，不够就是「数据不足」 |
 | `INSIGHTS_BACKFILL_BATCH` | `5000` | 单批读取的消息条数 |
-| `INSIGHTS_DEPTH_STRATEGY` | `lexical` | 深度维度策略，v1 只有词法策略 |
+| `INSIGHTS_DEPTH_STRATEGY` | `lexical` | 深度维度策略：`lexical`（词法代理）或 `llm`（大模型深度打分，见上） |
+| `INSIGHTS_LLM_BASE_URL` | 空 | OpenAI 兼容端点；空 = 禁用 LLM 深度打分 |
+| `INSIGHTS_LLM_API_KEY` | 空 | LLM 请求的 Bearer 密钥 |
+| `INSIGHTS_LLM_MODEL` | 空 | LLM 模型名 |
+| `INSIGHTS_LLM_TIMEOUT_SECONDS` | `30` | 单次 LLM 请求超时（5–300 秒） |
+| `INSIGHTS_MASK_WORDS_FILE` | 空 | 出站敏感词用户词表文件（UTF-8，每行一词） |
+| `INSIGHTS_LLM_SAMPLE_DAYS` | `60` | LLM 采样回看天数（7–730） |
+| `INSIGHTS_LLM_REFRESH_DAYS` | `30` | LLM 分数保鲜期（1–365 天） |
+| `INSIGHTS_LLM_REFRESH_MESSAGES` | `200` | 打分后新增这么多条消息就重评（10–100000） |
+| `INSIGHTS_LLM_MAX_CALLS_PER_RUN` | `40` | 单轮 LLM 调用上限（1–1000） |
+| `INSIGHTS_LLM_SAMPLE_MAX_CHARS` | `4000` | 单次采样送出字数上限（500–20000） |
 | `TZ` | 容器默认 | 决定「按天 / 深夜 / 周末」的切分，建议设成你自己的时区 |
 
 身份三变量（`WECHAT_HISTORY_ACCOUNT_DIR`、`WECHAT_HISTORY_USERNAME`、

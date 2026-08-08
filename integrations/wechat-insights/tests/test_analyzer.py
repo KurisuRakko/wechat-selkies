@@ -11,6 +11,7 @@ from unittest.mock import patch
 from wechat_history.formatting import message_kind
 
 from wechat_insights.analyzer import Analyzer, Cursor, read_messages_after
+from wechat_insights.depth import DepthStrategy, LexicalDepth, LLMDepth
 from wechat_insights.metrics import Metrics, day_key
 from wechat_insights.storage import MetricsStore
 
@@ -69,10 +70,14 @@ class FakeReader:
         self.closed = True
 
 
-def build_database(path: Path, rows: list[tuple[int, int, int, int, str]]) -> None:
+def build_database(
+    path: Path,
+    rows: list[tuple[int, int, int, int, str]],
+    session_id: str = SESSION_ID,
+) -> None:
     """rows = (local_id, local_type, create_time, real_sender_id, content)。"""
 
-    table = FakeReader._message_table(SESSION_ID)
+    table = FakeReader._message_table(session_id)
     with sqlite3.connect(path) as connection:
         connection.execute(
             f"""
@@ -109,9 +114,14 @@ class AnalyzerTestCase(unittest.TestCase):
         self.addCleanup(self.store.close)
         self.reader = FakeReader({"message/message_0.db": self.database})
 
-    def analyzer(self, batch_size: int = 5000) -> Analyzer:
+    def analyzer(
+        self, batch_size: int = 5000, strategy: DepthStrategy | None = None
+    ) -> Analyzer:
         return Analyzer(
-            self.store, reader_factory=lambda: self.reader, batch_size=batch_size
+            self.store,
+            reader_factory=lambda: self.reader,
+            strategy=strategy,
+            batch_size=batch_size,
         )
 
     def run_analysis(self, now: int = NOW, batch_size: int = 5000):
@@ -562,6 +572,147 @@ class LeadingGapTests(AnalyzerTestCase):
         self.assertTrue(scores["NewFriend"]["scored"])
         # 尾部空档（认识后 300 天都没聊）不算前导空档：new_friend 唯一活跃日在窗口内。
         self.assertGreater(scores["NewFriend"]["dimensions"]["constancy"], 0.0)
+
+
+class LLMDepthRefreshTests(AnalyzerTestCase):
+    """大模型深度打分的采样、屏蔽、缓存与刷新行为（假 reader + 假 llm.chat）。"""
+
+    def setUp(self) -> None:
+        super().setUp()
+        # 建一个空的真实分片表：增量读取会打开这个文件，空文件会被当成坏库。
+        build_database(self.database, [])
+
+    def run_llm_analysis(self, now: int = NOW, chat=None):
+        """以 llm 深度策略跑一轮，返回 (result, 被 patch 的 llm.chat)。"""
+
+        sessions = {SESSION_ID: SimpleNamespace(display_name=DISPLAY_NAME)}
+        with patch(
+            "wechat_insights.analyzer.scan_direct_rows", return_value=sessions
+        ), patch("wechat_insights.llm.chat", side_effect=chat) as fake:
+            result = self.analyzer(strategy=LLMDepth()).run(now=now)
+        return result, fake
+
+    def test_new_contact_is_scored_and_cached_on_first_round(self) -> None:
+        build_database(
+            self.database,
+            [
+                them(1, 0, "今天过得怎么样"),
+                me(2, 60, "还行"),
+                them(3, 120, "最近看了本好书"),
+            ],
+        )
+        result, fake = self.run_llm_analysis(chat=lambda system, user: '{"score": 66}')
+        self.assertEqual(result.llm_scored, 1)
+        self.assertEqual(fake.call_count, 1)
+        row = self.store.get_llm_depth(SESSION_ID)
+        self.assertIsNotNone(row)
+        self.assertEqual((row.score, row.scored_at, row.total_messages), (66.0, NOW, 3))
+
+    def test_sample_text_is_masked_before_being_sent(self) -> None:
+        build_database(
+            self.database,
+            [them(1, 0, "习近平今天讲了什么"), me(2, 60, "不知道")],
+        )
+
+        def chat(system: str, user: str) -> str:
+            # 种子词必须以星号出现，原文绝不能出容器。
+            self.assertNotIn("习近平", user)
+            self.assertIn("***", user)
+            return '{"score": 55}'
+
+        result, _ = self.run_llm_analysis(chat=chat)
+        self.assertEqual(result.llm_scored, 1)
+
+    def test_fresh_cache_within_ttl_and_under_message_threshold_skips(self) -> None:
+        build_database(self.database, [them(1, 0), me(2, 60)])
+        self.run_llm_analysis(chat=lambda system, user: '{"score": 50}')
+
+        def unexpected(system: str, user: str) -> str:
+            raise AssertionError("保鲜期内且消息增量不足，不该再调用 LLM")
+
+        result, fake = self.run_llm_analysis(now=NOW + 5 * 86400, chat=unexpected)
+        self.assertEqual(result.llm_scored, 0)
+        self.assertEqual(fake.call_count, 0)
+
+    def test_failed_chat_call_does_not_write_cache(self) -> None:
+        build_database(self.database, [them(1, 0, "你好呀"), me(2, 60, "你好")])
+        result, _ = self.run_llm_analysis(chat=lambda system, user: None)
+        self.assertEqual(result.llm_scored, 0)
+        self.assertIsNone(self.store.get_llm_depth(SESSION_ID))
+
+    def test_garbage_reply_skips_without_writing_cache(self) -> None:
+        build_database(self.database, [them(1, 0, "你好呀"), me(2, 60, "你好")])
+        result, _ = self.run_llm_analysis(
+            chat=lambda system, user: "这不是 JSON"
+        )
+        self.assertEqual(result.llm_scored, 0)
+        self.assertIsNone(self.store.get_llm_depth(SESSION_ID))
+
+    def test_max_calls_per_run_truncates_the_candidates(self) -> None:
+        shards: dict[str, Path] = {}
+        for index, session_id in enumerate(("c1", "c2", "c3")):
+            path = self.root / f"message_{index}.db"
+            build_database(
+                path,
+                [them(1, 0, "你好呀"), me(2, 60, "你好")],
+                session_id=session_id,
+            )
+            shards[f"message/message_{index}.db"] = path
+        self.reader = FakeReader(shards)
+        sessions = {
+            session_id: SimpleNamespace(display_name=session_id.upper())
+            for session_id in ("c1", "c2", "c3")
+        }
+        with patch(
+            "wechat_insights.analyzer.scan_direct_rows", return_value=sessions
+        ), patch(
+            "wechat_insights.llm.chat", side_effect=lambda s, u: '{"score": 40}'
+        ) as fake, patch("wechat_insights.analyzer.LLM_MAX_CALLS_PER_RUN", 2):
+            result = self.analyzer(strategy=LLMDepth()).run(now=NOW)
+        self.assertEqual(result.llm_scored, 2)
+        self.assertEqual(fake.call_count, 2)
+        cached = [
+            session_id
+            for session_id in ("c1", "c2", "c3")
+            if self.store.get_llm_depth(session_id) is not None
+        ]
+        # 单轮只评上限内的前两个，第三个留到下一轮。
+        self.assertEqual(cached, ["c1", "c2"])
+
+    def test_lexical_strategy_never_calls_the_llm(self) -> None:
+        build_database(self.database, [them(1, 0, "你好呀"), me(2, 60, "你好")])
+
+        def unexpected(system: str, user: str) -> str:
+            raise AssertionError("词法策略不该调用 LLM")
+
+        sessions = {SESSION_ID: SimpleNamespace(display_name=DISPLAY_NAME)}
+        with patch(
+            "wechat_insights.analyzer.scan_direct_rows", return_value=sessions
+        ), patch("wechat_insights.llm.chat", side_effect=unexpected):
+            result = self.analyzer(strategy=LexicalDepth()).run(now=NOW)
+        self.assertEqual(result.llm_scored, 0)
+
+    def test_llm_scores_flow_into_the_scoring_extras(self) -> None:
+        # 两人窗口内只有纯消息计数、没有任何词法文本指标（三项全部缺值），
+        # llm 组件的 0.5 权重整份生效：深度维度完全由 LLM 分决定（75 vs 25）。
+        for session_id, name in (("a", "A"), ("b", "B")):
+            self.seed_messages(
+                session_id,
+                name,
+                {BASE + offset * 86400: 3 for offset in range(25)},
+            )
+        self.store.set_llm_depth("a", 90.0, NOW, 75)
+        self.store.set_llm_depth("b", 10.0, NOW, 75)
+
+        with patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 50):
+            result, fake = self.run_llm_analysis(chat=lambda s, u: '{"score": 1}')
+        # 两个联系人的 last_message_at 是 None（seed 走的不是同步循环），
+        # 不会进采样候选，chat 不应被调用。
+        self.assertEqual(fake.call_count, 0)
+        payloads = {p["display_name"]: p for p in self.store.all_scores()}
+        self.assertTrue(payloads["A"]["scored"])
+        self.assertAlmostEqual(payloads["A"]["dimensions"]["depth"], 75.0)
+        self.assertAlmostEqual(payloads["B"]["dimensions"]["depth"], 25.0)
 
 
 if __name__ == "__main__":
