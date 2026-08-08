@@ -1,8 +1,8 @@
 # 本机微信聊天记录 MCP（可选）
 
-该功能只面向当前机器上的私人、非商用使用，默认构建保持关闭。它固定读取旧账户
-`wxid_bo75…7498`，并在首次读取时验证自身资料包含“杨博文”、`Spencer` 或
-`KurisuRakko`。任何不匹配都会停止，不会尝试另一个账户。
+该功能只面向当前机器上的私人、非商用使用，默认构建保持关闭。它只读取由环境变量
+指定的唯一账户（单账户白名单，见「环境变量」一节），并在首次读取时验证自身资料
+包含配置的身份标记。任何不匹配都会停止，不会尝试另一个账户。
 
 实现参考了 Apache-2.0 许可的
 [`huohuoer/wechat-cli`](https://github.com/huohuoer/wechat-cli/tree/a3789232d4f79bf0b30634d9dadbce71e4acd601)，
@@ -17,7 +17,8 @@
 docker compose up -d --build
 ```
 
-在微信界面手动切换到“杨博文 Spencer KurisuRakko”旧账户，并保持微信运行，随后执行：
+在微信界面手动切换到目标旧账户（即 `WECHAT_HISTORY_ACCOUNT_DIR` 指定的账户），
+并保持微信运行，随后执行：
 
 ```powershell
 pwsh -NoProfile -File .\integrations\wechat-history\scripts\keyscan.ps1
@@ -31,13 +32,41 @@ pwsh -NoProfile -File .\integrations\wechat-history\scripts\keyscan.ps1
 用户。当前不是目标旧账户时，扫描器会在读取任何进程内存前返回
 `TARGET_ACCOUNT_NOT_ACTIVE`。
 
+## 环境变量
+
+账户身份不在源码或镜像里，全部通过环境变量注入。主容器 `wechat-selkies` 服务的
+`environment`（以及独立的 wechat-insights 容器各自配置）需要设置：
+
+- `WECHAT_HISTORY_ACCOUNT_DIR`：目标账户目录名，即 `SOURCE_ROOT`（默认
+  `/history-source/xwechat_files`）下的单个目录名。这是单账户白名单的核心：
+  密钥校验、登录活跃度检查和所有读取都只认这一个目录；机器上同时存在其他
+  微信账户目录时，这个白名单保证工具绝不触碰它们。
+- `WECHAT_HISTORY_USERNAME`：账户自身的 wxid（contact.db 中自己那条记录的
+  username），用于把“自己”从会话列表里排除，并把发出的消息标记为 outgoing。
+- `WECHAT_HISTORY_IDENTITY_TOKENS`：逗号分隔的身份标记。首次读取时把自身资料的
+  昵称、备注、别名拼起来，必须包含其中任意一个才放行，防止密钥被拿到别的账户上
+  使用。
+
+示例（写入部署用的 compose 文件；这是私有配置，不要提交到公开仓库）：
+
+```yaml
+environment:
+  - WECHAT_HISTORY_ACCOUNT_DIR=wxid_example_0000
+  - WECHAT_HISTORY_USERNAME=wxid_example
+  - WECHAT_HISTORY_IDENTITY_TOKENS=姓名,昵称,别名
+```
+
+这三个变量不是便利性设置，而是安全边界：任一个缺失或留空，任何实际读取都会以
+`IDENTITY_UNCONFIGURED` 错误失败，并点名缺失的变量。工具绝不会回退到默认账户、
+自动发现账户目录或降级为读取全部 —— 未配置时的唯一行为就是拒绝服务。
+
 ## MCP 配置
 
 MCP 使用 stdio，不监听任何网络端口。Claude Code、Codex 或其他 MCP 客户端都应把
 以下命令配置为服务器启动命令：
 
 ```text
-pwsh -NoProfile -File C:\projects\wechat-selkies\integrations\wechat-history\scripts\mcp.ps1
+pwsh -NoProfile -File <项目根目录>\integrations\wechat-history\scripts\mcp.ps1
 ```
 
 例如客户端使用 JSON 配置时：
@@ -50,7 +79,7 @@ pwsh -NoProfile -File C:\projects\wechat-selkies\integrations\wechat-history\scr
       "args": [
         "-NoProfile",
         "-File",
-        "C:\\projects\\wechat-selkies\\integrations\\wechat-history\\scripts\\mcp.ps1"
+        "<项目根目录>\\integrations\\wechat-history\\scripts\\mcp.ps1"
       ]
     }
   }

@@ -3,12 +3,12 @@
 将下面的提示词完整交给需要读取本机微信聊天记录的 agent，并替换其中的任务参数。
 
 ```text
-你正在处理本机项目 C:\projects\wechat-selkies 中的私人微信聊天记录。请仅通过项目提供的
+你正在处理本机项目 <项目根目录> 中的私人微信聊天记录。请仅通过项目提供的
 wechat-history stdio MCP 读取记录，不要直接访问、复制或解析 /config 下的数据库，也不要输出
 数据库密钥、完整 wxid、内部 session_id 或数据库路径。
 
 MCP 启动命令：
-pwsh -NoProfile -File C:\projects\wechat-selkies\integrations\wechat-history\scripts\mcp.ps1
+pwsh -NoProfile -File <项目根目录>\integrations\wechat-history\scripts\mcp.ps1
 
 任务参数：
 - 目标会话：<联系人或群名>
@@ -47,7 +47,7 @@ health_check → list_sessions（确认唯一匹配）→ get_messages / search_
 ## 示例任务参数
 
 ```text
-- 目标会话：池鱼羁鸟
+- 目标会话：<联系人昵称>
 - 读取范围：最近 100 条
 - 用户目的：概括最近聊天内容和当前待回复的上下文
 ```

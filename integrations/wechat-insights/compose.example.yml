@@ -57,6 +57,13 @@ services:
       #   uid/gid   —— 必须与 user: 一致，否则进程写不进去、快照直接失败。
       - /run/wechat-history-cache:rw,noexec,nosuid,nodev,size=1g,mode=0700,uid=${PUID:-1000},gid=${PGID:-100}
     environment:
+      # ⚠️ 必须设置：目标账户身份，与主容器 wechat-selkies 用同一组值（见
+      #    docs/wechat-history.md）。这三个变量是单账户白名单的安全边界，不是
+      #    便利设置——任一缺失，首轮分析就会以 IDENTITY_UNCONFIGURED 失败，
+      #    绝不会回退到自动发现账户目录。值属于私有配置，不要提交到公开仓库。
+      - WECHAT_HISTORY_ACCOUNT_DIR=${WECHAT_HISTORY_ACCOUNT_DIR:?需要设置目标账户目录名}
+      - WECHAT_HISTORY_USERNAME=${WECHAT_HISTORY_USERNAME:?需要设置账户自身 wxid}
+      - WECHAT_HISTORY_IDENTITY_TOKENS=${WECHAT_HISTORY_IDENTITY_TOKENS:?需要设置身份标记}
       # 容器本地时区决定「按天/深夜/周末」的切分，建议与你自己一致。
       - TZ=${TZ:-Asia/Shanghai}
       # 每天固定时刻跑一轮增量分析（HH:MM）。

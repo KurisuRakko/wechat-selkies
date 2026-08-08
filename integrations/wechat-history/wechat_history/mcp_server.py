@@ -11,7 +11,7 @@ from typing import Any
 
 from mcp.server.mcpserver import MCPServer
 
-from .constants import TARGET_ACCOUNT_MASK
+from .constants import ACCOUNT
 from .errors import HistoryError
 from .reader import HistoryReader
 from .reply import ReplyPreparer, probe_wechat_window_status
@@ -66,8 +66,24 @@ class HistoryService:
     def health_check(self) -> dict:
         with self._lock:
             window_status = probe_wechat_window_status()
+            # 身份掩码先于读取器解析；未配置时也要以可操作的错误返回，
+            # 而不是让异常逃出 health_check。
+            try:
+                account = ACCOUNT.account_mask
+            except HistoryError as exc:
+                return {
+                    **exc.payload(),
+                    "identity_verified": False,
+                    "key_status": "unconfigured",
+                    "database_status": "unavailable",
+                    "snapshot_status": "unavailable",
+                    "wechat_window": window_status,
+                    "transport": "stdio",
+                    "network_listener": False,
+                    "automatic_send": False,
+                }
             common = {
-                "account": TARGET_ACCOUNT_MASK,
+                "account": account,
                 "wechat_window": window_status,
                 "transport": "stdio",
                 "network_listener": False,

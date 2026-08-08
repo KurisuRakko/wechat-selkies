@@ -5,7 +5,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from wechat_history.constants import TARGET_ACCOUNT_DIR
+# 身份通过环境变量注入（与生产同一机制）；这里固定合成值，保证测试确定性。
+os.environ["WECHAT_HISTORY_ACCOUNT_DIR"] = "wxid_testaccount_0000"
+os.environ["WECHAT_HISTORY_USERNAME"] = "wxid_testaccount"
+os.environ["WECHAT_HISTORY_IDENTITY_TOKENS"] = "测试身份,testidentity"
+
+from wechat_history.constants import ACCOUNT
 from wechat_history.errors import HistoryError
 from wechat_history.keyscan import prepare_key_directory, require_target_account_active
 
@@ -23,16 +28,16 @@ class KeyscanGuardTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             login_marker(root, "wxid_other_0000", 100)
-            login_marker(root, TARGET_ACCOUNT_DIR, 200)
-            database_dir = root / TARGET_ACCOUNT_DIR / "db_storage"
+            login_marker(root, ACCOUNT.account_dir, 200)
+            database_dir = root / ACCOUNT.account_dir / "db_storage"
             require_target_account_active(database_dir)
 
     def test_rejects_when_another_account_is_newer(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            login_marker(root, TARGET_ACCOUNT_DIR, 100)
+            login_marker(root, ACCOUNT.account_dir, 100)
             login_marker(root, "wxid_other_0000", 200)
-            database_dir = root / TARGET_ACCOUNT_DIR / "db_storage"
+            database_dir = root / ACCOUNT.account_dir / "db_storage"
             with self.assertRaises(HistoryError) as raised:
                 require_target_account_active(database_dir)
             self.assertEqual(raised.exception.code, "TARGET_ACCOUNT_NOT_ACTIVE")

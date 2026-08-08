@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import os
 import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+
+# default_reader_factory 会构造真实的 HistoryReader，触发 wechat_history 的身份解析。
+# 身份通过环境变量注入（与生产同一机制），这里固定合成值，不携带任何真实身份。
+os.environ["WECHAT_HISTORY_ACCOUNT_DIR"] = "wxid_testaccount_0000"
+os.environ["WECHAT_HISTORY_USERNAME"] = "wxid_testaccount"
+os.environ["WECHAT_HISTORY_IDENTITY_TOKENS"] = "测试身份,testidentity"
 
 from wechat_history.formatting import message_kind
 from wechat_history.reader import HistoryReader

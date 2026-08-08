@@ -7,8 +7,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+# 身份通过环境变量注入（与生产同一机制）；这里固定合成值，保证测试确定性。
+os.environ["WECHAT_HISTORY_ACCOUNT_DIR"] = "wxid_testaccount_0000"
+os.environ["WECHAT_HISTORY_USERNAME"] = "wxid_testaccount"
+os.environ["WECHAT_HISTORY_IDENTITY_TOKENS"] = "测试身份,testidentity"
+
 from tests.test_crypto import encrypted_page
-from wechat_history.constants import TARGET_ACCOUNT_DIR
+from wechat_history.constants import ACCOUNT
 from wechat_history.errors import HistoryError
 from wechat_history.snapshot import FileState, KeyStore, SnapshotCache, SourceState
 
@@ -16,7 +21,7 @@ from wechat_history.snapshot import FileState, KeyStore, SnapshotCache, SourceSt
 class SnapshotTests(unittest.TestCase):
     def _fixture(self, root: Path) -> tuple[Path, Path]:
         key = bytes(range(32))
-        source = root / "source" / TARGET_ACCOUNT_DIR / "db_storage"
+        source = root / "source" / ACCOUNT.account_dir / "db_storage"
         entries = (
             "contact/contact.db",
             "session/session.db",
@@ -25,7 +30,7 @@ class SnapshotTests(unittest.TestCase):
         document: dict[str, object] = {
             "_meta": {
                 "schema_version": 1,
-                "target_account_dir": TARGET_ACCOUNT_DIR,
+                "target_account_dir": ACCOUNT.account_dir,
                 "wechat_pid": 1,
                 "wechat_start_ticks": 1,
             }

@@ -21,11 +21,9 @@ from pathlib import Path
 from typing import BinaryIO, Callable, Iterable
 
 from .constants import (
+    ACCOUNT,
     KEY_SCHEMA_VERSION,
     KEYS_FILE,
-    TARGET_ACCOUNT_DIR,
-    TARGET_ACCOUNT_MASK,
-    TARGET_DB_DIR,
     UPSTREAM_COMMIT,
     is_allowed_database,
 )
@@ -121,9 +119,12 @@ def require_ptrace_capability() -> None:
         )
 
 
-def require_target_account_active(database_dir: Path = TARGET_DB_DIR) -> None:
+def require_target_account_active(database_dir: Path | None = None) -> None:
     """Fail closed unless the fixed account has the newest login marker."""
 
+    # 默认值延迟到运行期解析，避免 import 期就要求身份已配置。
+    if database_dir is None:
+        database_dir = ACCOUNT.db_dir
     source_root = database_dir.parent.parent
     account_times: dict[str, int] = {}
     try:
@@ -140,9 +141,9 @@ def require_target_account_active(database_dir: Path = TARGET_DB_DIR) -> None:
     except OSError as exc:
         raise fail("TARGET_ACCOUNT_UNCONFIRMED", "无法确认当前微信账户") from exc
 
-    target_time = account_times.get(TARGET_ACCOUNT_DIR)
+    target_time = account_times.get(ACCOUNT.account_dir)
     if target_time is None or any(
-        name != TARGET_ACCOUNT_DIR and timestamp >= target_time
+        name != ACCOUNT.account_dir and timestamp >= target_time
         for name, timestamp in account_times.items()
     ):
         raise fail(
@@ -151,10 +152,12 @@ def require_target_account_active(database_dir: Path = TARGET_DB_DIR) -> None:
         )
 
 
-def collect_target_databases(database_dir: Path = TARGET_DB_DIR) -> list[DatabasePage]:
+def collect_target_databases(database_dir: Path | None = None) -> list[DatabasePage]:
     """Collect only contact/session/message databases from the fixed account."""
 
-    if database_dir.parent.name != TARGET_ACCOUNT_DIR:
+    if database_dir is None:
+        database_dir = ACCOUNT.db_dir
+    if database_dir.parent.name != ACCOUNT.account_dir:
         raise fail("ACCOUNT_MISMATCH", "数据库目录不是允许的旧账户")
     if not database_dir.is_dir():
         raise fail("DB_NOT_FOUND", "目标旧账户数据库目录不存在")
@@ -360,8 +363,8 @@ def _build_key_document(
     result: dict[str, object] = {
         "_meta": {
             "schema_version": KEY_SCHEMA_VERSION,
-            "target_account_dir": TARGET_ACCOUNT_DIR,
-            "target_account_mask": TARGET_ACCOUNT_MASK,
+            "target_account_dir": ACCOUNT.account_dir,
+            "target_account_mask": ACCOUNT.account_mask,
             "scanned_at": datetime.now(timezone.utc).isoformat(),
             "wechat_pid": pid,
             "wechat_start_ticks": process_start_ticks(pid),

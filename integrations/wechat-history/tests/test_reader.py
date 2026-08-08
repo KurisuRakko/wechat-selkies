@@ -8,9 +8,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
+# 身份通过环境变量注入（与生产同一机制）；这里固定合成值，保证测试确定性，
+# 不携带任何真实身份。
+os.environ["WECHAT_HISTORY_ACCOUNT_DIR"] = "wxid_testaccount_0000"
+os.environ["WECHAT_HISTORY_USERNAME"] = "wxid_testaccount"
+os.environ["WECHAT_HISTORY_IDENTITY_TOKENS"] = "测试身份,testidentity"
+
 import zstandard as zstd
 
-from wechat_history.constants import TARGET_ACCOUNT_DIR, TARGET_USERNAME
+from wechat_history.constants import ACCOUNT
 from wechat_history.errors import HistoryError
 from wechat_history.reader import HistoryReader
 from wechat_history.snapshot import KeyStore
@@ -27,14 +33,14 @@ class FakeCache:
         pass
 
 
-def create_contact_database(path: Path, nickname: str, alias: str = "KurisuRakko") -> None:
+def create_contact_database(path: Path, nickname: str, alias: str = "testalias") -> None:
     with sqlite3.connect(path) as connection:
         connection.execute(
             "CREATE TABLE contact (username TEXT, nick_name TEXT, remark TEXT, alias TEXT)"
         )
         connection.execute(
             "INSERT INTO contact VALUES (?, ?, '', ?)",
-            (TARGET_USERNAME, nickname, alias),
+            (ACCOUNT.username, nickname, alias),
         )
 
 
@@ -43,8 +49,8 @@ class ReaderIdentityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             contact = root / "contact.db"
-            create_contact_database(contact, "杨博文 Spencer")
-            source = root / TARGET_ACCOUNT_DIR / "db_storage"
+            create_contact_database(contact, "测试身份 TestIdentity")
+            source = root / ACCOUNT.account_dir / "db_storage"
             reader = HistoryReader.__new__(HistoryReader)
             reader.key_store = object()
             reader.source_dir = source
@@ -54,14 +60,14 @@ class ReaderIdentityTests(unittest.TestCase):
             reader._profile = None
             profile = reader.ensure_account_validated()
             self.assertTrue(profile["identity_verified"])
-            self.assertIn("Spencer", profile["display_name"])
+            self.assertIn("TestIdentity", profile["display_name"])
 
     def test_rejects_wrong_self_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             contact = root / "contact.db"
             create_contact_database(contact, "Unrelated Account", alias="unrelated")
-            source = root / TARGET_ACCOUNT_DIR / "db_storage"
+            source = root / ACCOUNT.account_dir / "db_storage"
             reader = HistoryReader.__new__(HistoryReader)
             reader.key_store = object()
             reader.source_dir = source

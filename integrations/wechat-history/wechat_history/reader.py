@@ -14,13 +14,10 @@ from pathlib import Path
 from typing import Iterator
 
 from .constants import (
-    EXPECTED_IDENTITY_TOKENS,
+    ACCOUNT,
     MAX_MESSAGE_LIMIT,
     MAX_SEARCH_LIMIT,
     MAX_SESSION_LIMIT,
-    TARGET_ACCOUNT_MASK,
-    TARGET_DB_DIR,
-    TARGET_USERNAME,
 )
 from .errors import HistoryError, fail
 from .formatting import decompress_content, format_message, message_kind
@@ -99,13 +96,17 @@ class HistoryReader:
     def __init__(
         self,
         key_store: KeyStore | None = None,
-        source_dir: Path = TARGET_DB_DIR,
+        source_dir: Path | None = None,
         cache: SnapshotCache | None = None,
     ):
         self.key_store = key_store or KeyStore()
-        self.source_dir = source_dir
-        self.cache = cache or SnapshotCache(self.key_store, source_dir=source_dir)
-        self.account_root = source_dir.parent
+        # 默认值不能在 import 期解析（身份尚未配置时 import 必须成功），
+        # 所以延迟到真正构造读取器时才取目标账户目录。
+        self.source_dir = source_dir if source_dir is not None else ACCOUNT.db_dir
+        self.cache = cache or SnapshotCache(
+            self.key_store, source_dir=self.source_dir
+        )
+        self.account_root = self.source_dir.parent
         self.source_root = self.account_root.parent
         self._profile: dict | None = None
 
@@ -139,7 +140,7 @@ class HistoryReader:
         if self._profile is not None:
             return self._profile
         contacts = self._load_contacts()
-        profile = contacts.get(TARGET_USERNAME)
+        profile = contacts.get(ACCOUNT.username)
         if profile is None:
             raise fail(
                 "ACCOUNT_MISMATCH",
@@ -149,13 +150,15 @@ class HistoryReader:
             str(profile.get(field, ""))
             for field in ("nickname", "remark", "alias", "display_name")
         ).casefold()
-        if not any(token.casefold() in identity_text for token in EXPECTED_IDENTITY_TOKENS):
+        if not any(
+            token.casefold() in identity_text for token in ACCOUNT.identity_tokens
+        ):
             raise fail(
                 "ACCOUNT_MISMATCH",
-                "旧账户自身资料与“杨博文 / Spencer / KurisuRakko”不匹配",
+                "旧账户自身资料与配置的身份标记不匹配",
             )
         self._profile = {
-            "account": TARGET_ACCOUNT_MASK,
+            "account": ACCOUNT.account_mask,
             "display_name": profile["display_name"],
             "identity_verified": True,
         }
@@ -322,7 +325,7 @@ class HistoryReader:
             row["local_id"], row["local_type"], content, session["kind"] == "group"
         )
         sender_id = names.get(int(row["real_sender_id"] or 0), "") or sender_hint
-        if sender_id == TARGET_USERNAME:
+        if sender_id == ACCOUNT.username:
             direction = "outgoing"
             sender_name = "me"
         elif sender_id:

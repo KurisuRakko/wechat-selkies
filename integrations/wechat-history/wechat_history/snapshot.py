@@ -15,12 +15,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .constants import (
+    ACCOUNT,
     CACHE_ROOT,
     KEYS_FILE,
     KEY_SCHEMA_VERSION,
     MAX_CACHE_BYTES,
-    TARGET_ACCOUNT_DIR,
-    TARGET_DB_DIR,
     safe_relative_database,
 )
 from .crypto import PAGE_SIZE, apply_wal, decrypt_database, verify_encryption_key
@@ -86,7 +85,7 @@ class KeyStore:
             raise fail("KEY_INVALID", "密钥文件缺少安全元数据")
         if metadata.get("schema_version") != KEY_SCHEMA_VERSION:
             raise fail("KEY_INVALID", "密钥文件版本不受支持")
-        if metadata.get("target_account_dir") != TARGET_ACCOUNT_DIR:
+        if metadata.get("target_account_dir") != ACCOUNT.account_dir:
             raise fail("ACCOUNT_MISMATCH", "密钥不属于允许的旧账户")
 
         entries: dict[str, dict] = {}
@@ -138,11 +137,14 @@ class SnapshotCache:
     def __init__(
         self,
         keys: KeyStore,
-        source_dir: Path = TARGET_DB_DIR,
+        source_dir: Path | None = None,
         cache_root: Path = CACHE_ROOT,
         max_bytes: int = MAX_CACHE_BYTES,
     ):
-        if source_dir.parent.name != TARGET_ACCOUNT_DIR:
+        # 默认值延迟到运行期解析，避免 import 期就要求身份已配置。
+        if source_dir is None:
+            source_dir = ACCOUNT.db_dir
+        if source_dir.parent.name != ACCOUNT.account_dir:
             raise fail("ACCOUNT_MISMATCH", "读取器被指向了非目标账户")
         self.keys = keys
         self.source_dir = source_dir

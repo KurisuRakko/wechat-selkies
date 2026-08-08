@@ -1,5 +1,17 @@
 /config/
 .env
+.env.*
+# 本仓库是公开的，而 README 让人在根目录建 compose.local.yml 来放真实的
+# Tailscale 地址与 INSIGHTS_AUTH_TOKEN。没有这几条规则，一次 git add -A
+# 就会把鉴权令牌推到公开远端，且历史里删不干净。
+*.local
+*.local.yml
+*.local.yaml
+compose.local.yml
+secrets*
+*.pem
+*.key
+keys.json
 # integrations/wechat-history is a real Python package and the Dockerfile COPYs
 # the directory wholesale, so stray bytecode would be committed and then baked
 # into the image. The container itself runs with PYTHONDONTWRITEBYTECODE=1.

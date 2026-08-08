@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .constants import TARGET_USERNAME
+from .constants import ACCOUNT
 from .formatting import decompress_content
 from .reader import HistoryReader, _read_connection
 
@@ -62,7 +62,7 @@ def is_direct_session(
 
     return bool(
         session_id
-        and session_id != TARGET_USERNAME
+        and session_id != ACCOUNT.username
         and session_id not in SYSTEM_SESSION_IDS
         and not session_id.startswith("gh_")
         and "@chatroom" not in session_id

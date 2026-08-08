@@ -10,11 +10,15 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+# 身份通过环境变量注入（与生产同一机制）；这里固定合成值，保证测试确定性。
+os.environ["WECHAT_HISTORY_ACCOUNT_DIR"] = "wxid_testaccount_0000"
+os.environ["WECHAT_HISTORY_USERNAME"] = "wxid_testaccount"
+os.environ["WECHAT_HISTORY_IDENTITY_TOKENS"] = "测试身份,testidentity"
+
 from aiohttp import ClientSession
 from aiohttp.test_utils import TestClient, TestServer
 from pywebpush import WebPushException
 
-from wechat_history.constants import TARGET_USERNAME
 from wechat_history.errors import fail
 from wechat_history.notifications import (
     NotificationError,
