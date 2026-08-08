@@ -15,11 +15,22 @@
 
 {$WECHAT_DOMAIN} {
 	tls internal
-	# 上游走 LSIO selkies 的明文口 3000。3001 是它自带的自签 HTTPS，套两层 TLS 只
-	# 会多一次加解密，还多出「要不要验上游证书」这个没有好答案的问题；这一跳完全
-	# 在宿主机的 docker 网络内，不出网卡。
+	# 上游必须走 selkies 自带的自签 HTTPS 口 3001，不能走明文口 3000：容器内的
+	# nginx 用自己这一跳的 scheme 覆写 X-Forwarded-Proto（$scheme），走 3000 时
+	# 通知后端的同源校验拿到的期望值是 http://<域名>，和浏览器发来的 https Origin
+	# 永远对不上，PWA 推送订阅一律 403「same-origin request required」。
+	# 多一层内网 TLS 的代价可以忽略；上游证书是 LSIO 的自签名，验不了就跳过——
+	# 这一跳不出宿主机的 docker 网络。
 	# WebSocket（selkies 的信令与输入通道）由 reverse_proxy 自动透传，无需额外配置。
-	reverse_proxy wechat-selkies:3000
+	reverse_proxy https://wechat-selkies:3001 {
+		# 必须显式保留客户端的 Host（实测这一跳会把 Host 改写成上游地址
+		# wechat-selkies:3001）。通知后端的同源校验用 Host + X-Forwarded-Proto 拼
+		# 期望值和浏览器 Origin 比对，Host 一被改写就永远 403。
+		header_up Host {host}
+		transport http {
+			tls_insecure_skip_verify
+		}
+	}
 }
 
 {$INSIGHTS_DOMAIN} {

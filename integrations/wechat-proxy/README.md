@@ -63,21 +63,27 @@ compose 里那个 `wechat-proxy-data` 卷不要删。
 的 DNS-01 验证不要求服务器公网可达，但需要一个带 DNS 写权限的 API 令牌，并且要用带
 对应 DNS 插件的 Caddy 镜像（官方镜像不含插件）。
 
-## 上游为什么走 3000
+## 上游为什么必须走 3001 而不是 3000
 
-LSIO 的 selkies 基镜像上 3000 是 HTTP、3001 是它自带的自签 HTTPS。这一跳完全在宿主机
-的 docker 网络内、不出网卡，套两层 TLS 只会多一次加解密，还多出「要不要验上游证书」
-这个没有好答案的问题。
+LSIO 的 selkies 基镜像上 3000 是 HTTP、3001 是它自带的自签 HTTPS。直觉上走 3000 更省
+（这一跳不出宿主机的 docker 网络，少一层加解密），**但走 3000 会弄坏 PWA 推送**，
+这是实机踩过的坑：
 
-如果发现 3000 被强制跳转到 HTTPS（不同版本行为可能不同），把 Caddyfile 里那行改成：
+容器内的 nginx 给通知后端转发时写死了 `proxy_set_header X-Forwarded-Proto $scheme`
+——用**自己这一跳**的 scheme 覆写，而不是透传上一跳的值。代理走 3000 时 nginx 收到
+的是明文，这个头就变成 `http`；通知后端的同源校验拿它和 Host 拼出期望值
+`http://<域名>`，和浏览器发来的 `Origin: https://<域名>` 永远对不上，订阅请求一律
+403 `same-origin request required`。走 3001 时 nginx 那一跳本来就是 HTTPS，转发头与
+浏览器 Origin 一致，和从前直连 3001 的行为完全相同。
 
-```caddyfile
-reverse_proxy https://wechat-selkies:3001 {
-	transport http {
-		tls_insecure_skip_verify
-	}
-}
-```
+上游的自签证书验不了，跳过即可（`tls_insecure_skip_verify`）——这一跳不出宿主机的
+docker 网络，信任边界没有变化。
+
+还有第二个实测踩到的坑：这一跳会把 `Host` 改写成上游地址（`wechat-selkies:3001`），
+同源校验拿它拼期望值，照样永远 403——哪怕 `X-Forwarded-Proto` 已经是对的。所以
+`reverse_proxy` 块里那行 `header_up Host {host}` 不能省。排查这类问题有个好用的回显：
+请求 `/wechat-notifications/api`（不带尾斜杠），nginx 的 301 `Location` 会原样吐出它
+看到的 Host。
 
 ## 443 已经被 `tailscale serve` 占着
 
