@@ -1,0 +1,54 @@
+# 域名入口（Caddy）的 compose 片段示例。
+#
+# 刻意做成**独立的 compose 项目**：只新增一个容器，主容器与看板容器的编排、卷、
+# 端口一律不动，出问题 `down` 掉它就回到「用 IP 加端口访问」的原状态。
+#
+#   docker compose -f compose.proxy.yml up -d
+---
+services:
+  wechat-proxy:
+    image: caddy:2-alpine
+    container_name: wechat-proxy
+    restart: unless-stopped
+    ports:
+      # ⚠️ 必须绑定到具体地址。省略地址或写 0.0.0.0 会把微信界面和聊天统计一起
+      #    暴露到整个局域网——这两个站点的可见性约束和端口直连时完全一样。
+      - "127.0.0.1:443:443"
+      # ⚠️ 需要替换：`tailscale ip -4` 的输出（100.x 网段）。
+      - "100.64.0.1:443:443"
+      # 80 只用来把 http:// 跳到 https://。Windows 上 80 常被 IIS 之类占着，冲突就
+      # 删掉下面两行——浏览器对裸域名默认先试 HTTPS，影响很小。
+      - "127.0.0.1:80:80"
+      - "100.64.0.1:80:80"
+    environment:
+      # ⚠️ 需要替换：你自己的两个域名。放在这里而不是写进 Caddyfile，是为了让仓库
+      #    里的配置不携带真实域名。缺失就直接启动失败，不会静默起一个空站点。
+      - WECHAT_DOMAIN=${WECHAT_DOMAIN:?需要设置微信主界面的域名}
+      - INSIGHTS_DOMAIN=${INSIGHTS_DOMAIN:?需要设置看板的域名}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # /data 里存着本地 CA 的私钥与根证书，**必须持久化**：卷丢了等于换了一个 CA，
+      # 所有设备上装过的根证书立刻失效，浏览器重新开始告警、PWA 推送重新失效。
+      - wechat-proxy-data:/data
+      - wechat-proxy-config:/config
+    networks:
+      - selkies
+      - insights
+    # 没有 healthcheck：配置写错时 Caddy 直接退出，表现为重启循环而不是「看起来健康
+    # 但代理错了」；而逐站可用性绕不开各自的鉴权（selkies 登录、看板 token），
+    # 探针拿到 401 分不清是坏了还是正常拒绝，不如从浏览器看。
+
+networks:
+  # ⚠️ 需要替换：两个已有 compose 项目的默认网络名（`docker network ls` 里照抄）。
+  #    声明 external 是为了让网络不存在时**响亮地**报错，而不是悄悄新建一个空网络
+  #    ——那样 Caddy 解析不到上游容器名，表现是所有请求 502。
+  selkies:
+    external: true
+    name: wechat-selkies_default
+  insights:
+    external: true
+    name: wechat-insights_default
+
+volumes:
+  wechat-proxy-data:
+  wechat-proxy-config:

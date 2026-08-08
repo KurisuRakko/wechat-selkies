@@ -279,6 +279,14 @@ docker run -it -p 3001:3001 -v ./config:/config --device /dev/dri:/dev/dri nickr
 [integrations/wechat-insights/README.md](integrations/wechat-insights/README.md)。
 看板展示的是高度隐私的数据，端口只发布到 `127.0.0.1`，不要暴露公网。
 
+### 可选：给两个站点绑域名
+
+想用 `wechat.<你的域名>` / `relationship.<你的域名>` 代替「IP 加端口」访问，可以再加一个
+独立的 Caddy 容器按 `Host` 分流。域名只解析到 Tailscale 地址、443 只绑定在回环与
+Tailscale 地址上，所以「不挂 Tailscale 就访问不了」这条约束仍由网络层保证。做法、
+证书（内置本地 CA）与验收清单见
+[integrations/wechat-proxy/README.md](integrations/wechat-proxy/README.md)。
+
 ## 安装第三方应用（如 Telegram）
 
 本项目支持通过 [proot-apps](https://github.com/linuxserver/proot-apps) 安装第三方 Linux 应用。以 Telegram 为例：

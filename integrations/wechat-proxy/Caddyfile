@@ -1,0 +1,30 @@
+# 两个站点的域名入口：微信主界面与关系洞察看板。
+#
+# 「必须挂 Tailscale 才能访问」这条约束由网络层保证，不靠这里做来源判断：域名只解析
+# 到 Tailscale 地址（100.64/10 是 CGNAT 段，公网不可路由），并且 443 只绑定在回环与
+# Tailscale 地址上（见 compose.example.yml）。所以下面没有任何 IP 白名单——真正拦人
+# 的是路由，而不是一条能被 X-Forwarded-For 骗过的规则。
+#
+# 域名本身从环境变量注入：这个仓库是公开的，真实域名只存在于部署机的 compose 里。
+{
+	# 不申请公网证书：证书由 Caddy 内置的本地 CA 签发（根证书安装见 README）。
+	# 关掉 admin 接口——容器里没人需要热重载，少一个监听面。代价是改完配置要
+	# 重启容器才生效（重启只影响这个代理，两个业务容器不受影响）。
+	admin off
+}
+
+{$WECHAT_DOMAIN} {
+	tls internal
+	# 上游走 LSIO selkies 的明文口 3000。3001 是它自带的自签 HTTPS，套两层 TLS 只
+	# 会多一次加解密，还多出「要不要验上游证书」这个没有好答案的问题；这一跳完全
+	# 在宿主机的 docker 网络内，不出网卡。
+	# WebSocket（selkies 的信令与输入通道）由 reverse_proxy 自动透传，无需额外配置。
+	reverse_proxy wechat-selkies:3000
+}
+
+{$INSIGHTS_DOMAIN} {
+	tls internal
+	# 看板自己的 INSIGHTS_AUTH_TOKEN 鉴权照旧生效：token 走 Authorization 头或
+	# ?token=，通过后写 cookie 并 302 到相对路径，不含主机名，代理前后行为一致。
+	reverse_proxy wechat-insights:8300
+}
