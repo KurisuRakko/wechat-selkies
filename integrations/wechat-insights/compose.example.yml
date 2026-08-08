@@ -1,0 +1,67 @@
+# 关系洞察看板的 compose 片段示例。
+#
+# 把下面的内容合并进你自己的 compose.local.yml（该文件不在仓库里），并按注释里的
+# 「⚠️ 需要替换」逐项核对。这个容器与主微信容器完全独立，不会改动主容器的行为。
+#
+#   docker compose -f docker-compose.yml -f compose.local.yml up -d --build wechat-insights
+---
+services:
+  wechat-insights:
+    build:
+      # 构建上下文必须是仓库根目录：镜像里同时需要 wechat_history 与 wechat_insights。
+      context: .
+      dockerfile: integrations/wechat-insights/Dockerfile
+      args:
+        # ⚠️ 需要替换：与主容器的 PUID/PGID 保持一致，否则读不到 0600 的密钥文件。
+        - PUID=${PUID:-1000}
+        - PGID=${PGID:-100}
+    image: wechat-insights:latest
+    container_name: wechat-insights
+    # 与构建参数一致；命名卷 /data 的属主也是这个 uid。
+    user: "${PUID:-1000}:${PGID:-100}"
+    restart: unless-stopped
+    ports:
+      # ⚠️ 看板展示高度隐私的聊天统计。只发布到回环地址，不要暴露公网，
+      #    也不要放在没有鉴权的反向代理后面。
+      - "127.0.0.1:8300:8300"
+    volumes:
+      # ⚠️ 需要替换：与主容器 /config 挂载的宿主机路径相同，这里必须只读。
+      #    容器里看到的是 <这个目录>/xwechat_files。
+      - ./config:/history-source:ro
+      # ⚠️ 需要替换：keyscan profile 写入的那个 named volume 名字（照抄你现有
+      #    compose.local.yml 里 history-keyscan 用的卷名），同样只读。
+      - wechat-history-keys:/run/wechat-history:ro
+      # 分析结果持久化；重启容器不丢已算好的指标。
+      - wechat-insights-data:/data
+    tmpfs:
+      # 解密后的明文快照只落在 tmpfs，容器停止即消失。uid/gid 必须能被上面的
+      # user 写入，否则 SnapshotCache 建不出 0700 的缓存目录。
+      - /run/wechat-history-cache:size=512m,mode=0700,uid=${PUID:-1000},gid=${PGID:-100}
+    environment:
+      # 容器本地时区决定「按天/深夜/周末」的切分，建议与你自己一致。
+      - TZ=${TZ:-Asia/Shanghai}
+      # 每天固定时刻跑一轮增量分析（HH:MM）。
+      - INSIGHTS_ANALYZE_TIME=${INSIGHTS_ANALYZE_TIME:-04:30}
+      # ⚠️ 强烈建议设置：设置后所有请求（含静态资源）都需要
+      #    Authorization: Bearer <token> 或 ?token=<token>。留空则只打印一条警告。
+      - INSIGHTS_AUTH_TOKEN=${INSIGHTS_AUTH_TOKEN:-}
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          python3 -c "import urllib.request,os;
+          req=urllib.request.Request('http://127.0.0.1:8300/api/status');
+          t=os.environ.get('INSIGHTS_AUTH_TOKEN');
+          t and req.add_header('Authorization','Bearer '+t);
+          urllib.request.urlopen(req, timeout=5)"
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  # ⚠️ 需要替换：换成你现有 keyscan profile 实际使用的卷名，并声明为 external
+  #    （或直接删掉这一条，沿用主 compose 里已有的定义）。
+  wechat-history-keys:
+    external: true
+  wechat-insights-data:
