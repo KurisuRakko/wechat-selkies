@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import tempfile
@@ -13,6 +14,7 @@ os.environ["WECHAT_HISTORY_USERNAME"] = "wxid_testaccount"
 os.environ["WECHAT_HISTORY_IDENTITY_TOKENS"] = "测试身份,testidentity"
 
 from tests.test_crypto import encrypted_page
+from wechat_history import constants
 from wechat_history.constants import ACCOUNT
 from wechat_history.errors import HistoryError
 from wechat_history.snapshot import FileState, KeyStore, SnapshotCache, SourceState
@@ -96,6 +98,36 @@ class SnapshotTests(unittest.TestCase):
                     )
             self.assertEqual(raised.exception.code, "SOURCE_BUSY")
             cache.close()
+
+
+class CacheCeilingTests(unittest.TestCase):
+    """明文缓存上限的环境变量覆盖：这是主容器与看板容器共用的唯一旋钮。"""
+
+    @staticmethod
+    def _reload_with(value: str | None) -> int:
+        """在给定环境下重载 constants，取出上限后把模块恢复成真实环境的样子。"""
+
+        with patch.dict("os.environ"):
+            if value is None:
+                os.environ.pop("WECHAT_HISTORY_MAX_CACHE_BYTES", None)
+            else:
+                os.environ["WECHAT_HISTORY_MAX_CACHE_BYTES"] = value
+            importlib.reload(constants)
+            limit = constants.MAX_CACHE_BYTES
+        importlib.reload(constants)
+        return limit
+
+    def test_default_is_512_mib(self) -> None:
+        self.assertEqual(self._reload_with(None), 512 * 1024 * 1024)
+
+    def test_override_inside_the_bounds_wins(self) -> None:
+        self.assertEqual(self._reload_with("1006632960"), 1006632960)
+
+    def test_out_of_range_and_garbage_fall_back_to_the_default(self) -> None:
+        # 过小会让任何读取都失败、过大等于取消这道保护，非法值同理一律忽略。
+        for value in ("1024", "9999999999", "big", ""):
+            with self.subTest(value=value):
+                self.assertEqual(self._reload_with(value), 512 * 1024 * 1024)
 
 
 if __name__ == "__main__":

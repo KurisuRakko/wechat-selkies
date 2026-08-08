@@ -12,11 +12,9 @@ from dataclasses import dataclass, field
 
 from wechat_history.reader import HistoryReader, _read_connection
 from wechat_history.sessions import scan_direct_rows
-from wechat_history.snapshot import KeyStore, SnapshotCache
 
 from .constants import (
     BACKFILL_BATCH,
-    INSIGHTS_MAX_CACHE_BYTES,
     MIN_SCORE_MESSAGES,
     SCORE_WINDOW_DAYS,
     SESSION_GAP_SECONDS,
@@ -205,24 +203,15 @@ def update_milestones(
     contact.max_laugh_run = max(contact.max_laugh_run, aggregation.max_laugh_run)
 
 
-def default_reader_factory() -> HistoryReader:
-    """生产读取器：给 SnapshotCache 换上 wechat-insights 自己的缓存上限。
-
-    wechat_history 的默认上限是 512 MiB，九个消息分片解密后的实际占用已达
-    约 465 MiB，历史再增长一点就会在扫描会话时抛 CACHE_LIMIT。这里换一个
-    更大的上限，主容器行为完全不变。
-    """
-    cache = SnapshotCache(KeyStore(), max_bytes=INSIGHTS_MAX_CACHE_BYTES)
-    return HistoryReader(cache=cache)
-
-
 class Analyzer:
     """一轮完整分析：拉新消息 → 聚合落库 → 重算全部看板数据。"""
 
     def __init__(
         self,
         store: MetricsStore,
-        reader_factory=default_reader_factory,
+        # 默认直接用 wechat_history 的读取器（含密钥、快照、缓存上限的全套默认
+        # 配置）；测试从这里换成假读取器。
+        reader_factory=HistoryReader,
         strategy: DepthStrategy | None = None,
         gap_seconds: int = SESSION_GAP_SECONDS,
         batch_size: int = BACKFILL_BATCH,

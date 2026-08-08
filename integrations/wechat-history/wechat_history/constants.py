@@ -26,7 +26,6 @@ IDENTITY_TOKENS_ENV = "WECHAT_HISTORY_IDENTITY_TOKENS"
 UPSTREAM_COMMIT = "a3789232d4f79bf0b30634d9dadbce71e4acd601"
 
 KEY_SCHEMA_VERSION = 1
-MAX_CACHE_BYTES = 512 * 1024 * 1024
 MAX_REPLY_CHARS = 4000
 MAX_SESSION_LIMIT = 200
 MAX_MESSAGE_LIMIT = 200
@@ -41,6 +40,28 @@ KEYS_FILE = Path(
 CACHE_ROOT = Path(
     os.environ.get("WECHAT_HISTORY_CACHE_ROOT", "/run/wechat-history-cache")
 )
+
+def _cache_ceiling() -> int:
+    """解密明文缓存上限（字节），可用环境变量覆盖，越界或非法值回退到默认值。
+
+    这个上限必须 ≤ CACHE_ROOT 那个 tmpfs 的 size=，否则缓存写满前就先撞上 tmpfs
+    的内存上限，得到的是 ENOSPC 而不是干净的 CACHE_LIMIT。默认 512 MiB 与文档里的
+    tmpfs 默认大小配对；一次读取涉及的分片越多，需要的上限越高，调整时两处一起改
+    （实测九个消息分片全量铺开需要 960 MiB 上限 + 1 GiB tmpfs）。
+    """
+
+    default = 512 * 1024 * 1024
+    try:
+        value = int(os.environ["WECHAT_HISTORY_MAX_CACHE_BYTES"])
+    except (KeyError, TypeError, ValueError):
+        return default
+    # 越界值一律忽略：过小会让任何读取都失败，过大等于取消这道保护。
+    if 64 * 1024 * 1024 <= value <= 4 * 1024 * 1024 * 1024:
+        return value
+    return default
+
+
+MAX_CACHE_BYTES = _cache_ceiling()
 
 
 class AccountIdentity:

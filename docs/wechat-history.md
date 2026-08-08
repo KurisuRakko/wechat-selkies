@@ -60,6 +60,15 @@ environment:
 `IDENTITY_UNCONFIGURED` 错误失败，并点名缺失的变量。工具绝不会回退到默认账户、
 自动发现账户目录或降级为读取全部 —— 未配置时的唯一行为就是拒绝服务。
 
+此外还有一个容量旋钮：
+
+- `WECHAT_HISTORY_MAX_CACHE_BYTES`：tmpfs 里解密明文缓存的上限（字节），默认
+  512 MiB，接受 64 MiB–4 GiB，越界或非法值一律忽略并回退到默认值。**它必须
+  ≤ 缓存 tmpfs 的 `size=`**：否则缓存写满前就先撞上 tmpfs 的内存上限，拿到的是
+  ENOSPC 而不是干净的 `CACHE_LIMIT`，所以两处要一起改。一次读取会解密的分片越多、
+  需要的上限越高（本机实测九个消息分片全量铺开需要 960 MiB 上限 + 1 GiB tmpfs），
+  扫描范围广的服务撞到 `CACHE_LIMIT` 时就是这里不够。
+
 ## MCP 配置
 
 MCP 使用 stdio，不监听任何网络端口。Claude Code、Codex 或其他 MCP 客户端都应把
@@ -101,7 +110,8 @@ pwsh -NoProfile -File <项目根目录>\integrations\wechat-history\scripts\mcp.
 
 - 源数据库通过 `/history-source` 的只读挂载读取；不会修改 `/config`。
 - DB 与 WAL 复制前后状态不一致时重试三次，之后返回 `SOURCE_BUSY`。
-- 解密文件只存放在 512 MiB tmpfs，MCP 进程退出后立即清理。
+- 解密文件只存放在 tmpfs（默认上限 512 MiB，见 `WECHAT_HISTORY_MAX_CACHE_BYTES`），
+  MCP 进程退出后立即清理。
 - 图片、语音、视频和文件只返回消息类型及安全元数据，不导出媒体。
 - 搜索会流式解压文本，但不建立持久索引；媒体内容不参与搜索。
 - 不后台轮询、不自动回复、不跨账户读取、不发布包含本功能的公共镜像。

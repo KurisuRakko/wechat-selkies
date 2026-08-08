@@ -90,10 +90,12 @@ docker compose -f docker-compose.yml -f compose.local.yml up -d --build wechat-i
 ### 内存与 tmpfs 的取舍
 
 tmpfs 的大小直接决定明文缓存的写满点：缓存数据量达到 `size=` 上限后，任何写入都会
-硬失败（`CACHE_LIMIT`）。`size=1g` 配合默认 960 MiB 的 `INSIGHTS_MAX_CACHE_BYTES`，
-实测九个消息分片全量解密峰值 474.9 MiB（约 46%），留足了余量。tmpfs 只在实际写入
-时才占用内存，不会启动即占满 1g——但宿主机 Docker VM 总共只有 8 GiB，主微信容器
-已经用掉约 4.5 GiB，所以这 1g 是真实预算，调大上限前先看看内存余量。
+硬失败（`CACHE_LIMIT`）。示例里的 `size=1g` 配合 `WECHAT_HISTORY_MAX_CACHE_BYTES`
+设成 960 MiB，实测九个消息分片全量解密峰值 474.9 MiB（约 46%），留足了余量。上限
+必须 ≤ tmpfs 的 `size=`，否则缓存写满前先撞上 tmpfs 的内存上限，拿到的是 ENOSPC 而
+不是干净的 `CACHE_LIMIT`——两处要一起改。tmpfs 只在实际写入时才占用内存，不会启动
+即占满 1g——但宿主机 Docker VM 总共只有 8 GiB，主微信容器已经用掉约 4.5 GiB，所以
+这 1g 是真实预算，调大上限前先看看内存余量。
 
 ## 环境变量
 
@@ -112,12 +114,15 @@ tmpfs 的大小直接决定明文缓存的写满点：缓存数据量达到 `siz
 | `INSIGHTS_MIN_SCORE_MESSAGES` | `50` | 打分窗口内的最低消息数，不够就是「数据不足」 |
 | `INSIGHTS_BACKFILL_BATCH` | `5000` | 单批读取的消息条数 |
 | `INSIGHTS_DEPTH_STRATEGY` | `lexical` | 深度维度策略，v1 只有词法策略 |
-| `INSIGHTS_MAX_CACHE_BYTES` | `1006632960` | 解密明文缓存上限（字节，默认 960 MiB）。必须 ≤ tmpfs 的 `size=`，否则缓存写满前先撞 tmpfs 上限 |
 | `TZ` | 容器默认 | 决定「按天 / 深夜 / 周末」的切分，建议设成你自己的时区 |
 
-`wechat_history` 自身的路径变量（`WECHAT_HISTORY_SOURCE_ROOT`、
-`WECHAT_HISTORY_KEYS_FILE`、`WECHAT_HISTORY_CACHE_ROOT`）沿用默认值即可，
-compose 示例里的挂载点与它们一一对应。
+身份三变量（`WECHAT_HISTORY_ACCOUNT_DIR`、`WECHAT_HISTORY_USERNAME`、
+`WECHAT_HISTORY_IDENTITY_TOKENS`）必须设置，取值与主容器完全一致，见
+[docs/wechat-history.md](../../docs/wechat-history.md)。明文缓存上限
+`WECHAT_HISTORY_MAX_CACHE_BYTES`（默认 512 MiB）也是 `wechat_history` 的旋钮，
+本容器要扫全部会话，需要按上一节调大。`wechat_history` 的路径变量
+（`WECHAT_HISTORY_SOURCE_ROOT`、`WECHAT_HISTORY_KEYS_FILE`、
+`WECHAT_HISTORY_CACHE_ROOT`）沿用默认值即可，compose 示例里的挂载点与它们一一对应。
 
 ## 安全注意事项
 

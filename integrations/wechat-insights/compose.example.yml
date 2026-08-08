@@ -51,7 +51,7 @@ services:
       #   noexec    —— 明文聊天数据绝不可能是程序，禁止从这里执行任何东西；
       #   nosuid    —— 禁止 setuid 位生效，配合上一条封死提权路径；
       #   nodev     —— 不允许设备节点，防止造出特殊文件；
-      #   size=1g   —— 明文缓存上限 INSIGHTS_MAX_CACHE_BYTES 默认 960 MiB，九个
+      #   size=1g   —— 与下面 WECHAT_HISTORY_MAX_CACHE_BYTES 的 960 MiB 配对，九个
       #                消息分片全量解密实测峰值 474.9 MiB，1g 留足余量；
       #   mode=0700 —— 只有容器运行用户能读明文，其他 uid 一律拒之门外；
       #   uid/gid   —— 必须与 user: 一致，否则进程写不进去、快照直接失败。
@@ -71,9 +71,10 @@ services:
       # ⚠️ 强烈建议设置：设置后所有请求（含静态资源）都需要
       #    Authorization: Bearer <token> 或 ?token=<token>。留空则只打印一条警告。
       - INSIGHTS_AUTH_TOKEN=${INSIGHTS_AUTH_TOKEN:-}
-      # 解密明文缓存上限（字节），默认 1006632960 = 960 MiB，必须 ≤ 上面 tmpfs 的
-      # size=——缓存写满前先撞 tmpfs 内存上限会硬失败，上限设得再大也没用。
-      - INSIGHTS_MAX_CACHE_BYTES=${INSIGHTS_MAX_CACHE_BYTES:-1006632960}
+      # 解密明文缓存上限（字节）。wechat_history 的默认值 512 MiB 只够通知服务扫
+      # 少量会话，本容器要扫全部会话，必须调大；同时必须 ≤ 上面 tmpfs 的 size=，
+      # 否则缓存写满前先撞 tmpfs 内存上限，得到的是 ENOSPC 而不是干净的 CACHE_LIMIT。
+      - WECHAT_HISTORY_MAX_CACHE_BYTES=${WECHAT_HISTORY_MAX_CACHE_BYTES:-1006632960}
     healthcheck:
       test:
         - CMD-SHELL

@@ -78,12 +78,9 @@ TEXT_CHARS_PER_COST_UNIT = 20.0
 # —— 增量读取 ——
 # 单批读取的消息条数上限；首轮回填靠多批循环推进。
 BACKFILL_BATCH = _int_env("INSIGHTS_BACKFILL_BATCH", 5000, 100, 200000)
-# 解密后的明文缓存上限（字节）。wechat_history 默认 512 MiB，九个消息分片
-# 全量解密后实测已达约 465 MiB（88.5%），历史再长一点就会抛 CACHE_LIMIT；
-# 这里把上限提到 960 MiB（1006632960 字节）留足余量。
-INSIGHTS_MAX_CACHE_BYTES = _int_env(
-    "INSIGHTS_MAX_CACHE_BYTES", 1006632960, 512 * 1024 * 1024, 4 * 1024 * 1024 * 1024
-)
+# 明文缓存上限不在这里配：它是 wechat_history 的旋钮
+# （WECHAT_HISTORY_MAX_CACHE_BYTES），本容器与主容器读的是同一批库、需要同一个
+# 上限，各配一份只会让人改了一处以为生效了。
 
 # —— 指标列 ——
 # 与 wechat_history.formatting.message_kind 的返回值一一对应。
