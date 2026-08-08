@@ -44,6 +44,7 @@ from .metrics import (
 )
 from .scoring import (
     DIMENSION_NAMES,
+    anomalies_key,
     detect_anomalies,
     median,
     raw_metrics,
@@ -217,18 +218,34 @@ def update_milestones(
 
 _LLM_SYSTEM_PROMPT = (
     "你是一个亲密关系分析助手。用户会给你他和一位朋友最近的聊天记录（已做隐私脱敏，"
-    "部分词被替换成星号）。请从话题实质性、情感袒露程度、相互追问与回应的质量三个方面，"
-    "评估这段对话关系的深度，给出 0 到 100 的整数分：日常寒暄、斗图、纯事务性沟通在 "
-    "30 以下；有实质话题讨论在 30–60；有情感袒露、深度交流在 60 以上。只回复 JSON，"
-    "格式 {\"score\": 整数}，不要任何其他文字。"
+    "部分词被替换成星号），可能还附有一份检测到的近期变化列表。只回复 JSON，不要任何"
+    "其他文字，字段如下：\n"
+    '"score"：0 到 100 的整数。从话题实质性、情感袒露程度、相互追问与回应的质量三个'
+    "方面评估对话深度：日常寒暄、斗图、纯事务性沟通在 30 以下；有实质话题讨论在 "
+    "30–60；有情感袒露、深度交流在 60 以上。\n"
+    '"summary"：不超过 100 字的两三句话，概括你们主要聊什么话题、相处模式是什么样。'
+    '用「你们」称呼双方，不要出现具体人名。\n'
+    '"anomaly_note"：如果附了近期变化列表，基于聊天内容用一句话（不超过 50 字）推测'
+    "变化最可能的原因；没有附变化列表则为 null。"
 )
 
 
-def _parse_llm_score(reply: str) -> int | None:
-    """从模型回复里截取第一个 JSON 块解析整数分并夹到 [0, 100]；失败返回 None。
+@dataclass(frozen=True, slots=True)
+class LLMReply:
+    """一次 LLM 深度打分回复解析出的三件套：分数 + 关系画像 + 异动解释。"""
 
-    不把回复内容写进日志：回复虽然是模型生成的，但日志里出现任何聊天相关
-    文本都违背「原文不出容器」的原则。
+    score: int
+    summary: str
+    anomaly_note: str | None
+
+
+def _parse_llm_reply(reply: str) -> LLMReply | None:
+    """截取回复里的第一个 JSON 块，解析 score/summary/anomaly_note。
+
+    score 缺失或解析不出 → 整体返回 None（不落缓存）；summary 与
+    anomaly_note 解析失败只是降级成空，不影响分数落库。两者都是模型输出，
+    长度硬截断防毒，且不把回复内容写进日志：日志里出现任何聊天相关文本
+    都违背「原文不出容器」的原则。
     """
 
     start = reply.find("{")
@@ -242,7 +259,17 @@ def _parse_llm_score(reply: str) -> int | None:
     except (ValueError, KeyError, TypeError):
         LOG.warning("LLM 深度分回复里解析不出 score")
         return None
-    return max(0, min(100, score))
+    summary = data.get("summary")
+    if not isinstance(summary, str):
+        summary = ""
+    else:
+        summary = summary.strip()[:200]
+    note = data.get("anomaly_note")
+    if not isinstance(note, str):
+        note = None
+    else:
+        note = note.strip()[:100] or None
+    return LLMReply(max(0, min(100, score)), summary, note)
 
 
 class Analyzer:
@@ -401,28 +428,71 @@ class Analyzer:
         contact.display_name = display_name
         self.store.commit_batch(contact.session_id, buckets, contact)
 
-    def _refresh_llm_depth(self, reader: HistoryReader, moment: int) -> int:
-        """给候选联系人补上/刷新 LLM 深度分，写进 llm_depth 缓存表。
+    @staticmethod
+    def _window_bounds(moment: int) -> tuple[str, str, str, str]:
+        """异动对比窗口的日键边界：(today, recent_start, baseline_end, baseline_start)。
 
-        只在深度策略是 llm 时被调用。所有调用都是出站流量：样本必须先
-        整体过 masking.mask() 再交给 llm.chat——这是聊天原文离开容器的
-        唯一出口。
+        _recompute 与 LLM 异动指纹共用这一份换算，两处不会各写各的窗口边界。
+        """
+
+        today = day_key(moment)
+        recent_start = day_key(moment - TREND_RECENT_DAYS * 86400)
+        baseline_end = day_key(moment - (TREND_RECENT_DAYS + 1) * 86400)
+        baseline_start = day_key(
+            moment - (TREND_RECENT_DAYS + TREND_BASELINE_DAYS) * 86400
+        )
+        return today, recent_start, baseline_end, baseline_start
+
+    def _refresh_llm_depth(self, reader: HistoryReader, moment: int) -> int:
+        """给候选联系人补上/刷新 LLM 深度分、关系画像与异动解释。
+
+        只在深度策略是 llm 时被调用。所有调用都是出站流量：聊天样本与异动
+        列表拼成一个 user 字符串后，整体过 masking.mask() 再交给 llm.chat
+        ——这是聊天原文离开容器的唯一出口。
 
         候选 = 采样窗口内有消息，且（从未评过 / 分数过了保鲜期 / 打分后
-        新增消息数达标）的联系人；从未评过的排最前，其余按最陈旧在前，
-        截断到单轮调用上限，剩下的下一轮再评。
+        新增消息数达标 / 近期异动指纹变了）的联系人；从未评过的排最前，
+        其余按最陈旧在前，截断到单轮调用上限，剩下的下一轮再评。异动指纹
+        与 _recompute 里的同一套计算重复一次（每轮多算几次 raw_metrics +
+        detect_anomalies，增量一轮 16 秒可接受），换来 prompt 里的异动列表
+        与缓存指纹自洽。
         """
 
         sample_start = moment - LLM_SAMPLE_DAYS * 86400
-        pending: list[tuple[int, int, str, ContactRow]] = []
+        today, recent_start, baseline_end, baseline_start = self._window_bounds(moment)
+        recent_windows = self.store.load_window(recent_start, today)
+        baseline_windows = self.store.load_window(baseline_start, baseline_end)
+        empty = Metrics()
+        recent_span = day_span(recent_start, today)
+        baseline_span = day_span(baseline_start, baseline_end)
+        pending: list[
+            tuple[int, int, str, ContactRow, list[dict[str, object]], str]
+        ] = []
         for contact in self.store.all_contacts():
             if contact.last_message_at is None or contact.last_message_at < sample_start:
                 continue
             cached = self.store.get_llm_depth(contact.session_id)
+            anomalies = detect_anomalies(
+                raw_metrics(
+                    recent_windows.get(contact.session_id, empty),
+                    self.strategy,
+                    recent_span,
+                ),
+                raw_metrics(
+                    baseline_windows.get(contact.session_id, empty),
+                    self.strategy,
+                    baseline_span,
+                ),
+                recent_windows.get(contact.session_id, empty),
+                baseline_windows.get(contact.session_id, empty),
+            )
+            key = anomalies_key(anomalies)
             if not (
                 cached is None
                 or moment - cached.scored_at >= LLM_REFRESH_DAYS * 86400
-                or contact.total_messages - cached.total_messages >= LLM_REFRESH_MESSAGES
+                or contact.total_messages - cached.total_messages
+                >= LLM_REFRESH_MESSAGES
+                or cached.anomalies_key != key
             ):
                 continue
             pending.append(
@@ -431,24 +501,40 @@ class Analyzer:
                     cached.scored_at if cached is not None else 0,
                     contact.session_id,
                     contact,
+                    anomalies,
+                    key,
                 )
             )
 
         scored = skipped = failed = 0
-        for _, _, _, contact in sorted(pending)[:LLM_MAX_CALLS_PER_RUN]:
+        for _, _, _, contact, anomalies, key in sorted(pending)[
+            :LLM_MAX_CALLS_PER_RUN
+        ]:
             sample = self._llm_sample(
                 reader, contact.session_id, contact.display_name, sample_start
             )
             if sample is None:
                 skipped += 1
                 continue
-            reply = llm.chat(_LLM_SYSTEM_PROMPT, mask(sample))
-            score = _parse_llm_score(reply) if reply is not None else None
-            if score is None:
+            user = sample
+            if anomalies:
+                user += "\n\n近期变化：\n" + "\n".join(
+                    f"- {item['label']}：{item['before']} → {item['after']}"
+                    for item in anomalies
+                )
+            reply = llm.chat(_LLM_SYSTEM_PROMPT, mask(user))
+            parsed = _parse_llm_reply(reply) if reply is not None else None
+            if parsed is None:
                 failed += 1
                 continue
             self.store.set_llm_depth(
-                contact.session_id, score, moment, contact.total_messages
+                contact.session_id,
+                parsed.score,
+                moment,
+                contact.total_messages,
+                parsed.summary,
+                parsed.anomaly_note,
+                key,
             )
             scored += 1
         LOG.info(
@@ -527,14 +613,9 @@ class Analyzer:
         # 窗口起点用「N 天前的同一时刻」折算，跨 DST 切换时本地时间会偏移
         # 一小时、日键偶尔差一天（生产容器在澳大利亚/悉尼，有夏令时），
         # 目前按秒数近似，不做逐天修正。
-        today = day_key(moment)
+        today, recent_start, baseline_end, baseline_start = self._window_bounds(moment)
         score_start = day_key(moment - SCORE_WINDOW_DAYS * 86400)
         score_start_ts = moment - SCORE_WINDOW_DAYS * 86400
-        recent_start = day_key(moment - TREND_RECENT_DAYS * 86400)
-        baseline_end = day_key(moment - (TREND_RECENT_DAYS + 1) * 86400)
-        baseline_start = day_key(
-            moment - (TREND_RECENT_DAYS + TREND_BASELINE_DAYS) * 86400
-        )
 
         score_stats = self.store.load_window_stats(
             score_start, today, lambda day: self._weight_of(today, day)
@@ -573,9 +654,12 @@ class Analyzer:
                 ),
             }
             if self.strategy.name == "llm":
-                # LLM 分可能还没评出来（None）：缺值权重回流给词法三项，
+                # LLM 行可能还没有（None）：缺值权重回流给词法三项，
                 # 深度维度自动退化成纯词法，不需要特判。
-                extras["llm_depth_score"] = llm_scores.get(session_id)
+                llm_row = llm_scores.get(session_id)
+                extras["llm_depth_score"] = (
+                    llm_row.score if llm_row is not None else None
+                )
             raw_score[session_id] = raw_metrics(
                 stats.weighted, self.strategy, equivalent_days, extras
             )
@@ -627,6 +711,16 @@ class Analyzer:
                 payloads.append((session_id, payload))
                 continue
             scored = session_id in scores
+            anomalies = (
+                detect_anomalies(
+                    raw_recent[session_id],
+                    raw_baseline[session_id],
+                    recent_windows.get(session_id, empty),
+                    baseline_windows.get(session_id, empty),
+                )
+                if scored
+                else []
+            )
             dimension_scores = scores.get(session_id)
             # 趋势要基线窗口样本足够才成立：基线窗口不足时基线分恒为 50，
             # 趋势退化成「近期百分位 − 50」的假数字。此时置 null 让前端显示
@@ -662,17 +756,24 @@ class Analyzer:
                 "window_messages": stats.raw.messages_total(),
                 "last_message_at": contact.last_message_at,
                 "sample_note": "" if scored else "数据不足",
-                "anomalies": (
-                    detect_anomalies(
-                        raw_recent[session_id],
-                        raw_baseline[session_id],
-                        recent_windows.get(session_id, empty),
-                        baseline_windows.get(session_id, empty),
-                    )
-                    if scored
-                    else []
-                ),
+                "anomalies": anomalies,
             }
+            if scored and self.strategy.name == "llm":
+                # 画像与异动解释只在详情页展示；归零/数据不足不发，词法策略
+                # 下不出现任何键（前端对缺省与 None 一视同仁）。
+                llm_row = llm_scores.get(session_id)
+                summary = llm_row.summary if llm_row is not None else None
+                payload["llm_summary"] = summary if summary else None
+                payload["llm_summary_at"] = llm_row.scored_at if summary else None
+                note = llm_row.anomaly_note if llm_row is not None else None
+                # 指纹不匹配 = 解释针对的是旧异动集合，宁缺毋滥。
+                payload["anomaly_note"] = (
+                    note
+                    if note
+                    and anomalies
+                    and anomalies_key(anomalies) == llm_row.anomalies_key
+                    else None
+                )
             payloads.append((session_id, payload))
 
         self.store.save_scores(payloads)

@@ -178,39 +178,91 @@ class ScoreTests(StoreTestCase):
 
 
 class LLMDepthTests(StoreTestCase):
-    def test_set_and_get_round_trip(self) -> None:
+    def test_set_and_get_round_trip_with_all_columns(self) -> None:
         self.assertIsNone(self.store.get_llm_depth("friend"))
-        self.store.set_llm_depth("friend", 66.0, 1_700_000_000, 120)
+        self.store.set_llm_depth(
+            "friend", 66.0, 1_700_000_000, 120, "关系画像", "异动解释", "a:worse|b:better"
+        )
         row = self.store.get_llm_depth("friend")
         self.assertEqual(row.score, 66.0)
         self.assertEqual(row.scored_at, 1_700_000_000)
         self.assertEqual(row.total_messages, 120)
+        self.assertEqual(row.summary, "关系画像")
+        self.assertEqual(row.anomaly_note, "异动解释")
+        self.assertEqual(row.anomalies_key, "a:worse|b:better")
 
-    def test_setting_twice_is_an_upsert(self) -> None:
-        self.store.set_llm_depth("friend", 66.0, 1_700_000_000, 120)
-        self.store.set_llm_depth("friend", 80.0, 1_700_000_100, 150)
+    def test_empty_anomaly_note_is_normalised_to_none(self) -> None:
+        self.store.set_llm_depth("friend", 66.0, 1, 10, "摘要", "")
+        row = self.store.get_llm_depth("friend")
+        self.assertIsNone(row.anomaly_note)
+        self.assertEqual(row.summary, "摘要")
+
+    def test_setting_twice_is_an_upsert_of_every_column(self) -> None:
+        self.store.set_llm_depth("friend", 66.0, 1, 120, "旧摘要", "旧解释", "old")
+        self.store.set_llm_depth("friend", 80.0, 2, 150, "新摘要", "新解释", "new")
         self.assertEqual(len(self.store.all_llm_depth()), 1)
         row = self.store.get_llm_depth("friend")
         self.assertEqual(
             (row.score, row.scored_at, row.total_messages),
-            (80.0, 1_700_000_100, 150),
+            (80.0, 2, 150),
+        )
+        self.assertEqual(
+            (row.summary, row.anomaly_note, row.anomalies_key),
+            ("新摘要", "新解释", "new"),
         )
 
-    def test_all_llm_depth_maps_session_ids_to_scores(self) -> None:
-        self.store.set_llm_depth("a", 10.0, 1, 10)
+    def test_all_llm_depth_maps_session_ids_to_rows(self) -> None:
+        self.store.set_llm_depth("a", 10.0, 1, 10, "摘要A", "解释A", "a")
         self.store.set_llm_depth("b", 20.0, 2, 20)
-        self.assertEqual(self.store.all_llm_depth(), {"a": 10.0, "b": 20.0})
+        rows = self.store.all_llm_depth()
+        self.assertEqual(
+            (rows["a"].score, rows["a"].summary, rows["a"].anomaly_note),
+            (10.0, "摘要A", "解释A"),
+        )
+        self.assertEqual(rows["b"].summary, "")
+        self.assertIsNone(rows["b"].anomaly_note)
 
     def test_table_survives_reinitializing_an_existing_database(self) -> None:
         # 对既有库再走一次 _initialize：executescript 全部 IF NOT EXISTS，
-        # 新表照常补齐、旧数据不动。
-        self.store.set_llm_depth("friend", 30.0, 1, 10)
+        # 新表照常补齐、旧数据不动；补列迁移同样幂等。
+        self.store.set_llm_depth("friend", 30.0, 1, 10, "摘要", "解释", "k")
         self.store.close()
         reopened = MetricsStore(self.store.path)
         self.addCleanup(reopened.close)
-        self.assertEqual(reopened.get_llm_depth("friend").score, 30.0)
-        reopened.set_llm_depth("friend", 40.0, 2, 20)
-        self.assertEqual(reopened.get_llm_depth("friend").score, 40.0)
+        row = reopened.get_llm_depth("friend")
+        self.assertEqual(row.score, 30.0)
+        self.assertEqual(row.summary, "摘要")
+        reopened.set_llm_depth("friend", 40.0, 2, 20, "新摘要")
+        row = reopened.get_llm_depth("friend")
+        self.assertEqual(row.score, 40.0)
+        self.assertEqual(row.summary, "新摘要")
+
+    def test_old_shaped_table_is_migrated_in_place(self) -> None:
+        # 3a15872 形状的 llm_depth（没有三新列）：本地开发/测试库在加列前
+        # 建过表，_initialize 要幂等地补列并保留旧行。先建新形状的库，
+        # 再手动删掉三列模拟旧形状，重新初始化后三列回来、旧数据还在。
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        path = Path(temporary.name) / "metrics.db"
+        seed = MetricsStore(path)
+        seed.set_llm_depth("friend", 55.0, 1_000, 42, "旧摘要", "旧解释", "old:key")
+        seed.close()
+        with sqlite3.connect(path) as connection:
+            connection.execute("ALTER TABLE llm_depth DROP COLUMN summary")
+            connection.execute("ALTER TABLE llm_depth DROP COLUMN anomaly_note")
+            connection.execute("ALTER TABLE llm_depth DROP COLUMN anomalies_key")
+
+        store = MetricsStore(path)
+        self.addCleanup(store.close)
+        columns = {
+            row[1] for row in store.connection.execute("PRAGMA table_info(llm_depth)")
+        }
+        self.assertLessEqual({"summary", "anomaly_note", "anomalies_key"}, columns)
+        row = store.get_llm_depth("friend")
+        self.assertEqual((row.score, row.total_messages), (55.0, 42))
+        self.assertEqual(row.summary, "")
+        self.assertIsNone(row.anomaly_note)
+        self.assertEqual(row.anomalies_key, "")
 
 
 class SchemaMigrationTests(unittest.TestCase):

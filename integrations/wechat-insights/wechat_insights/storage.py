@@ -4,8 +4,8 @@
 - contacts   每个私聊联系人的游标与里程碑
 - stats_daily 按天分桶的可加指标（数值列由 constants.METRIC_COLUMNS 生成）
 - scores     分析结束时预计算好的看板数据，HTTP 处理器直接吐 JSON
-- llm_depth  可选的大模型深度分缓存（session_id → 分数 + 打分时刻 +
-             打分时的累计消息数，做新鲜度基准）
+- llm_depth  可选的大模型深度分缓存（session_id → 分数 + 画像摘要 +
+             异动解释 + 打分时刻 + 打分时累计消息数 + 异动指纹）
 
 按天而不是按自然月分桶，是为了让「近 30 天 / 近 90 天 / 近两年」这类滚动窗口是
 精确的；自然月视图由 SQL 之外的 Python 聚合从同一批天桶合成，没有第二份真相。
@@ -34,6 +34,12 @@ from .metrics import Metrics, day_span, dump_histogram, parse_histogram
 LOG = logging.getLogger("wechat-insights")
 
 _ROW_COLUMNS = METRIC_COLUMNS + HISTOGRAM_COLUMNS
+
+#: llm_depth 在 CREATE TABLE 之外的幂等补列清单（见 _initialize）。
+_LLM_DEPTH_EXTRA_COLUMNS = ("summary", "anomaly_note", "anomalies_key")
+
+#: get_llm_depth / all_llm_depth 的共享列清单，两处查询保持一致。
+_LLM_DEPTH_COLUMNS = "score, scored_at, total_messages, summary, anomaly_note, anomalies_key"
 
 _SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS meta (
@@ -79,11 +85,16 @@ CREATE TABLE IF NOT EXISTS scores (
 
 -- LLM 深度分缓存；total_messages 是打分时联系人的累计消息数，
 -- 与 contacts.total_messages 的差值做「新增多少条就重评」的基准。
+-- summary/anomaly_note 是同一批调用顺带生成的关系画像与异动解释，
+-- anomalies_key 是打分时异动清单的指纹，指纹变了才需要重评重写解释。
 CREATE TABLE IF NOT EXISTS llm_depth (
     session_id     TEXT PRIMARY KEY,
     score          REAL NOT NULL,
     scored_at      INTEGER NOT NULL,
-    total_messages INTEGER NOT NULL
+    total_messages INTEGER NOT NULL,
+    summary        TEXT NOT NULL DEFAULT '',
+    anomaly_note   TEXT NOT NULL DEFAULT '',
+    anomalies_key  TEXT NOT NULL DEFAULT ''
 );
 """
 
@@ -140,11 +151,14 @@ class ContactRow:
 
 @dataclass(frozen=True, slots=True)
 class LLMDepthRow:
-    """一条 LLM 深度分缓存。"""
+    """一条 LLM 深度分缓存：分数 + 关系画像 + 异动解释 + 指纹。"""
 
     score: float
     scored_at: int
     total_messages: int
+    summary: str
+    anomaly_note: str | None
+    anomalies_key: str
 
 
 @dataclass(slots=True)
@@ -202,6 +216,17 @@ class MetricsStore:
                 self.path.with_name(self.path.name + suffix).unlink(missing_ok=True)
         with closing(sqlite3.connect(self.path)) as setup, setup:
             setup.executescript(_SCHEMA)
+            # llm_depth 是 3a15872 新增、从未上过生产，这个幂等迁移只为本地
+            # 已建库的开发/测试环境兜底：逐个补列，列已存在就跳过。不值得为
+            # 它 bump SCHEMA_VERSION 触发全量重建回填。
+            for column in _LLM_DEPTH_EXTRA_COLUMNS:
+                try:
+                    setup.execute(
+                        f"ALTER TABLE llm_depth ADD COLUMN {column} "
+                        "TEXT NOT NULL DEFAULT ''"
+                    )
+                except sqlite3.OperationalError:
+                    pass  # 列已存在（新形状的库）
             setup.execute(
                 "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
@@ -333,36 +358,66 @@ class MetricsStore:
 
     # —— llm_depth ——
 
+    @staticmethod
+    def _llm_depth_row(row: sqlite3.Row) -> LLMDepthRow:
+        """从一行查询结果构造 LLMDepthRow；空串的 anomaly_note 归一成 None。"""
+
+        return LLMDepthRow(
+            score=row["score"],
+            scored_at=row["scored_at"],
+            total_messages=row["total_messages"],
+            summary=row["summary"] or "",
+            anomaly_note=row["anomaly_note"] or None,
+            anomalies_key=row["anomalies_key"] or "",
+        )
+
     def get_llm_depth(self, session_id: str) -> LLMDepthRow | None:
         row = self.connection.execute(
-            "SELECT score, scored_at, total_messages FROM llm_depth "
-            "WHERE session_id = ?",
+            f"SELECT {_LLM_DEPTH_COLUMNS} FROM llm_depth WHERE session_id = ?",
             (session_id,),
         ).fetchone()
-        return None if row is None else LLMDepthRow(**row)
+        return None if row is None else self._llm_depth_row(row)
 
     def set_llm_depth(
-        self, session_id: str, score: float, scored_at: int, total_messages: int
+        self,
+        session_id: str,
+        score: float,
+        scored_at: int,
+        total_messages: int,
+        summary: str = "",
+        anomaly_note: str | None = None,
+        anomalies_key: str = "",
     ) -> None:
         """写入或覆盖一条 LLM 深度分缓存（UPSERT）。"""
 
         with self.connection as connection:
             connection.execute(
-                "INSERT INTO llm_depth (session_id, score, scored_at, total_messages) "
-                "VALUES (?, ?, ?, ?) "
+                "INSERT INTO llm_depth "
+                "(session_id, score, scored_at, total_messages, summary, "
+                "anomaly_note, anomalies_key) VALUES (?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(session_id) DO UPDATE SET "
                 "score = excluded.score, scored_at = excluded.scored_at, "
-                "total_messages = excluded.total_messages",
-                (session_id, score, scored_at, total_messages),
+                "total_messages = excluded.total_messages, "
+                "summary = excluded.summary, anomaly_note = excluded.anomaly_note, "
+                "anomalies_key = excluded.anomalies_key",
+                (
+                    session_id,
+                    score,
+                    scored_at,
+                    total_messages,
+                    summary,
+                    anomaly_note or "",
+                    anomalies_key,
+                ),
             )
 
-    def all_llm_depth(self) -> dict[str, float]:
-        """全部联系人的 LLM 深度分，供打分窗口注入用。"""
+    def all_llm_depth(self) -> dict[str, LLMDepthRow]:
+        """全部联系人的 LLM 深度缓存行，供打分注入与画像/异动解释用。"""
 
         return {
-            str(row["session_id"]): float(row["score"])
+            str(row["session_id"]): self._llm_depth_row(row)
             for row in self.connection.execute(
-                "SELECT session_id, score FROM llm_depth"
+                f"SELECT session_id, {_LLM_DEPTH_COLUMNS} FROM llm_depth"
             )
         }
 

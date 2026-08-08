@@ -331,3 +331,16 @@ def detect_anomalies(
         )
     )
     return anomalies
+
+
+def anomalies_key(anomalies: list[dict[str, object]]) -> str:
+    """异动集合的稳定指纹：按 metric 排序拼 metric:direction，空集返回 ""。
+
+    指纹只记「哪些项、往哪个方向变」，不含数值——展示用的 before/after 是
+    格式化字符串，同一组异动换成另一轮数据时数值会变，但判定是否重评只看
+    异动集合本身有没有变。LLM 异动解释与指纹一起缓存，指纹不一致就说明
+    解释针对的是旧的异动集合。
+    """
+
+    pairs = sorted((str(item["metric"]), str(item["direction"])) for item in anomalies)
+    return "|".join(f"{metric}:{direction}" for metric, direction in pairs)

@@ -6,6 +6,7 @@ from wechat_insights.depth import LexicalDepth
 from wechat_insights.metrics import Metrics
 from wechat_insights.scoring import (
     DIMENSION_NAMES,
+    anomalies_key,
     detect_anomalies,
     median,
     percentile_rank,
@@ -268,6 +269,25 @@ class AnomalyTests(unittest.TestCase):
         self.assertEqual(anomalies[0]["direction"], "better")
         self.assertEqual(anomalies[0]["before"], "20%")
         self.assertEqual(anomalies[0]["after"], "80%")
+
+    def test_anomalies_key_is_sorted_and_order_independent(self) -> None:
+        # 同一组异动不管条目顺序如何，指纹必须一致；排序按 metric 不按
+        # detect_anomalies 的展示顺序（worse 在前）。
+        first = [
+            {"metric": "msgs_them_per_day", "direction": "worse"},
+            {"metric": "avg_len_them", "direction": "better"},
+        ]
+        second = [
+            {"metric": "avg_len_them", "direction": "better"},
+            {"metric": "msgs_them_per_day", "direction": "worse"},
+        ]
+        self.assertEqual(
+            anomalies_key(first), "avg_len_them:better|msgs_them_per_day:worse"
+        )
+        self.assertEqual(anomalies_key(first), anomalies_key(second))
+
+    def test_empty_anomalies_have_an_empty_key(self) -> None:
+        self.assertEqual(anomalies_key([]), "")
 
 
 if __name__ == "__main__":
