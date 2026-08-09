@@ -313,6 +313,10 @@ def create_app(runtime: InsightsRuntime) -> web.Application:
             }
         )
 
+    def fading() -> list:
+        stored = store.get_json("fading", [])
+        return stored if isinstance(stored, list) else []
+
     async def contacts(_: web.Request) -> web.Response:
         items = store.all_scores()
         # 列表页不需要异动明细，去掉以免响应无谓变大。
@@ -324,6 +328,7 @@ def create_app(runtime: InsightsRuntime) -> web.Application:
                 "ok": True,
                 "generated_at": runtime.last_analyzed_at(),
                 "medians": medians(),
+                "fading": fading(),
                 "items": items,
             }
         )
@@ -348,6 +353,11 @@ def create_app(runtime: InsightsRuntime) -> web.Application:
             )
         days = store.load_days(row.session_id)
         anomalies = payload.pop("anomalies", [])
+        # 关系温度曲线只下发 {day, overall}，七维存着备用、暂不上传。
+        history = [
+            {"day": day, "overall": overall}
+            for day, overall, _dims in store.load_score_history(row.session_id)
+        ]
         return no_store(
             {
                 "ok": True,
@@ -357,6 +367,7 @@ def create_app(runtime: InsightsRuntime) -> web.Application:
                 "types": type_composition(total_metrics(days)),
                 "milestones": row.milestones(),
                 "anomalies": anomalies,
+                "history": history,
             }
         )
 

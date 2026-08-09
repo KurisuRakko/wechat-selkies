@@ -13,6 +13,7 @@
     statusLine: document.getElementById("status-line"),
     refreshBtn: document.getElementById("refresh-btn"),
     bannerSlot: document.getElementById("banner-slot"),
+    fadingSlot: document.getElementById("fading-slot"),
     sortSelect: document.getElementById("sort-select"),
     summaryLine: document.getElementById("summary-line"),
     content: document.getElementById("content"),
@@ -230,6 +231,7 @@
 
   function showUnauthorized() {
     state.unauthorized = true;
+    els.fadingSlot.innerHTML = "";
     els.content.innerHTML = I.errorStateHtml({ status: 401 });
     els.summaryLine.textContent = "";
     els.statusLine.textContent = "尚未分析";
@@ -265,12 +267,14 @@
     try {
       var payload = await I.api("/api/contacts");
       state.items = payload.items || [];
+      renderFading(payload.fading || []);
       renderList();
     } catch (err) {
       if (err.status === 401) {
         showUnauthorized();
         return;
       }
+      els.fadingSlot.innerHTML = "";
       els.content.innerHTML = I.errorStateHtml(err);
       els.summaryLine.textContent = "";
     }
@@ -325,6 +329,61 @@
   /* ------------------------------------------------------------------ *
    * 卡片渲染
    * ------------------------------------------------------------------ */
+
+  /**
+   * 「正在淡出」提醒卡：沉默已久但分还高的关系，一行一人、整行可点。
+   * 无命中时清空插槽（后端每一轮都会写，空数组或未写都按无命中处理）。
+   */
+  function renderFading(fading) {
+    if (!fading.length) {
+      els.fadingSlot.innerHTML = "";
+      return;
+    }
+    var rows = fading
+      .map(function (item) {
+        return (
+          '<button type="button" class="fading-row" data-hash="' +
+          item.hash +
+          '">' +
+          '<span class="avatar" style="background:' +
+          I.avatarColor(item.display_name) +
+          '" aria-hidden="true">' +
+          I.escapeHtml(I.initial(item.display_name)) +
+          "</span>" +
+          '<span class="fading-row__id">' +
+          '<span class="fading-row__name">' +
+          I.escapeHtml(item.display_name) +
+          "</span>" +
+          '<span class="fading-row__meta">已沉默 ' +
+          item.gap_days +
+          " 天 · 综合 " +
+          I.formatNumber(item.overall, 1) +
+          " 分</span>" +
+          "</span>" +
+          "</button>"
+        );
+      })
+      .join("");
+
+    els.fadingSlot.innerHTML =
+      '<section class="card fading-card">' +
+      '<h2 class="card__title fading-card__title">' +
+      "正在淡出" +
+      '<span class="fading-card__dot" aria-hidden="true"></span>' +
+      "</h2>" +
+      '<div class="fading-card__rows">' +
+      rows +
+      "</div>" +
+      "</section>";
+
+    els.fadingSlot.querySelectorAll(".fading-row").forEach(function (row) {
+      row.addEventListener("click", function () {
+        global.location.href = I.linkTo(
+          "/contact/" + encodeURIComponent(row.dataset.hash)
+        );
+      });
+    });
+  }
 
   var RING_SIZE = 56;
   var RING_RADIUS = 24;

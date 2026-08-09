@@ -149,6 +149,41 @@ class ApiTests(AioHTTPTestCase):
         self.assertIn("first_message_at", body["milestones"])
         self.assertEqual(len(body["anomalies"]), 1)
 
+    async def test_detail_includes_the_score_history_ascending(self) -> None:
+        self.store.record_score_history(
+            "2026-03-08", [(SESSION_ID, 70.5, '{"responsiveness":80.0}')]
+        )
+        self.store.record_score_history(
+            "2026-03-09", [(SESSION_ID, 68.0, '{"responsiveness":75.0}')]
+        )
+        body = await (await self.client.get(f"/api/contact/{HASH}")).json()
+        # 只下发 day/overall，dims 不下发。
+        self.assertEqual(
+            body["history"],
+            [
+                {"day": "2026-03-08", "overall": 70.5},
+                {"day": "2026-03-09", "overall": 68.0},
+            ],
+        )
+
+    async def test_detail_history_defaults_to_empty(self) -> None:
+        body = await (await self.client.get(f"/api/contact/{HASH}")).json()
+        self.assertEqual(body["history"], [])
+
+    async def test_contact_list_includes_fading(self) -> None:
+        self.store.set_json(
+            "fading",
+            [{"hash": HASH, "display_name": "Alice", "gap_days": 20, "overall": 70.0}],
+        )
+        body = await (await self.client.get("/api/contacts")).json()
+        self.assertEqual(
+            body["fading"], [{"hash": HASH, "display_name": "Alice", "gap_days": 20, "overall": 70.0}]
+        )
+
+    async def test_contact_list_fading_defaults_to_empty(self) -> None:
+        body = await (await self.client.get("/api/contacts")).json()
+        self.assertEqual(body["fading"], [])
+
     async def test_unknown_contact_returns_a_typed_404(self) -> None:
         response = await self.client.get(f"/api/contact/{'0' * 24}")
         self.assertEqual(response.status, 404)

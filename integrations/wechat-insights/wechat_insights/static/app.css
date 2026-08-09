@@ -667,6 +667,84 @@ body {
 }
 
 /* ==========================================================================
+   「正在淡出」提醒卡
+   ========================================================================== */
+
+.fading-card {
+  margin-bottom: 16px;
+}
+
+/* 标题右侧的警示色小圆点：提醒卡的存在本身就是「需要看一眼」的信号 */
+.fading-card__title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+
+.fading-card__dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--md-negative);
+}
+
+.fading-card__rows {
+  display: grid;
+  gap: 4px;
+}
+
+/* 一行一位联系人，整行可点进详情页 */
+.fading-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  width: 100%;
+  padding: 8px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  font-family: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+
+.fading-row:hover {
+  background: var(--md-state-hover);
+}
+
+.fading-row:focus-visible {
+  outline: none;
+  background: var(--md-state-focus);
+}
+
+.fading-row__id {
+  flex: 1;
+  min-width: 0;
+}
+
+.fading-row__name {
+  display: block;
+  font-size: 14px;
+  line-height: 20px;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.fading-row__meta {
+  display: block;
+  margin-top: 2px;
+  font-size: 12px;
+  line-height: 16px;
+  color: var(--md-on-surface-medium);
+}
+
+/* ==========================================================================
    说明弹窗（MD2 Dialog）
    ========================================================================== */
 

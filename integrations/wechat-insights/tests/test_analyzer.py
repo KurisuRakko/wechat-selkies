@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -881,6 +882,126 @@ class LLMDepthRefreshTests(AnalyzerTestCase):
         self.assertTrue(payloads["A"]["scored"])
         self.assertAlmostEqual(payloads["A"]["dimensions"]["depth"], 75.0)
         self.assertAlmostEqual(payloads["B"]["dimensions"]["depth"], 25.0)
+
+
+class ScoreHistoryTests(AnalyzerTestCase):
+    """关系温度历史：scored 记当天综合分、zeroed 记 0、数据不足不记。"""
+
+    def test_history_records_scored_and_zeroed_but_not_thin(self) -> None:
+        # Alice 达标被打分；Ghost 两年无往来归零；Thin 有消息但数据不足。
+        self.seed_messages("friend2", "Bob", {BASE + 5 * 86400: 15})
+        self.seed_messages(SESSION_ID, DISPLAY_NAME, {BASE + 5 * 86400: 20})
+        self.seed_messages("thin", "Thin", {BASE + 5 * 86400: 2})
+        self.store.ensure_contact("ghost", "Ghost")
+
+        with patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10):
+            self.run_analysis(now=NOW)
+
+        today = day_key(NOW)
+        alice = self.store.load_score_history(SESSION_ID)
+        self.assertEqual(len(alice), 1)
+        self.assertEqual(alice[0][0], today)
+        # 采样点与 scores 表里当轮的 payload 一致（分数 + 七维 JSON）。
+        payload = next(
+            p for p in self.store.all_scores() if p["display_name"] == DISPLAY_NAME
+        )
+        self.assertEqual(alice[0][1], payload["overall"])
+        self.assertEqual(json.loads(alice[0][2]), payload["dimensions"])
+
+        ghost = self.store.load_score_history("ghost")
+        self.assertEqual(ghost[0][0], today)
+        self.assertEqual(ghost[0][1], 0.0)
+        self.assertEqual(set(json.loads(ghost[0][2]).values()), {0.0})
+
+        self.assertEqual(self.store.load_score_history("thin"), [])
+
+    def test_two_rounds_on_the_same_day_keep_one_point_per_day(self) -> None:
+        self.seed_messages("friend2", "Bob", {BASE + 5 * 86400: 15})
+        self.seed_messages(SESSION_ID, DISPLAY_NAME, {BASE + 5 * 86400: 20})
+
+        with patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10):
+            self.run_analysis(now=NOW)
+            self.run_analysis(now=NOW)
+
+        rows = self.store.load_score_history(SESSION_ID)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0], day_key(NOW))
+
+
+class FadeTests(AnalyzerTestCase):
+    """「正在淡出」提醒：已打分 + 沉默够久 + 分够高，按综合分降序截断。
+
+    四个活跃联系人里，High/Mid/Low 把 last_message_at 拨到 30 天前
+    （current_gap ≈ 30 ≥ 14，全部入选），Fresh 保持最近（gap ≈ 1，被
+    沉默条件挡下）。四人除消息量外各项指标完全相同，综合分只由消息量
+    的百分位拉开，排序方向确定。
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        for session_id, count in (("high", 3), ("mid", 2), ("low", 1)):
+            self.seed_messages(
+                session_id,
+                session_id.title(),
+                {BASE + offset * 86400: count for offset in range(25)},
+            )
+            contact = self.store.get_contact(session_id)
+            contact.last_message_at = NOW - 30 * 86400
+            self.store.save_contact(contact)
+        self.seed_messages(
+            "fresh", "Fresh", {BASE + offset * 86400: 3 for offset in range(25)}
+        )
+        contact = self.store.get_contact("fresh")
+        contact.last_message_at = NOW - 86400
+        self.store.save_contact(contact)
+
+    def fading(self) -> list:
+        return self.store.get_json("fading", [])
+
+    def test_fading_keeps_long_silent_scored_contacts_sorted_by_overall(self) -> None:
+        with patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10):
+            self.run_analysis()
+
+        fading = self.fading()
+        self.assertEqual(
+            [item["display_name"] for item in fading], ["High", "Mid", "Low"]
+        )
+        overalls = [item["overall"] for item in fading]
+        self.assertEqual(overalls, sorted(overalls, reverse=True))
+        for item in fading:
+            self.assertEqual(item["gap_days"], 30)
+            self.assertGreaterEqual(item["overall"], 40.0)
+            self.assertEqual(len(item["hash"]), 24)
+
+    def test_fading_drops_contacts_below_the_overall_floor(self) -> None:
+        # 三人的综合分都落在 50 附近：把门槛抬到 60，名单必须清空。
+        with patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10), patch(
+            "wechat_insights.analyzer.FADE_MIN_OVERALL", 60
+        ):
+            self.run_analysis()
+        self.assertEqual(self.fading(), [])
+
+    def test_fading_truncates_to_the_list_limit(self) -> None:
+        with patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10), patch(
+            "wechat_insights.analyzer.FADE_LIST_LIMIT", 2
+        ):
+            self.run_analysis()
+        fading = self.fading()
+        self.assertEqual(
+            [item["display_name"] for item in fading], ["High", "Mid"]
+        )
+
+    def test_fading_overwrites_a_stale_round_with_an_empty_list(self) -> None:
+        with patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10):
+            self.run_analysis()
+        self.assertEqual(len(self.fading()), 3)
+        # 第二轮把沉默门槛抬到不可能达到的高度：名单整体换成空数组，
+        # 不能残留上一轮的旧条目。
+        with patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10), patch(
+            "wechat_insights.analyzer.FADE_MIN_GAP_DAYS", 365
+        ):
+            self.run_analysis()
+        self.assertEqual(self.fading(), [])
 
 
 class ProgressTests(AnalyzerTestCase):

@@ -265,6 +265,40 @@ class LLMDepthTests(StoreTestCase):
         self.assertEqual(row.anomalies_key, "")
 
 
+class ScoreHistoryTests(StoreTestCase):
+    def test_same_day_records_overwrite_instead_of_accumulating(self) -> None:
+        self.store.record_score_history(
+            "2026-03-10", [("friend", 72.0, '{"responsiveness":80.0}')]
+        )
+        self.store.record_score_history(
+            "2026-03-10", [("friend", 55.0, '{"responsiveness":60.0}')]
+        )
+        self.assertEqual(
+            self.store.load_score_history("friend"),
+            [("2026-03-10", 55.0, '{"responsiveness":60.0}')],
+        )
+
+    def test_load_returns_rows_ascending_and_scoped_to_the_session(self) -> None:
+        self.store.record_score_history(
+            "2026-03-12", [("friend", 1.0, "{}"), ("other", 9.0, "{}")]
+        )
+        self.store.record_score_history("2026-03-10", [("friend", 2.0, "{}")])
+        self.store.record_score_history("2026-03-11", [("friend", 3.0, "{}")])
+        self.assertEqual(
+            self.store.load_score_history("friend"),
+            [
+                ("2026-03-10", 2.0, "{}"),
+                ("2026-03-11", 3.0, "{}"),
+                ("2026-03-12", 1.0, "{}"),
+            ],
+        )
+        self.assertEqual(self.store.load_score_history("other"), [("2026-03-12", 9.0, "{}")])
+
+    def test_empty_batch_writes_nothing(self) -> None:
+        self.store.record_score_history("2026-03-10", [])
+        self.assertEqual(self.store.load_score_history("friend"), [])
+
+
 class SchemaMigrationTests(unittest.TestCase):
     def test_stale_schema_is_rebuilt_from_scratch(self) -> None:
         # 模拟旧版本 metrics.db：contacts 没有 cursor_shard 列。

@@ -105,6 +105,7 @@
     var contact = payload.contact || {};
     var monthly = payload.monthly || [];
     var types = payload.types || [];
+    var history = payload.history || [];
 
     els.name.textContent = contact.display_name || "联系人详情";
     document.title = (contact.display_name || "联系人详情") + " · 关系洞察";
@@ -137,9 +138,20 @@
     var typesBody = types.length
       ? '<div class="chart" id="types-chart"></div>'
       : emptyCardBody("暂无消息类型数据");
+    // 少于两个采样点的曲线没有形状，部署首日整卡不渲染。
+    var tempBody = history.length >= 2
+      ? '<div class="chart" id="temp-chart"></div>'
+      : "";
 
     els.content.innerHTML =
       '<div class="stack">' +
+      (tempBody
+        ? card(
+            "关系温度",
+            tempBody,
+            "每天记录一次综合分 · 自 " + history[0].day + " 起"
+          )
+        : "") +
       card("七维画像", radarBody, contact.scored ? "与全联系人中位数对比" : "") +
       // 关系画像由大模型生成，文本不可信，必须整体 escapeHtml。
       (contact.llm_summary
@@ -160,6 +172,9 @@
       ) +
       "</div>";
 
+    if (history.length >= 2) {
+      I.mountChart(document.getElementById("temp-chart"), tempOption(history));
+    }
     if (contact.scored) {
       I.mountChart(
         document.getElementById("radar-chart"),
@@ -173,6 +188,77 @@
     if (types.length) {
       I.mountChart(document.getElementById("types-chart"), typesOption(types));
     }
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 0. 关系温度：每日综合分历史折线
+   * ------------------------------------------------------------------ */
+
+  function tempOption(history) {
+    var days = history.map(function (row) {
+      return row.day;
+    });
+    var values = history.map(function (row) {
+      return row.overall;
+    });
+
+    return function (theme) {
+      return {
+        backgroundColor: "transparent",
+        grid: { left: 48, right: 24, top: 24, bottom: 40 },
+        tooltip: Object.assign(
+          {
+            trigger: "axis",
+            formatter: function (params) {
+              var lines = [I.escapeHtml(params[0].axisValue)];
+              params.forEach(function (p) {
+                var value = I.isNumber(p.value)
+                  ? I.formatNumber(p.value, 1) + " 分"
+                  : "无数据";
+                lines.push(p.marker + I.escapeHtml(p.seriesName) + "：" + value);
+              });
+              return lines.join("<br/>");
+            }
+          },
+          I.tooltipStyle(theme)
+        ),
+        xAxis: {
+          type: "category",
+          data: days,
+          boundaryGap: false,
+          axisLine: { lineStyle: { color: theme.axisColor } },
+          axisTick: { show: false },
+          // 日键是 YYYY-MM-DD，只露 MM-DD，跨年时 ECharts 会自动隔开标签。
+          axisLabel: {
+            color: theme.subTextColor,
+            fontSize: 12,
+            formatter: function (value) {
+              return value.slice(5);
+            }
+          }
+        },
+        yAxis: {
+          type: "value",
+          min: 0,
+          max: 100,
+          axisLine: { show: false },
+          splitLine: { lineStyle: { color: theme.splitColor } },
+          axisLabel: { color: theme.subTextColor, fontSize: 12 }
+        },
+        series: [
+          {
+            name: "综合分",
+            type: "line",
+            data: values,
+            smooth: true,
+            // 每天一个点，攒一年就是 365 个点：不画符号，靠 hover 看值。
+            showSymbol: false,
+            lineStyle: { width: 2, color: theme.primary },
+            itemStyle: { color: theme.primary }
+          }
+        ]
+      };
+    };
   }
 
   /* ------------------------------------------------------------------ *

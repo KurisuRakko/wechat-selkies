@@ -1,9 +1,10 @@
 """metrics.db：只存统计结果，不存任何消息原文。
 
-四张表：
+五张表：
 - contacts   每个私聊联系人的游标与里程碑
 - stats_daily 按天分桶的可加指标（数值列由 constants.METRIC_COLUMNS 生成）
 - scores     分析结束时预计算好的看板数据，HTTP 处理器直接吐 JSON
+- score_history 关系温度历史：每个联系人每天一个综合分采样点
 - llm_depth  可选的大模型深度分缓存（session_id → 分数 + 画像摘要 +
              异动解释 + 打分时刻 + 打分时累计消息数 + 异动指纹）
 
@@ -81,6 +82,17 @@ CREATE TABLE IF NOT EXISTS scores (
     session_id TEXT PRIMARY KEY,
     hash       TEXT NOT NULL UNIQUE,
     payload    TEXT NOT NULL
+);
+
+-- 关系温度历史：每个联系人每天一个综合分采样点（UPSERT 覆盖，一天一点）；
+-- dims 是七维分的紧凑 JSON，暂不下发、留着备用。归零的联系人记 0，
+-- 归零也是曲线的一部分。
+CREATE TABLE IF NOT EXISTS score_history (
+    session_id TEXT NOT NULL,
+    day        TEXT NOT NULL,
+    overall    REAL NOT NULL,
+    dims       TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (session_id, day)
 );
 
 -- LLM 深度分缓存；total_messages 是打分时联系人的累计消息数，
@@ -568,3 +580,38 @@ class MetricsStore:
             "SELECT payload FROM scores WHERE hash = ?", (value,)
         ).fetchone()
         return None if row is None else json.loads(row["payload"])
+
+    # —— score_history ——
+
+    def record_score_history(
+        self, day: str, rows: list[tuple[str, float, str]]
+    ) -> None:
+        """记录一批联系人当天的综合分采样（UPSERT，一次事务）。
+
+        同一 (session_id, day) 多次记录直接覆盖——一天只保留最后一次分析的
+        分数，曲线是「每天一个点」而不是「每轮一个点」。
+        """
+
+        with self.connection as connection:
+            connection.executemany(
+                "INSERT INTO score_history (session_id, day, overall, dims) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(session_id, day) DO UPDATE SET "
+                "overall = excluded.overall, dims = excluded.dims",
+                [
+                    (session_id, day, float(overall), dims)
+                    for session_id, overall, dims in rows
+                ],
+            )
+
+    def load_score_history(self, session_id: str) -> list[tuple[str, float, str]]:
+        """单个联系人的全部历史采样点，按日期升序。走主键索引。"""
+
+        return [
+            (str(row["day"]), float(row["overall"]), str(row["dims"]))
+            for row in self.connection.execute(
+                "SELECT day, overall, dims FROM score_history "
+                "WHERE session_id = ? ORDER BY day ASC",
+                (session_id,),
+            )
+        ]

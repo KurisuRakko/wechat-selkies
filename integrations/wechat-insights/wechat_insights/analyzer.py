@@ -19,6 +19,9 @@ from . import llm
 from .constants import (
     BACKFILL_BATCH,
     DECAY_HALF_LIFE_DAYS,
+    FADE_LIST_LIMIT,
+    FADE_MIN_GAP_DAYS,
+    FADE_MIN_OVERALL,
     LLM_MAX_CALLS_PER_RUN,
     LLM_REFRESH_DAYS,
     LLM_REFRESH_MESSAGES,
@@ -805,6 +808,48 @@ class Analyzer:
             payloads.append((session_id, payload))
 
         self.store.save_scores(payloads)
+        # 关系温度历史：每天一个采样点，从部署日起积累。scored 与归零的
+        # 联系人都记（归零也是曲线的一部分），数据不足的跳过——没有分数
+        # 就没有温度。UPSERT 语义保证同一天多轮分析只留一个点。
+        self.store.record_score_history(
+            today,
+            [
+                (
+                    session_id,
+                    payload["overall"],
+                    json.dumps(
+                        payload["dimensions"],
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                )
+                for session_id, payload in payloads
+                if payload["overall"] is not None
+            ],
+        )
+        # 「正在淡出」提醒：在归零之前抓住正在滑落的高分关系——已打分、
+        # 当前沉默达到 FADE_MIN_GAP_DAYS 天、综合分还高于 FADE_MIN_OVERALL
+        # 的联系人，按综合分降序取前 FADE_LIST_LIMIT 个，让看板从观赏变成
+        # 行动。无命中也写空数组，避免上一轮的旧名单残留。
+        fading = []
+        for session_id, payload in payloads:
+            if not payload["scored"]:
+                continue
+            gap_days = raw_score[session_id]["current_gap_days"]
+            if gap_days is None or gap_days < FADE_MIN_GAP_DAYS:
+                continue
+            if payload["overall"] < FADE_MIN_OVERALL:
+                continue
+            fading.append(
+                {
+                    "hash": payload["hash"],
+                    "display_name": payload["display_name"],
+                    "gap_days": int(round(gap_days)),
+                    "overall": payload["overall"],
+                }
+            )
+        fading.sort(key=lambda item: item["overall"], reverse=True)
+        self.store.set_json("fading", fading[:FADE_LIST_LIMIT])
         # 中位数随分数一起落库；一个人没有参照系时不写任何中位数。
         self.store.set_json(
             "medians",

@@ -62,6 +62,15 @@ MIN_REPLY_SAMPLES = 3
 ANOMALY_MIN_RATIO = 2.0
 ANOMALY_MIN_SAMPLES = 10
 
+# —— 「正在淡出」提醒 ——
+# 已打分联系人沉默达到该天数、且综合分还够高时，进列表页的提醒卡：
+# 在归零之前抓住正在滑落的高分关系，让看板从观赏变成行动。
+FADE_MIN_GAP_DAYS = _int_env("INSIGHTS_FADE_MIN_GAP_DAYS", 14, 3, 365)
+# 综合分低于该值的联系人不提醒——分数已经见底，不构成「正在淡出」。
+FADE_MIN_OVERALL = _int_env("INSIGHTS_FADE_MIN_OVERALL", 40, 0, 100)
+# 提醒名单最多取这么多位，按综合分降序。
+FADE_LIST_LIMIT = _int_env("INSIGHTS_FADE_LIST_LIMIT", 8, 1, 50)
+
 # —— 投入维度的类型成本权重 ——
 # 语音/通话比一条文字贵得多，直接按「等价条数」加权。
 COST_WEIGHTS = {
