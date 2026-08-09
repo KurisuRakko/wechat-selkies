@@ -249,17 +249,18 @@
       ? '<div class="chart" id="temp-chart"></div>'
       : "";
 
+    // 卡片顺序：七维画像 → 关系温度 → 关系画像 → 回复延迟 → 月度消息量 →
+    // 消息类型构成 → 里程碑 → 近期异动；「关系类型」是改判控件，放最后。
     els.content.innerHTML =
       '<div class="stack">' +
+      card("七维画像", radarBody, contact.scored ? "与全联系人中位数对比" : "") +
       (tempBody
         ? card(
             "关系温度",
             tempBody,
-            "每天记录一次综合分 · 自 " + history[0].day + " 起"
+            "每周/每日采样 · 自 " + history[0].day + " 起"
           )
         : "") +
-      kindCard(contact) +
-      card("七维画像", radarBody, contact.scored ? "与全联系人中位数对比" : "") +
       // 画像与标签由大模型生成，文本不可信，必须整体 escapeHtml。
       portraitCard(contact) +
       card("回复延迟中位数", monthlyBody, "按月，越低越快") +
@@ -270,6 +271,7 @@
         "近期异动",
         anomaliesHtml(payload.anomalies || [], contact.anomaly_note)
       ) +
+      kindCard(contact) +
       "</div>";
 
     var picker = els.content.querySelector(".kind-picker__select");
@@ -298,15 +300,36 @@
   }
 
   /* ------------------------------------------------------------------ *
-   * 0. 关系温度：每日综合分历史折线
+   * 0. 关系温度：历史综合分折线（全史每周回放 + 部署日起每日采样）
    * ------------------------------------------------------------------ */
 
+  /** 日键（YYYY-MM-DD）→ 本地时区当天 0 点的毫秒时间戳。
+   * 不直接把字符串丢给 ECharts：它按 UTC 解析 "YYYY-MM-DD"，
+   * 负时区（如美东）会把点画到前一天。 */
+  function dayKeyMs(day) {
+    var parts = day.split("-");
+    return new Date(+parts[0], +parts[1] - 1, +parts[2]).getTime();
+  }
+
+  /** time 轴横坐标（毫秒时间戳，个别版本传字符串）→ 完整日期。 */
+  function formatAxisFull(value) {
+    return I.isNumber(value) ? I.formatDate(value / 1000) : I.formatDate(value);
+  }
+
+  /** 同上的 MM-DD 版本，给轴标签用。 */
+  function formatAxisDay(value) {
+    var full = formatAxisFull(value);
+    return full === I.DASH ? "" : full.slice(5);
+  }
+
+  /**
+   * 关系温度：历史折线。x 轴用 time 而不是 category：全史回放后是
+   * 「每周一点 + 部署日起每日一点」的混合间距，category 轴会平均铺开、
+   * 稀疏的周点失真；time 轴按真实时间落点。
+   */
   function tempOption(history) {
-    var days = history.map(function (row) {
-      return row.day;
-    });
-    var values = history.map(function (row) {
-      return row.overall;
+    var points = history.map(function (row) {
+      return [dayKeyMs(row.day), row.overall];
     });
 
     return function (theme) {
@@ -317,10 +340,12 @@
           {
             trigger: "axis",
             formatter: function (params) {
-              var lines = [I.escapeHtml(params[0].axisValue)];
+              var lines = [I.escapeHtml(formatAxisFull(params[0].axisValue))];
               params.forEach(function (p) {
-                var value = I.isNumber(p.value)
-                  ? I.formatNumber(p.value, 1) + " 分"
+                // time 轴的数据是 [时刻, 分数] 对，取值取下标 1。
+                var v = Array.isArray(p.value) ? p.value[1] : p.value;
+                var value = I.isNumber(v)
+                  ? I.formatNumber(v, 1) + " 分"
                   : "无数据";
                 lines.push(p.marker + I.escapeHtml(p.seriesName) + "：" + value);
               });
@@ -330,17 +355,16 @@
           I.tooltipStyle(theme)
         ),
         xAxis: {
-          type: "category",
-          data: days,
+          type: "time",
           boundaryGap: false,
           axisLine: { lineStyle: { color: theme.axisColor } },
           axisTick: { show: false },
-          // 日键是 YYYY-MM-DD，只露 MM-DD，跨年时 ECharts 会自动隔开标签。
+          // 只露 MM-DD；刻度间距由 time 轴按真实时间取，跨年自动隔开。
           axisLabel: {
             color: theme.subTextColor,
             fontSize: 12,
             formatter: function (value) {
-              return value.slice(5);
+              return formatAxisDay(value);
             }
           }
         },
@@ -356,9 +380,9 @@
           {
             name: "综合分",
             type: "line",
-            data: values,
+            data: points,
             smooth: true,
-            // 每天一个点，攒一年就是 365 个点：不画符号，靠 hover 看值。
+            // 两年历史也不过百来点，仍偏密：不画符号，靠 hover 看值。
             showSymbol: false,
             lineStyle: { width: 2, color: theme.primary },
             itemStyle: { color: theme.primary }

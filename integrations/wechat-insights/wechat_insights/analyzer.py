@@ -11,6 +11,7 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta
 
 from wechat_history.reader import HistoryReader, _read_connection
 from wechat_history.sessions import scan_direct_rows
@@ -23,6 +24,7 @@ from .constants import (
     FADE_LIST_LIMIT,
     FADE_MIN_GAP_DAYS,
     FADE_MIN_OVERALL,
+    INSIGHTS_FORCE_HISTORY_BACKFILL,
     LLM_MAX_CALLS_PER_RUN,
     LLM_REFRESH_DAYS,
     LLM_REFRESH_MESSAGES,
@@ -55,7 +57,7 @@ from .scoring import (
     raw_metrics,
     score_cohort,
 )
-from .storage import ContactRow, MetricsStore, WindowStats
+from .storage import ContactRow, LLMDepthRow, MetricsStore, WindowStats
 
 
 LOG = logging.getLogger("wechat-insights")
@@ -83,7 +85,27 @@ class AnalysisResult:
     scored: int = 0
     llm_scored: int = 0
     classified: int = 0
+    # 本轮全史回放写入的采样点行数（关系温度曲线补上部署日之前的历史）。
+    history_points: int = 0
     per_session: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class ScoresAsOf:
+    """打分内核在「某一时刻」的输出：今日打分与全史回放共用，没有第二份真相。
+
+    stats 是窗口统计（零消息判定、window_messages）；raw 是百分位之前的原始值
+    （「正在淡出」的 current_gap_days 从这里读）；scores 是 score_cohort 的结果
+    （{} 表示没有对照系，整体按未打分处理）；eligible 是参与 cohort 的会话名单
+    （中位数等派生统计的基数）；contacts 是全部联系人。
+    """
+
+    stats: dict[str, WindowStats]
+    raw: dict[str, dict[str, float | None]]
+    scores: dict[str, dict[str, float]]
+    eligible: list[str]
+    contacts: dict[str, ContactRow]
+    equivalent_days: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -297,6 +319,16 @@ def _parse_llm_reply(reply: str) -> LLMReply | None:
     return LLMReply(max(0, min(100, score)), summary, note, tags)
 
 
+def _day_moment(day: str) -> int:
+    """日键 → 当天本地 0 点的时间戳（回放网格点的时间坐标）。
+
+    用日期解析而不是「现在 − n 天 × 86400」：跨夏令时的日子后者会差一小时、
+    日键偶尔差一天，回放点必须精确落在网格日上。
+    """
+
+    return int(datetime.fromisoformat(day).timestamp())
+
+
 class Analyzer:
     """一轮完整分析：拉新消息 → 聚合落库 → 重算全部看板数据。"""
 
@@ -378,6 +410,9 @@ class Analyzer:
 
         self._report(phase="score", done=0, total=0, detail="")
         result.scored = self._recompute(moment)
+        # 关系温度全史回放：今日打分之后补上部署日之前的历史，与今日共用
+        # 同一个打分内核（_scores_asof），没有第二份真相。
+        result.history_points = self._backfill_history(moment)
         result.duration_seconds = time.monotonic() - started
 
         if result.messages_read:
@@ -725,22 +760,38 @@ class Analyzer:
             payload["zeroed"] = True
         return payload
 
-    def _recompute(self, moment: int) -> int:
-        """重算所有联系人的七维分、趋势与异动，整体替换 scores 表。"""
+    def _scores_asof(
+        self,
+        moment: int,
+        *,
+        gap_override: dict[str, float | None] | None = None,
+        llm_scores: dict[str, LLMDepthRow] | None = None,
+    ) -> ScoresAsOf:
+        """打分内核：把「某一时刻」能看到的天桶换算成每个联系人的七维分与综合分。
 
+        今日打分（_recompute）与全史回放（_backfill_history）共用这一份换算，
+        历史回放不许复制出第二份真相。与今日路径的差异集中注释在这里：
+        - current_gap_days 按「窗口内最后活跃日到 asof_day 的天数」推算——
+          不能拿 contact.last_message_at 这种「现在」的知识穿越回过去；
+          今日路径用 gap_override 传回 contact.last_message_at 口径；
+        - 不注入 llm_depth_score：llm_depth 缓存里只有「当前」的分数，历史
+          时刻不可知，深度维度按缺值机制自动退化成纯词法；今日路径传
+          llm_scores（LLM 行缺失时注入 None，与不注入等价）。
+        """
+
+        asof_day = day_key(moment)
         # 窗口起点用「N 天前的同一时刻」折算，跨 DST 切换时本地时间会偏移
         # 一小时、日键偶尔差一天（生产容器在澳大利亚/悉尼，有夏令时），
         # 目前按秒数近似，不做逐天修正。
-        today, recent_start, baseline_end, baseline_start = self._window_bounds(moment)
         score_start = day_key(moment - SCORE_WINDOW_DAYS * 86400)
         score_start_ts = moment - SCORE_WINDOW_DAYS * 86400
 
-        score_stats = self.store.load_window_stats(
-            score_start, today, lambda day: self._weight_of(today, day)
+        # 窗口终点 = asof_day：回放到历史某天时只看得见那天之前的天桶，
+        # 「未来」的消息不会泄漏进窗口。
+        stats = self.store.load_window_stats(
+            score_start, asof_day, lambda day: self._weight_of(asof_day, day)
         )
-        recent_windows = self.store.load_window(recent_start, today)
-        baseline_windows = self.store.load_window(baseline_start, baseline_end)
-        contacts_by_id = {
+        contacts = {
             contact.session_id: contact for contact in self.store.all_contacts()
         }
 
@@ -749,32 +800,37 @@ class Analyzer:
         # 沟通的消息量会污染参照系，把正常朋友的相对分压扁。
         eligible = sorted(
             session_id
-            for session_id, stats in score_stats.items()
-            if stats.raw.messages_total() >= MIN_SCORE_MESSAGES
-            and contacts_by_id[session_id].relation_kind() != "transactional"
+            for session_id, window in stats.items()
+            if window.raw.messages_total() >= MIN_SCORE_MESSAGES
+            and contacts[session_id].relation_kind() != "transactional"
         )
 
-        empty = Metrics()
         # 打分窗口的日均除数用 decayed_span 的「等效天数」：均匀活跃的人加权前后
         # 日均一致，两年的衰减窗口与近 30 天窗口的日均仍可直接比较。
-        equivalent_days = decayed_span(day_span(score_start, today), DECAY_HALF_LIFE_DAYS)
-        llm_scores = self.store.all_llm_depth() if self.strategy.name == "llm" else {}
+        equivalent_days = decayed_span(
+            day_span(score_start, asof_day), DECAY_HALF_LIFE_DAYS
+        )
         raw_score: dict[str, dict[str, float | None]] = {}
         for session_id in eligible:
-            stats = score_stats[session_id]
-            contact = contacts_by_id[session_id]
+            window = stats[session_id]
+            contact = contacts[session_id]
+            current_gap = (
+                day_span(window.last_day, asof_day) - 1
+                if window.last_day is not None
+                else None
+            )
+            if gap_override is not None and session_id in gap_override:
+                # 今日路径：沉默可能发生在窗口末活跃日之后（最近一个月没聊），
+                # 只有「现在」的 last_message_at 才知道，保持原口径。
+                current_gap = gap_override[session_id]
             extras: dict[str, float | None] = {
-                "active_day_rate": stats.active_weight / equivalent_days,
-                "current_gap_days": (
-                    (moment - contact.last_message_at) / 86400
-                    if contact.last_message_at is not None
-                    else None
-                ),
+                "active_day_rate": window.active_weight / equivalent_days,
+                "current_gap_days": current_gap,
                 "longest_gap_days": self._longest_gap(
-                    stats, contact, score_start, score_start_ts
+                    window, contact, score_start, score_start_ts
                 ),
             }
-            if self.strategy.name == "llm":
+            if llm_scores is not None:
                 # LLM 行可能还没有（None）：缺值权重回流给词法三项，
                 # 深度维度自动退化成纯词法，不需要特判。
                 llm_row = llm_scores.get(session_id)
@@ -782,8 +838,51 @@ class Analyzer:
                     llm_row.score if llm_row is not None else None
                 )
             raw_score[session_id] = raw_metrics(
-                stats.weighted, self.strategy, equivalent_days, extras
+                window.weighted, self.strategy, equivalent_days, extras
             )
+        scores = score_cohort(raw_score, self.strategy)
+        return ScoresAsOf(
+            stats=stats,
+            raw=raw_score,
+            scores=scores,
+            eligible=eligible,
+            contacts=contacts,
+            equivalent_days=equivalent_days,
+        )
+
+    def _recompute(self, moment: int) -> int:
+        """重算所有联系人的七维分、趋势与异动，整体替换 scores 表。
+
+        分数本体由 _scores_asof 内核算出；这里叠加今日专属的部分：LLM 深度分
+        注入、趋势/异动窗口、payload 组装、温度历史每日记点与「正在淡出」。
+        """
+
+        today, recent_start, baseline_end, baseline_start = self._window_bounds(moment)
+        contacts = {contact.session_id: contact for contact in self.store.all_contacts()}
+        llm_scores = self.store.all_llm_depth() if self.strategy.name == "llm" else {}
+        asof = self._scores_asof(
+            moment,
+            gap_override={
+                session_id: (
+                    (moment - contact.last_message_at) / 86400
+                    if contact.last_message_at is not None
+                    else None
+                )
+                for session_id, contact in contacts.items()
+            },
+            llm_scores=llm_scores or None,
+        )
+        score_stats = asof.stats
+        contacts_by_id = asof.contacts
+        eligible = asof.eligible
+        scores = asof.scores
+        raw_score = asof.raw
+        equivalent_days = asof.equivalent_days
+
+        recent_windows = self.store.load_window(recent_start, today)
+        baseline_windows = self.store.load_window(baseline_start, baseline_end)
+
+        empty = Metrics()
         raw_recent = {
             session_id: raw_metrics(
                 recent_windows.get(session_id, empty),
@@ -801,7 +900,6 @@ class Analyzer:
             for session_id in eligible
         }
 
-        scores = score_cohort(raw_score, self.strategy)
         # 趋势 = 同一批联系人内，近期窗口的百分位 减去 基线窗口的百分位。
         recent_scores = score_cohort(raw_recent, self.strategy)
         baseline_scores = score_cohort(raw_baseline, self.strategy)
@@ -974,3 +1072,89 @@ class Analyzer:
         self.store.set_meta("last_analyzed_at", str(moment))
         LOG.info("完成打分：%d/%d 个联系人样本达标", len(eligible), len(payloads))
         return len(scores)
+
+    def _backfill_history(self, moment: int) -> int:
+        """把关系温度回放到全史：从最早统计日起每 7 天一个采样点，直到今天。
+
+        与今日打分共用 _scores_asof 内核，历史回放没有第二份真相；周点与部署
+        日起的每日点重叠时 UPSERT 覆盖，无害。完成后记 meta 标记
+        score_history_backfilled（值 = moment），之后每轮跳过；设
+        INSIGHTS_FORCE_HISTORY_BACKFILL=true 强制重跑（打分口径升级后重放历史
+        用）。回放与今日口径的差异见 _scores_asof 的注释。
+        """
+
+        if not INSIGHTS_FORCE_HISTORY_BACKFILL and self.store.get_meta(
+            "score_history_backfilled"
+        ):
+            return 0
+
+        earliest = self.store.earliest_stats_day()
+        if earliest is None:
+            return 0  # 一条天桶都没有（首轮同步还没落地），无史可回放。
+        today = day_key(moment)
+        grid: list[str] = []
+        cursor = earliest
+        while cursor <= today:
+            grid.append(cursor)
+            cursor = (date.fromisoformat(cursor) + timedelta(days=7)).isoformat()
+        if not grid:
+            return 0
+
+        started = time.monotonic()
+        points = 0
+        self._report(phase="history", done=0, total=len(grid), detail="")
+        for done, day in enumerate(grid, start=1):
+            self._report(phase="history", done=done, total=len(grid), detail=day)
+            asof = self._scores_asof(_day_moment(day))
+            rows: list[tuple[str, float, str]] = []
+            for session_id, contact in asof.contacts.items():
+                kind = contact.relation_kind()
+                dims = asof.scores.get(session_id)
+                if dims is not None:
+                    # 达标打分：记当天的综合分与七维（与每日记点同一格式）。
+                    rows.append(
+                        (
+                            session_id,
+                            round(dims["overall"], 1),
+                            json.dumps(
+                                {
+                                    name: round(dims[name], 1)
+                                    for name in DIMENSION_NAMES
+                                },
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ),
+                        )
+                    )
+                    continue
+                window = asof.stats.get(session_id)
+                if window is None or window.raw.messages_total() <= 0:
+                    if kind in ("transactional", "family"):
+                        # 事务往来永不记温度；家人零消息不归零、不记 0 分——
+                        # 两者都与每日规则一致。
+                        continue
+                    # 归零也是曲线的一部分：记 0。
+                    rows.append(
+                        (
+                            session_id,
+                            0.0,
+                            json.dumps(
+                                {name: 0.0 for name in DIMENSION_NAMES},
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ),
+                        )
+                    )
+                # 有消息但样本不够：数据不足，不记（与每日规则一致）。
+            # 每点一个事务：单个点失败不连坐整段历史。
+            self.store.record_score_history(day, rows)
+            points += len(rows)
+        self.store.set_meta("score_history_backfilled", str(moment))
+        LOG.info(
+            "全史回放：%d 天网格 %d 个采样点，写入 %d 行，用时 %.1f 秒",
+            day_span(earliest, today),
+            len(grid),
+            points,
+            time.monotonic() - started,
+        )
+        return points

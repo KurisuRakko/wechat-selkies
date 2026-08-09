@@ -800,14 +800,46 @@ body {
   margin-bottom: 16px;
 }
 
-/* 标题右侧的警示色小圆点：提醒卡的存在本身就是「需要看一眼」的信号 */
-.fading-card__title {
+/* 头部整行可点：默认收起只看这一行，点击展开名单 */
+.fading-card__header {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 8px;
+  gap: 8px;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  font-family: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
 }
 
+.fading-card__header:hover {
+  background: var(--md-state-hover);
+}
+
+.fading-card__header:focus-visible {
+  outline: none;
+  background: var(--md-state-focus);
+}
+
+.fading-card__title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* 人数跟在标题后：括号里的数量 */
+.fading-card__count {
+  font-weight: 400;
+  color: var(--md-on-surface-disabled);
+}
+
+/* 标题右侧的警示色小圆点：提醒卡的存在本身就是「需要看一眼」的信号 */
 .fading-card__dot {
   flex: none;
   width: 8px;
@@ -816,9 +848,30 @@ body {
   background: var(--md-negative);
 }
 
+/* 纯 CSS 三角箭头，展开时翻转朝上 */
+.fading-card__chevron {
+  flex: none;
+  width: 0;
+  height: 0;
+  border-left: 5px solid transparent;
+  border-right: 5px solid transparent;
+  border-top: 6px solid var(--md-on-surface-disabled);
+  transition: transform 0.15s ease;
+}
+
+.fading-card__header[aria-expanded="true"] .fading-card__chevron {
+  transform: rotate(180deg);
+}
+
 .fading-card__rows {
   display: grid;
   gap: 4px;
+  margin-top: 8px;
+}
+
+/* display: grid 会压过浏览器默认的 [hidden] 规则，必须显式收起 */
+.fading-card__rows[hidden] {
+  display: none;
 }
 
 /* 一行一位联系人，整行可点进详情页 */

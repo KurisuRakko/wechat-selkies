@@ -46,6 +46,13 @@ NIGHT_HOURS = frozenset({23, 0, 1})
 # 「聊到最晚的一次」只在凌晨窗口里比较，避免 23:59 永远压过 02:00。
 LATE_NIGHT_MAX_HOUR = 6
 
+# —— 关系温度全史回放 ——
+# 默认只回放一次（完成后记 meta 标记 score_history_backfilled，之后每轮跳过）；
+# 置 true 时每轮强制重跑，供打分口径升级后重放历史用。
+INSIGHTS_FORCE_HISTORY_BACKFILL = (
+    os.environ.get("INSIGHTS_FORCE_HISTORY_BACKFILL", "false").lower() == "true"
+)
+
 # —— 打分窗口 ——
 SCORE_WINDOW_DAYS = _int_env("INSIGHTS_SCORE_WINDOW_DAYS", 730, 7, 3650)
 # 打分窗口内每个天桶按 0.5^(天龄/半衰期) 加权：两年窗口 + 90 天半衰期下，

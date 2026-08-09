@@ -45,7 +45,8 @@
     sync: "同步聊天记录",
     llm: "AI 分析",
     classify: "关系分类",
-    score: "重算打分"
+    score: "重算打分",
+    history: "回放历史"
   };
 
   /* ------------------------------------------------------------------ *
@@ -338,7 +339,9 @@
 
   /**
    * 「正在淡出」提醒卡：沉默已久但分还高的关系，一行一人、整行可点。
-   * 无命中时清空插槽（后端每一轮都会写，空数组或未写都按无命中处理）。
+   * 默认收起只看头部（标题 + 人数 + 警示点 + chevron），点头部展开；
+   * 展开状态不持久化，每轮重绘回到收起。无命中时清空插槽（后端每一轮
+   * 都会写，空数组或未写都按无命中处理）。
    */
   function renderFading(fading) {
     if (!fading.length) {
@@ -373,14 +376,28 @@
 
     els.fadingSlot.innerHTML =
       '<section class="card fading-card">' +
-      '<h2 class="card__title fading-card__title">' +
+      '<button type="button" class="fading-card__header" aria-expanded="false">' +
+      '<span class="fading-card__title">' +
       "正在淡出" +
+      '<span class="fading-card__count">(' +
+      fading.length +
+      ")</span>" +
       '<span class="fading-card__dot" aria-hidden="true"></span>' +
-      "</h2>" +
-      '<div class="fading-card__rows">' +
+      "</span>" +
+      '<span class="fading-card__chevron" aria-hidden="true"></span>' +
+      "</button>" +
+      '<div class="fading-card__rows" hidden>' +
       rows +
       "</div>" +
       "</section>";
+
+    els.fadingSlot
+      .querySelector(".fading-card__header")
+      .addEventListener("click", function () {
+        var expanded = this.getAttribute("aria-expanded") === "true";
+        els.fadingSlot.querySelector(".fading-card__rows").hidden = expanded;
+        this.setAttribute("aria-expanded", expanded ? "false" : "true");
+      });
 
     els.fadingSlot.querySelectorAll(".fading-row").forEach(function (row) {
       row.addEventListener("click", function () {

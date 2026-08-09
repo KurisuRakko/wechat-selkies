@@ -623,6 +623,15 @@ class MetricsStore:
             bucket.merge(row_to_metrics(row))
         return totals
 
+    def earliest_stats_day(self) -> str | None:
+        """stats_daily 里最早的日键；一张天桶都没有时返回 None。
+
+        关系温度全史回放的网格起点用。走 MIN(day)，不需要扫描全表。
+        """
+
+        row = self.connection.execute("SELECT MIN(day) FROM stats_daily").fetchone()
+        return None if row is None or row[0] is None else str(row[0])
+
     def load_days(self, session_id: str) -> list[tuple[str, Metrics]]:
         """单个联系人的全部天桶，按日期升序。走主键索引，不是全表扫描。"""
 

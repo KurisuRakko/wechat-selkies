@@ -5,6 +5,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from datetime import date, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -14,6 +15,7 @@ from wechat_history.formatting import message_kind
 from wechat_insights.analyzer import Analyzer, Cursor, read_messages_after
 from wechat_insights.depth import DepthStrategy, LexicalDepth, LLMDepth
 from wechat_insights.metrics import Metrics, day_key
+from wechat_insights.scoring import DIMENSION_NAMES
 from wechat_insights.storage import MetricsStore
 
 
@@ -1292,13 +1294,15 @@ class RelationKindScoreTests(AnalyzerTestCase):
         self.assertEqual(
             [item["display_name"] for item in fading], ["FriendA", "FriendB"]
         )
-        # 有数据时家人照常打分、记历史。
+        # 有数据时家人照常打分、记历史（含回放的周点，最后一点是今天的每日点）。
         payloads = {p["display_name"]: p for p in self.store.all_scores()}
         mom = payloads["Mom"]
         self.assertTrue(mom["scored"])
         self.assertEqual(mom["relation_kind"], "family")
         self.assertEqual(mom["kind_source"], "manual")
-        self.assertEqual(len(self.store.load_score_history("mom")), 1)
+        mom_history = self.store.load_score_history("mom")
+        self.assertGreater(len(mom_history), 1)
+        self.assertEqual(mom_history[-1][0], day_key(NOW))
 
     def test_kind_source_reflects_manual_auto_and_default(self) -> None:
         self.seed_messages("friend2", "Bob", {BASE + 5 * 86400: 15})
@@ -1334,6 +1338,8 @@ class ScoreHistoryTests(AnalyzerTestCase):
 
     def test_history_records_scored_and_zeroed_but_not_thin(self) -> None:
         # Alice 达标被打分；Ghost 两年无往来归零；Thin 有消息但数据不足。
+        # 全史回放（部署日之前的周网格）走同一套规则：scored 记综合分、
+        # 归零记 0、数据不足不记。
         self.seed_messages("friend2", "Bob", {BASE + 5 * 86400: 15})
         self.seed_messages(SESSION_ID, DISPLAY_NAME, {BASE + 5 * 86400: 20})
         self.seed_messages("thin", "Thin", {BASE + 5 * 86400: 2})
@@ -1344,18 +1350,20 @@ class ScoreHistoryTests(AnalyzerTestCase):
 
         today = day_key(NOW)
         alice = self.store.load_score_history(SESSION_ID)
-        self.assertEqual(len(alice), 1)
-        self.assertEqual(alice[0][0], today)
+        # 回放的周点之外还有今天的每日点（最后一条）。
+        self.assertEqual(alice[-1][0], today)
+        self.assertGreater(len(alice), 1)
         # 采样点与 scores 表里当轮的 payload 一致（分数 + 七维 JSON）。
         payload = next(
             p for p in self.store.all_scores() if p["display_name"] == DISPLAY_NAME
         )
-        self.assertEqual(alice[0][1], payload["overall"])
-        self.assertEqual(json.loads(alice[0][2]), payload["dimensions"])
+        self.assertEqual(alice[-1][1], payload["overall"])
+        self.assertEqual(json.loads(alice[-1][2]), payload["dimensions"])
 
         ghost = self.store.load_score_history("ghost")
-        self.assertEqual(ghost[0][0], today)
-        self.assertEqual(ghost[0][1], 0.0)
+        # Ghost 每个采样点都是 0（归零也是曲线的一部分），最后一点是今天。
+        self.assertEqual(ghost[-1][0], today)
+        self.assertTrue(all(row[1] == 0.0 for row in ghost))
         self.assertEqual(set(json.loads(ghost[0][2]).values()), {0.0})
 
         self.assertEqual(self.store.load_score_history("thin"), [])
@@ -1366,11 +1374,154 @@ class ScoreHistoryTests(AnalyzerTestCase):
 
         with patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10):
             self.run_analysis(now=NOW)
+            rows_after_first = self.store.load_score_history(SESSION_ID)
+            # 回放完成即记标记：第二轮不再回放，一行都不新增。
             self.run_analysis(now=NOW)
+            rows_after_second = self.store.load_score_history(SESSION_ID)
 
-        rows = self.store.load_score_history(SESSION_ID)
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0][0], day_key(NOW))
+        self.assertEqual(rows_after_first, rows_after_second)
+        # 每天最多一个点（周网格 + 每日点互不重复），最后一条是今天的每日点。
+        days = [row[0] for row in rows_after_second]
+        self.assertEqual(len(days), len(set(days)))
+        self.assertEqual(days[-1], day_key(NOW))
+
+
+class HistoryReplayTests(AnalyzerTestCase):
+    """全史回放的一致性：回放点与「把 now 拨到那一刻跑一轮」记下的点逐位一致。"""
+
+    def test_replay_point_matches_a_run_at_that_moment(self) -> None:
+        # 一致性黄金测试：同一份构造数据，_scores_asof 回放到某时刻的结果 =
+        # 把 now 拨到该时刻调 _recompute 路径记下的每日点。构造上把
+        # last_message_at 对齐到天边界，contact 口径与窗口末活跃日口径
+        # 完全一致（回放与今日的唯一差异点消失），分数必须逐位一致。
+        for session_id, name, count in (
+            (SESSION_ID, DISPLAY_NAME, 20),
+            ("friend2", "Bob", 15),
+        ):
+            self.seed_messages(
+                session_id,
+                name,
+                {BASE + offset * 86400: count for offset in range(20)},
+            )
+            contact = self.store.get_contact(session_id)
+            contact.last_message_at = BASE + 19 * 86400
+            self.store.save_contact(contact)
+
+        past = BASE + 20 * 86400
+        with patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10):
+            self.run_analysis(now=past)
+            # 同一份数据直接调内核回放到同一时刻。
+            replay = self.analyzer()._scores_asof(past)
+
+        day = day_key(past)
+        alice = {
+            row[0]: (row[1], json.loads(row[2]))
+            for row in self.store.load_score_history(SESSION_ID)
+        }
+        self.assertIn(day, alice)
+        expected = replay.scores[SESSION_ID]
+        self.assertEqual(alice[day][0], round(expected["overall"], 1))
+        self.assertEqual(
+            alice[day][1],
+            {name: round(expected[name], 1) for name in DIMENSION_NAMES},
+        )
+
+
+class HistoryReplayGridTests(AnalyzerTestCase):
+    """全史回放网格：周网格日期序列、归零段记 0、家人/事务口径、幂等与 FORCE。
+
+    两个相隔超过 730 天（打分窗口）的消息簇，中间必然出现「窗口内零消息」
+    的回放段：friend 记 0，family 跳过（不归零），transactional 永不写。
+    """
+
+    # 全史跨度：BASE 起 830 天，好友与家人两簇消息（0..9 天、800..809 天）。
+    NOW_LATE = BASE + 830 * 86400
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.early = {BASE + offset * 86400: 15 for offset in range(10)}
+        self.late = {BASE + 800 * 86400 + offset * 86400: 15 for offset in range(10)}
+        self.seed_messages("friend2", "Bob", self.early)
+        self.seed_messages("friend2", "Bob", self.late)
+        self.seed_messages("mom", "Mom", self.early)
+        self.seed_messages("mom", "Mom", self.late)
+        self.seed_messages("agent", "机票代理", {BASE + 5 * 86400: 500})
+        self.store.set_contact_kind_manual("mom", "family")
+        self.store.set_contact_kind_manual("agent", "transactional")
+
+    def run_with_progress(self, now: int):
+        """无同步会话跑一轮（数据全在 stats_daily 里），同时收进度事件。"""
+
+        events: list[dict] = []
+        with patch(
+            "wechat_insights.analyzer.scan_direct_rows", return_value={}
+        ), patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10):
+            result = self.analyzer(
+                progress_cb=lambda fields: events.append(dict(fields))
+            ).run(now=now)
+        return result, events
+
+    def test_replay_writes_weekly_grid_with_kind_rules(self) -> None:
+        today = day_key(self.NOW_LATE)
+        grid = backfill_grid(day_key(BASE), today)
+
+        result, events = self.run_with_progress(self.NOW_LATE)
+
+        # 周网格日期序列：每个网格点都有 friend 的采样（达标段记分、归零段记
+        # 0），最后一条是今天的每日点。
+        friend = self.store.load_score_history("friend2")
+        self.assertEqual([row[0] for row in friend], grid + [today])
+        zero_rows = [row for row in friend if row[1] == 0.0]
+        self.assertTrue(zero_rows)
+        # 归零段的 dims 全 0。
+        self.assertEqual(set(json.loads(zero_rows[0][2]).values()), {0.0})
+        # 达标段记的是分数不是 0。
+        self.assertTrue(any(row[1] != 0.0 for row in friend))
+
+        # family 有采样但不记 0 分（家人久不聊天不代表疏远）。
+        mom = self.store.load_score_history("mom")
+        self.assertTrue(mom)
+        self.assertTrue(all(row[1] != 0.0 for row in mom))
+        # transactional 无任何行。
+        self.assertEqual(self.store.load_score_history("agent"), [])
+
+        # history_points = 回放写入的总行数（friend 全网格 + family 达标段）。
+        self.assertEqual(result.history_points, len(grid) + len(mom) - 1)
+
+        # 进度包含 history 阶段：起点 + 每 7 天一个点，detail 是网格日。
+        phases = [event["phase"] for event in events]
+        self.assertIn("history", phases)
+        history = [event for event in events if event["phase"] == "history"]
+        self.assertEqual(
+            history[0],
+            {"phase": "history", "done": 0, "total": len(grid), "detail": ""},
+        )
+        self.assertEqual(
+            [event["done"] for event in history], list(range(len(grid) + 1))
+        )
+        self.assertEqual(history[-1]["detail"], grid[-1])
+
+    def test_marker_makes_reruns_noop_until_force(self) -> None:
+        first, _ = self.run_with_progress(self.NOW_LATE)
+        rows_after_first = self.store.load_score_history("friend2")
+        self.assertGreater(first.history_points, 0)
+        self.assertEqual(
+            self.store.get_meta("score_history_backfilled"), str(self.NOW_LATE)
+        )
+
+        # 标记在则二跑 no-op：不回放、不加行。
+        second, _ = self.run_with_progress(self.NOW_LATE)
+        self.assertEqual(second.history_points, 0)
+        self.assertEqual(self.store.load_score_history("friend2"), rows_after_first)
+
+        # FORCE 强制重跑：行数不变（UPSERT 覆盖、不重复）。
+        with patch("wechat_insights.analyzer.INSIGHTS_FORCE_HISTORY_BACKFILL", True):
+            forced, _ = self.run_with_progress(self.NOW_LATE)
+        self.assertEqual(forced.history_points, first.history_points)
+        self.assertEqual(self.store.load_score_history("friend2"), rows_after_first)
+        self.assertEqual(
+            self.store.get_meta("score_history_backfilled"), str(self.NOW_LATE)
+        )
 
 
 class FadeTests(AnalyzerTestCase):
@@ -1449,6 +1600,18 @@ class FadeTests(AnalyzerTestCase):
         self.assertEqual(self.fading(), [])
 
 
+def backfill_grid(earliest: str, today: str) -> list[str]:
+    """全史回放的周网格（与 analyzer._backfill_history 同一语义）。"""
+
+    days = []
+    cursor = date.fromisoformat(earliest)
+    end = date.fromisoformat(today)
+    while cursor <= end:
+        days.append(cursor.isoformat())
+        cursor += timedelta(days=7)
+    return days
+
+
 class ProgressTests(AnalyzerTestCase):
     """进度上报：阶段顺序、计数递增，以及 cb 异常绝不影响分析本身。"""
 
@@ -1467,10 +1630,13 @@ class ProgressTests(AnalyzerTestCase):
 
     def test_lexical_run_reports_sync_then_score(self) -> None:
         build_database(self.database, [them(1, 0), me(2, 60)])
-        _, events = self.run_with_progress()
-        self.assertEqual(
-            [event["phase"] for event in events], ["sync", "sync", "score"]
-        )
+        _, events = self.run_with_progress(now=NOW)
+        # 阶段顺序：sync（起点 + 1 个会话）→ score → history（全史回放网格，
+        # 起点 + 每 7 天一个点）。
+        grid = backfill_grid(day_key(BASE), day_key(NOW))
+        phases = [event["phase"] for event in events]
+        self.assertEqual(phases[:3], ["sync", "sync", "score"])
+        self.assertEqual(phases[3:], ["history"] * (len(grid) + 1))
         # sync 起点：total=会话数、done=0；随后每个会话前上报一次 display_name。
         self.assertEqual(events[0], {"phase": "sync", "done": 0, "total": 1, "detail": ""})
         self.assertEqual(
@@ -1479,6 +1645,21 @@ class ProgressTests(AnalyzerTestCase):
         )
         # score 阶段没有逐项计数：total=0。
         self.assertEqual(events[2], {"phase": "score", "done": 0, "total": 0, "detail": ""})
+        # history 起点 total=网格点数，随后逐点上报日期。
+        history = [event for event in events if event["phase"] == "history"]
+        self.assertEqual(
+            history[0],
+            {"phase": "history", "done": 0, "total": len(grid), "detail": ""},
+        )
+        self.assertEqual(
+            history[-1],
+            {
+                "phase": "history",
+                "done": len(grid),
+                "total": len(grid),
+                "detail": grid[-1],
+            },
+        )
 
     def test_llm_run_reports_candidate_progress_between_sync_and_score(self) -> None:
         shards: dict[str, Path] = {}
@@ -1506,9 +1687,11 @@ class ProgressTests(AnalyzerTestCase):
         self.assertEqual(result.llm_scored, 2)
         self.assertEqual(fake.call_count, 2)
         phases = [event["phase"] for event in events]
-        # 阶段顺序：sync（起点 + 3 个会话）→ llm（起点 + 2 个候选）→ score。
+        # 阶段顺序：sync（起点 + 3 个会话）→ llm（起点 + 2 个候选）→
+        # score → history（全史回放网格）。
+        grid = backfill_grid(day_key(BASE), day_key(NOW))
         self.assertEqual(
-            phases, ["sync"] * 4 + ["llm"] * 3 + ["score"]
+            phases, ["sync"] * 4 + ["llm"] * 3 + ["score"] + ["history"] * (len(grid) + 1)
         )
         llm = [event for event in events if event["phase"] == "llm"]
         self.assertEqual(llm[0], {"phase": "llm", "done": 0, "total": 2, "detail": ""})
