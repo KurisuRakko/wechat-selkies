@@ -299,6 +299,29 @@ body {
   background: transparent;
 }
 
+/* 年报页 App Bar 上的年份切换：‹ 2026 › */
+.report-year {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--md-appbar-on);
+}
+
+.report-year__label {
+  min-width: 48px;
+  text-align: center;
+  font-size: 16px;
+  line-height: 24px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+.report-year .icon-btn:disabled {
+  color: var(--md-appbar-on-medium);
+  background: transparent;
+}
+
 /* ==========================================================================
    页面容器与卡片
    ========================================================================== */
@@ -579,6 +602,7 @@ body {
 
 .contact-card__name {
   display: block;
+  min-width: 0;
   font-size: 16px;
   line-height: 24px;
   font-weight: 400;
@@ -586,6 +610,83 @@ body {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* 名字 + 异动角标一行；min-width:0 让长名字优先收缩、角标不被挤出 */
+.contact-card__name-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* 异动角标：警示色胶囊 + 小圆点，悬停提示「N 项近期异动」 */
+.contact-card__badge {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 18px;
+  padding: 0 6px;
+  border-radius: 9px;
+  background: var(--md-warning-bg);
+  color: var(--md-warning-fg);
+  font-size: 11px;
+  line-height: 18px;
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+.contact-card__badge__dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+/* 名字行下方的小号话题标签行，最多 2 个 */
+.contact-card__tags {
+  display: inline-flex;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+/* MD2 chip：描边胶囊。标签来自大模型输出，长度已被后端截断 */
+.chip {
+  display: inline-block;
+  height: 20px;
+  padding: 0 8px;
+  border: 1px solid var(--md-divider);
+  border-radius: 10px;
+  font-size: 11px;
+  line-height: 18px;
+  color: var(--md-on-surface-medium);
+  white-space: nowrap;
+}
+
+/* 列表卡片里的小号 chip */
+.chip--small {
+  height: 16px;
+  padding: 0 6px;
+  border-radius: 8px;
+  font-size: 10px;
+  line-height: 14px;
+}
+
+/* 详情页「关系画像」卡里的标签行 */
+.tag-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+/* 年报页的年度总结正文 */
+.report-narrative {
+  margin: 0 0 8px;
+  font-size: 16px;
+  line-height: 28px;
+  color: var(--md-on-surface);
 }
 
 .contact-card__meta {

@@ -101,6 +101,39 @@
     return full === I.DASH ? I.DASH : full.slice(5);
   }
 
+  /** 话题标签 chips（大模型输出，逐个 escapeHtml）；无标签返回空串。 */
+  function tagChipsHtml(tags) {
+    if (!tags || !tags.length) {
+      return "";
+    }
+    return (
+      '<div class="tag-chips">' +
+      tags
+        .map(function (tag) {
+          return '<span class="chip">' + I.escapeHtml(tag) + "</span>";
+        })
+        .join("") +
+      "</div>"
+    );
+  }
+
+  /** 「关系画像」卡：summary 下方挂话题标签；只有其一存在也照常渲染。 */
+  function portraitCard(contact) {
+    var tags = contact.llm_tags || [];
+    if (!contact.llm_summary && !tags.length) {
+      return "";
+    }
+    var body = "";
+    if (contact.llm_summary) {
+      body += '<p class="md-body2">' + I.escapeHtml(contact.llm_summary) + "</p>";
+    }
+    body += tagChipsHtml(tags);
+    var subtitle = contact.llm_summary_at
+      ? "大模型基于最近的脱敏对话生成 · " + formatMonthDay(contact.llm_summary_at)
+      : "大模型基于最近的脱敏对话生成";
+    return card("关系画像", body, subtitle);
+  }
+
   function render(payload) {
     var contact = payload.contact || {};
     var monthly = payload.monthly || [];
@@ -153,15 +186,8 @@
           )
         : "") +
       card("七维画像", radarBody, contact.scored ? "与全联系人中位数对比" : "") +
-      // 关系画像由大模型生成，文本不可信，必须整体 escapeHtml。
-      (contact.llm_summary
-        ? card(
-            "关系画像",
-            '<p class="md-body2">' + I.escapeHtml(contact.llm_summary) + "</p>",
-            "大模型基于最近的脱敏对话生成 · " +
-              formatMonthDay(contact.llm_summary_at)
-          )
-        : "") +
+      // 画像与标签由大模型生成，文本不可信，必须整体 escapeHtml。
+      portraitCard(contact) +
       card("回复延迟中位数", monthlyBody, "按月，越低越快") +
       card("月度消息量", volumeBody) +
       card("消息类型构成", typesBody) +

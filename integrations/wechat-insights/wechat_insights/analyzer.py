@@ -230,26 +230,31 @@ _LLM_SYSTEM_PROMPT = (
     '"summary"：不超过 100 字的两三句话，概括你们主要聊什么话题、相处模式是什么样。'
     '用「你们」称呼双方，不要出现具体人名。\n'
     '"anomaly_note"：如果附了近期变化列表，基于聊天内容用一句话（不超过 50 字）推测'
-    "变化最可能的原因；没有附变化列表则为 null。"
+    "变化最可能的原因；没有附变化列表则为 null。\n"
+    '"tags"：2 到 4 个标签，每个 2–6 个字，概括你们的主要话题与相处方式'
+    "（例如 游戏、深夜谈心、工作吐槽）；给不出就空数组。"
 )
 
 
 @dataclass(frozen=True, slots=True)
 class LLMReply:
-    """一次 LLM 深度打分回复解析出的三件套：分数 + 关系画像 + 异动解释。"""
+    """一次 LLM 深度打分回复解析出的四件套：分数 + 关系画像 + 异动解释 + 话题标签。"""
 
     score: int
     summary: str
     anomaly_note: str | None
+    tags: list[str] | None
 
 
 def _parse_llm_reply(reply: str) -> LLMReply | None:
-    """截取回复里的第一个 JSON 块，解析 score/summary/anomaly_note。
+    """截取回复里的第一个 JSON 块，解析 score/summary/anomaly_note/tags。
 
     score 缺失或解析不出 → 整体返回 None（不落缓存）；summary 与
-    anomaly_note 解析失败只是降级成空，不影响分数落库。两者都是模型输出，
-    长度硬截断防毒，且不把回复内容写进日志：日志里出现任何聊天相关文本
-    都违背「原文不出容器」的原则。
+    anomaly_note 解析失败只是降级成空，不影响分数落库。tags 非 list（含
+    缺失）归一成 None——「老缓存行没有 tags」与「模型给了空数组」是两回事：
+    None 会触发下一轮重评补齐，[] 则不会。其余字段都是模型输出，长度硬
+    截断防毒，且不把回复内容写进日志：日志里出现任何聊天相关文本都违背
+    「原文不出容器」的原则。
     """
 
     start = reply.find("{")
@@ -273,7 +278,21 @@ def _parse_llm_reply(reply: str) -> LLMReply | None:
         note = None
     else:
         note = note.strip()[:100] or None
-    return LLMReply(max(0, min(100, score)), summary, note)
+    tags = data.get("tags")
+    if not isinstance(tags, list):
+        tags = None
+    else:
+        cleaned: list[str] = []
+        for item in tags:
+            if not isinstance(item, str):
+                continue
+            tag = item.strip()[:8]
+            if tag:
+                cleaned.append(tag)
+            if len(cleaned) >= 4:
+                break
+        tags = cleaned
+    return LLMReply(max(0, min(100, score)), summary, note, tags)
 
 
 class Analyzer:
@@ -518,6 +537,9 @@ class Analyzer:
                 or contact.total_messages - cached.total_messages
                 >= LLM_REFRESH_MESSAGES
                 or cached.anomalies_key != key
+                # 老缓存行没有 tags：还没经历过带 tags 字段的 prompt，重评一次
+                # 补齐。单轮 40 次的上限兜底成本，多数部署两天内收敛。
+                or cached.tags is None
             ):
                 continue
             pending.append(
@@ -566,6 +588,7 @@ class Analyzer:
                 parsed.summary,
                 parsed.anomaly_note,
                 key,
+                parsed.tags,
             )
             scored += 1
         LOG.info(
@@ -790,12 +813,15 @@ class Analyzer:
                 "anomalies": anomalies,
             }
             if scored and self.strategy.name == "llm":
-                # 画像与异动解释只在详情页展示；归零/数据不足不发，词法策略
-                # 下不出现任何键（前端对缺省与 None 一视同仁）。
+                # 画像、话题标签与异动解释只在详情页展示；归零/数据不足不发，
+                # 词法策略下不出现任何键（前端对缺省与 None 一视同仁）。
                 llm_row = llm_scores.get(session_id)
                 summary = llm_row.summary if llm_row is not None else None
                 payload["llm_summary"] = summary if summary else None
                 payload["llm_summary_at"] = llm_row.scored_at if summary else None
+                payload["llm_tags"] = (
+                    (llm_row.tags or []) if llm_row is not None else []
+                )
                 note = llm_row.anomaly_note if llm_row is not None else None
                 # 指纹不匹配 = 解释针对的是旧异动集合，宁缺毋滥。
                 payload["anomaly_note"] = (

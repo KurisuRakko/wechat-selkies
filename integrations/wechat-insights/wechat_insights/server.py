@@ -28,7 +28,14 @@ from .constants import (
     DB_PATH,
     RUN_ON_START,
 )
-from .reporting import monthly_series, total_metrics, type_composition
+from .depth import get_depth_strategy
+from .reporting import (
+    generate_narrative,
+    monthly_series,
+    total_metrics,
+    type_composition,
+    yearly_report,
+)
 from .scoring import DIMENSION_NAMES
 from .storage import MetricsStore
 
@@ -39,6 +46,19 @@ STATIC_ROOT = Path(__file__).resolve().parent / "static"
 _HASH_PATTERN = re.compile(r"^[0-9a-f]{24}$")
 # 分析失败后的重试间隔，避免密钥失效时每秒刷屏。
 RETRY_SECONDS = 900.0
+
+
+def _report_year(value: str | None) -> int:
+    """解析 ?year= 参数；非法或缺失回退到当前年份。
+
+    未来年份不特殊处理：窗口为空时年报自然全是零值，前端已禁用未来年切换。
+    """
+
+    if value is not None and re.fullmatch(r"\d{4}", value):
+        year = int(value)
+        if 2000 <= year <= 2100:
+            return year
+    return datetime.now().year
 
 
 def parse_analyze_time(value: str) -> tuple[int, int]:
@@ -287,6 +307,54 @@ def create_app(runtime: InsightsRuntime) -> web.Application:
     async def contact_page(_: web.Request) -> web.FileResponse:
         return await page("contact.html")
 
+    async def report_page(_: web.Request) -> web.FileResponse:
+        return await page("report.html")
+
+    async def _report_narrative(
+        store: MetricsStore, year: int, stats: dict
+    ) -> str | None:
+        """年报叙事：分析没更新时直接用缓存，更新过则下次请求重新生成。
+
+        生成在 asyncio.to_thread 里做（llm.chat 是同步阻塞调用）；失败降级
+        为无叙事（返回 None），stats 照常返回。失败不写缓存，下次请求重试。
+        """
+
+        analyzed_at = runtime.last_analyzed_at()
+        if analyzed_at is None:
+            return None
+        cache = store.get_json(f"report_narrative_{year}")
+        if (
+            isinstance(cache, dict)
+            and cache.get("last_analyzed_at") == analyzed_at
+            and isinstance(cache.get("text"), str)
+            and cache["text"]
+        ):
+            return cache["text"]
+        try:
+            text = await asyncio.to_thread(generate_narrative, stats)
+        except Exception:
+            LOG.warning("年报叙事生成失败，本轮降级为无叙事", exc_info=True)
+            return None
+        if text is None:
+            return None
+        store.set_json(
+            f"report_narrative_{year}",
+            {"last_analyzed_at": analyzed_at, "text": text},
+        )
+        return text
+
+    async def report(request: web.Request) -> web.Response:
+        year = _report_year(request.query.get("year"))
+        stats = yearly_report(store, year, int(time.time()))
+        narrative = None
+        # 叙事只在深度策略是 llm（接了大模型端点）时才有；全年一条消息都
+        # 没有的年（例如未来的年份）不生成，没有可总结的内容。
+        if get_depth_strategy().name == "llm" and stats["overview"]["messages"] > 0:
+            narrative = await _report_narrative(store, year, stats)
+        return no_store(
+            {"ok": True, "year": year, "stats": stats, "narrative": narrative}
+        )
+
     async def status(_: web.Request) -> web.Response:
         analyzed = runtime.last_analyzed_at()
         contacts = store.all_contacts()
@@ -319,9 +387,7 @@ def create_app(runtime: InsightsRuntime) -> web.Application:
 
     async def contacts(_: web.Request) -> web.Response:
         items = store.all_scores()
-        # 列表页不需要异动明细，去掉以免响应无谓变大。
-        for item in items:
-            item.pop("anomalies", None)
+        # 异动明细保留在 payload 里：列表卡片用它渲染「N 项近期异动」角标。
         items.sort(key=lambda item: (item.get("overall") is None, -(item.get("overall") or 0)))
         return no_store(
             {
@@ -396,9 +462,11 @@ def create_app(runtime: InsightsRuntime) -> web.Application:
 
     app.router.add_get("/", index)
     app.router.add_get("/contact/{hash}", contact_page)
+    app.router.add_get("/report", report_page)
     app.router.add_get("/api/status", status)
     app.router.add_get("/api/contacts", contacts)
     app.router.add_get("/api/contact/{hash}", contact_detail)
+    app.router.add_get("/api/report", report)
     app.router.add_get("/api/progress", progress)
     app.router.add_post("/api/refresh", refresh)
     app.router.add_static("/static/", STATIC_ROOT)

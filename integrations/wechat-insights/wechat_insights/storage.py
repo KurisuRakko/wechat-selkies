@@ -6,7 +6,7 @@
 - scores     分析结束时预计算好的看板数据，HTTP 处理器直接吐 JSON
 - score_history 关系温度历史：每个联系人每天一个综合分采样点
 - llm_depth  可选的大模型深度分缓存（session_id → 分数 + 画像摘要 +
-             异动解释 + 打分时刻 + 打分时累计消息数 + 异动指纹）
+             异动解释 + 话题标签 + 打分时刻 + 打分时累计消息数 + 异动指纹）
 
 按天而不是按自然月分桶，是为了让「近 30 天 / 近 90 天 / 近两年」这类滚动窗口是
 精确的；自然月视图由 SQL 之外的 Python 聚合从同一批天桶合成，没有第二份真相。
@@ -37,10 +37,12 @@ LOG = logging.getLogger("wechat-insights")
 _ROW_COLUMNS = METRIC_COLUMNS + HISTOGRAM_COLUMNS
 
 #: llm_depth 在 CREATE TABLE 之外的幂等补列清单（见 _initialize）。
-_LLM_DEPTH_EXTRA_COLUMNS = ("summary", "anomaly_note", "anomalies_key")
+_LLM_DEPTH_EXTRA_COLUMNS = ("summary", "anomaly_note", "anomalies_key", "tags")
 
 #: get_llm_depth / all_llm_depth 的共享列清单，两处查询保持一致。
-_LLM_DEPTH_COLUMNS = "score, scored_at, total_messages, summary, anomaly_note, anomalies_key"
+_LLM_DEPTH_COLUMNS = (
+    "score, scored_at, total_messages, summary, anomaly_note, anomalies_key, tags"
+)
 
 _SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS meta (
@@ -99,6 +101,7 @@ CREATE TABLE IF NOT EXISTS score_history (
 -- 与 contacts.total_messages 的差值做「新增多少条就重评」的基准。
 -- summary/anomaly_note 是同一批调用顺带生成的关系画像与异动解释，
 -- anomalies_key 是打分时异动清单的指纹，指纹变了才需要重评重写解释。
+-- tags 是同一批调用顺带生成的话题标签（紧凑 JSON；'' 表示没有，[] 合法）。
 CREATE TABLE IF NOT EXISTS llm_depth (
     session_id     TEXT PRIMARY KEY,
     score          REAL NOT NULL,
@@ -106,7 +109,8 @@ CREATE TABLE IF NOT EXISTS llm_depth (
     total_messages INTEGER NOT NULL,
     summary        TEXT NOT NULL DEFAULT '',
     anomaly_note   TEXT NOT NULL DEFAULT '',
-    anomalies_key  TEXT NOT NULL DEFAULT ''
+    anomalies_key  TEXT NOT NULL DEFAULT '',
+    tags           TEXT NOT NULL DEFAULT ''
 );
 """
 
@@ -163,7 +167,7 @@ class ContactRow:
 
 @dataclass(frozen=True, slots=True)
 class LLMDepthRow:
-    """一条 LLM 深度分缓存：分数 + 关系画像 + 异动解释 + 指纹。"""
+    """一条 LLM 深度分缓存：分数 + 关系画像 + 异动解释 + 话题标签 + 指纹。"""
 
     score: float
     scored_at: int
@@ -171,6 +175,7 @@ class LLMDepthRow:
     summary: str
     anomaly_note: str | None
     anomalies_key: str
+    tags: list[str] | None
 
 
 @dataclass(slots=True)
@@ -372,8 +377,24 @@ class MetricsStore:
 
     @staticmethod
     def _llm_depth_row(row: sqlite3.Row) -> LLMDepthRow:
-        """从一行查询结果构造 LLMDepthRow；空串的 anomaly_note 归一成 None。"""
+        """从一行查询结果构造 LLMDepthRow。
 
+        空串的 anomaly_note / tags 归一成 None；tags 的 '[]' 是合法值
+        （模型明确给了空数组），要还原成空列表而不是 None——两者含义不同：
+        None 表示「老缓存行没有 tags」，[] 表示「有 tags 字段但模型没给」。
+        """
+
+        tags = None
+        raw_tags = row["tags"] or ""
+        if raw_tags:
+            try:
+                parsed = json.loads(raw_tags)
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, list) and all(
+                isinstance(item, str) for item in parsed
+            ):
+                tags = parsed
         return LLMDepthRow(
             score=row["score"],
             scored_at=row["scored_at"],
@@ -381,6 +402,7 @@ class MetricsStore:
             summary=row["summary"] or "",
             anomaly_note=row["anomaly_note"] or None,
             anomalies_key=row["anomalies_key"] or "",
+            tags=tags,
         )
 
     def get_llm_depth(self, session_id: str) -> LLMDepthRow | None:
@@ -399,19 +421,29 @@ class MetricsStore:
         summary: str = "",
         anomaly_note: str | None = None,
         anomalies_key: str = "",
+        tags: list[str] | None = None,
     ) -> None:
-        """写入或覆盖一条 LLM 深度分缓存（UPSERT）。"""
+        """写入或覆盖一条 LLM 深度分缓存（UPSERT）。
 
+        tags 为 None 存 ''（读回是 None，触发重评补齐），list 存紧凑
+        JSON——空数组 [] 也是合法值，照存。
+        """
+
+        tags_json = (
+            ""
+            if tags is None
+            else json.dumps(tags, ensure_ascii=False, separators=(",", ":"))
+        )
         with self.connection as connection:
             connection.execute(
                 "INSERT INTO llm_depth "
                 "(session_id, score, scored_at, total_messages, summary, "
-                "anomaly_note, anomalies_key) VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "anomaly_note, anomalies_key, tags) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(session_id) DO UPDATE SET "
                 "score = excluded.score, scored_at = excluded.scored_at, "
                 "total_messages = excluded.total_messages, "
                 "summary = excluded.summary, anomaly_note = excluded.anomaly_note, "
-                "anomalies_key = excluded.anomalies_key",
+                "anomalies_key = excluded.anomalies_key, tags = excluded.tags",
                 (
                     session_id,
                     score,
@@ -420,6 +452,7 @@ class MetricsStore:
                     summary,
                     anomaly_note or "",
                     anomalies_key,
+                    tags_json,
                 ),
             )
 

@@ -12,6 +12,7 @@
   var els = {
     statusLine: document.getElementById("status-line"),
     refreshBtn: document.getElementById("refresh-btn"),
+    reportBtn: document.getElementById("report-btn"),
     bannerSlot: document.getElementById("banner-slot"),
     fadingSlot: document.getElementById("fading-slot"),
     sortSelect: document.getElementById("sort-select"),
@@ -450,6 +451,41 @@
     );
   }
 
+  /** 名字旁的异动角标：警示色小圆点 + 数量，悬停提示「N 项近期异动」。 */
+  function anomalyBadgeHtml(item) {
+    var count = item.anomalies && item.anomalies.length;
+    if (!count) {
+      return "";
+    }
+    return (
+      '<span class="contact-card__badge" title="' +
+      count +
+      ' 项近期异动" aria-label="' +
+      count +
+      ' 项近期异动">' +
+      '<span class="contact-card__badge__dot" aria-hidden="true"></span>' +
+      count +
+      "</span>"
+    );
+  }
+
+  /** 名字行下方最多 2 个小号话题标签 chip（大模型输出，逐个 escapeHtml）。 */
+  function cardTagsHtml(tags) {
+    if (!tags || !tags.length) {
+      return "";
+    }
+    return (
+      '<span class="contact-card__tags">' +
+      tags
+        .slice(0, 2)
+        .map(function (tag) {
+          return '<span class="chip chip--small">' + I.escapeHtml(tag) + "</span>";
+        })
+        .join("") +
+      "</span>"
+    );
+  }
+
   /** 综合分趋势箭头：±8 以内视为持平（阈值只在 JS 里维护）。 */
   function trendHtml(delta) {
     if (!I.isNumber(delta)) {
@@ -533,9 +569,13 @@
       I.escapeHtml(I.initial(item.display_name)) +
       "</span>" +
       '<span class="contact-card__id">' +
+      '<span class="contact-card__name-row">' +
       '<span class="contact-card__name">' +
       I.escapeHtml(item.display_name) +
       "</span>" +
+      anomalyBadgeHtml(item) +
+      "</span>" +
+      cardTagsHtml(item.llm_tags) +
       '<span class="contact-card__meta">' +
       recent +
       "</span>" +
@@ -623,6 +663,10 @@
     if (state.items.length) {
       renderList();
     }
+  });
+
+  els.reportBtn.addEventListener("click", function () {
+    global.location.href = I.linkTo("/report");
   });
 
   els.refreshBtn.addEventListener("click", async function () {

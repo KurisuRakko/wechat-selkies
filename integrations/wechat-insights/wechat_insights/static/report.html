@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>友谊年报 · 关系洞察</title>
+    <link rel="stylesheet" href="/static/app.css" />
+  </head>
+  <body>
+    <header class="app-bar">
+      <div class="app-bar__row">
+        <a class="icon-btn" id="back-link" href="/" aria-label="返回列表">←</a>
+        <div class="app-bar__titles">
+          <h1 class="app-bar__title">友谊年报</h1>
+          <p class="app-bar__subtitle" id="report-meta"></p>
+        </div>
+        <div class="report-year" role="group" aria-label="切换年份">
+          <button class="icon-btn" id="prev-year" type="button" aria-label="上一年">‹</button>
+          <span class="report-year__label" id="year-label"></span>
+          <button class="icon-btn" id="next-year" type="button" aria-label="下一年">›</button>
+        </div>
+      </div>
+    </header>
+
+    <main class="page">
+      <div id="content"></div>
+    </main>
+
+    <script src="/static/vendor/echarts.min.js"></script>
+    <script src="/static/common.js"></script>
+    <script src="/static/report.js"></script>
+  </body>
+</html>

@@ -257,12 +257,58 @@ class LLMDepthTests(StoreTestCase):
         columns = {
             row[1] for row in store.connection.execute("PRAGMA table_info(llm_depth)")
         }
-        self.assertLessEqual({"summary", "anomaly_note", "anomalies_key"}, columns)
+        self.assertLessEqual(
+            {"summary", "anomaly_note", "anomalies_key", "tags"}, columns
+        )
         row = store.get_llm_depth("friend")
         self.assertEqual((row.score, row.total_messages), (55.0, 42))
         self.assertEqual(row.summary, "")
         self.assertIsNone(row.anomaly_note)
         self.assertEqual(row.anomalies_key, "")
+
+    def test_tags_column_is_migrated_in_place(self) -> None:
+        # 更早形状的 llm_depth 连 tags 列都没有：_initialize 幂等地补上，
+        # 旧行读回 tags 是 None（触发下一轮重评补齐），而不是崩在缺列上。
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        path = Path(temporary.name) / "metrics.db"
+        seed = MetricsStore(path)
+        seed.set_llm_depth("friend", 55.0, 1_000, 42, "旧摘要")
+        seed.close()
+        with sqlite3.connect(path) as connection:
+            connection.execute("ALTER TABLE llm_depth DROP COLUMN tags")
+
+        store = MetricsStore(path)
+        self.addCleanup(store.close)
+        columns = {
+            row[1] for row in store.connection.execute("PRAGMA table_info(llm_depth)")
+        }
+        self.assertIn("tags", columns)
+        row = store.get_llm_depth("friend")
+        self.assertEqual((row.score, row.summary), (55.0, "旧摘要"))
+        self.assertIsNone(row.tags)
+
+    def test_tags_round_trip_none_empty_list_and_list(self) -> None:
+        # None → ''（读回 None，触发重评补齐）；[] 是合法值照存、读回空
+        # 列表；普通列表走紧凑 JSON 往返。
+        self.store.set_llm_depth("friend", 66.0, 1, 10, "摘要", None, "", None)
+        self.assertIsNone(self.store.get_llm_depth("friend").tags)
+        self.store.set_llm_depth("friend", 66.0, 1, 10, "摘要", None, "", [])
+        self.assertEqual(self.store.get_llm_depth("friend").tags, [])
+        self.store.set_llm_depth(
+            "friend", 66.0, 1, 10, "摘要", None, "", ["游戏", "深夜谈心"]
+        )
+        self.assertEqual(
+            self.store.get_llm_depth("friend").tags, ["游戏", "深夜谈心"]
+        )
+
+    def test_corrupt_tags_json_reads_as_none(self) -> None:
+        self.store.set_llm_depth("friend", 66.0, 1, 10, "摘要", None, "", ["游戏"])
+        with self.store.connection as connection:
+            connection.execute(
+                "UPDATE llm_depth SET tags = 'oops' WHERE session_id = 'friend'"
+            )
+        self.assertIsNone(self.store.get_llm_depth("friend").tags)
 
 
 class ScoreHistoryTests(StoreTestCase):

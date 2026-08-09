@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import tempfile
+from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from aiohttp.test_utils import AioHTTPTestCase
@@ -131,10 +133,11 @@ class ApiTests(AioHTTPTestCase):
         self.assertEqual(body["contacts"], 1)
         self.assertEqual(body["scored_contacts"], 1)
 
-    async def test_contact_list_omits_anomalies_and_fills_missing_medians(self) -> None:
+    async def test_contact_list_keeps_anomalies_and_fills_missing_medians(self) -> None:
         body = await (await self.client.get("/api/contacts")).json()
         self.assertEqual(len(body["items"]), 1)
-        self.assertNotIn("anomalies", body["items"][0])
+        # 异动明细留在 payload：列表卡片用数量渲染「N 项近期异动」角标。
+        self.assertEqual(len(body["items"][0]["anomalies"]), 1)
         self.assertEqual(body["medians"]["responsiveness"], 50.0)
         # 分析器还没写过的维度用中性值补齐，前端不必处理缺字段。
         self.assertEqual(body["medians"]["depth"], 50.0)
@@ -240,6 +243,112 @@ class ApiTests(AioHTTPTestCase):
     async def test_pages_are_served(self) -> None:
         self.assertEqual((await self.client.get("/")).status, 200)
         self.assertEqual((await self.client.get(f"/contact/{HASH}")).status, 200)
+        self.assertEqual((await self.client.get("/report")).status, 200)
+
+    async def test_report_returns_the_yearly_structure(self) -> None:
+        # 词法策略（默认）下不生成叙事；结构稳定，前端只依赖这些键。
+        with patch(
+            "wechat_insights.server.get_depth_strategy",
+            return_value=SimpleNamespace(name="lexical"),
+        ):
+            body = await (await self.client.get("/api/report?year=2026")).json()
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["year"], 2026)
+        self.assertIsNone(body["narrative"])
+        stats = body["stats"]
+        self.assertEqual(stats["year"], 2026)
+        # 窗口收口到「今天」：3/10 的数据永远落在窗口内即可。
+        self.assertEqual(stats["window"]["start"], "2026-01-01")
+        self.assertGreaterEqual(stats["window"]["end"], "2026-03-10")
+        self.assertEqual(
+            stats["overview"],
+            {"messages": 4, "contacts": 1, "incoming": 4, "outgoing": 0},
+        )
+        self.assertEqual(stats["top"][0]["display_name"], "Alice")
+        self.assertEqual(stats["top"][0]["messages"], 4)
+        # 月度固定 12 格：3 月 4 条，其余月份（含 1 月）为 0。
+        self.assertEqual(len(stats["monthly"]), 12)
+        self.assertEqual(stats["monthly"][2]["count"], 4)
+        self.assertEqual(stats["monthly"][0]["count"], 0)
+        self.assertEqual(stats["new_friends"], [])
+        self.assertEqual(stats["faded"], [])
+        self.assertIsNone(stats["haha_king"])
+
+    async def test_report_with_bad_year_falls_back_to_the_current_year(self) -> None:
+        with patch(
+            "wechat_insights.server.get_depth_strategy",
+            return_value=SimpleNamespace(name="lexical"),
+        ):
+            body = await (await self.client.get("/api/report?year=oops")).json()
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["year"], datetime.now().year)
+
+
+class ReportNarrativeTests(AioHTTPTestCase):
+    """年报叙事：llm 策略下才生成；缓存命中不重复调用；失败降级 stats 照常。"""
+
+    async def get_application(self):
+        return create_app(self.runtime)
+
+    async def asyncSetUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.store = MetricsStore(Path(self.temporary.name) / "metrics.db")
+        self.addCleanup(self.store.close)
+        self.store.set_meta("last_analyzed_at", "1700000000")
+        self.store.ensure_contact(SESSION_ID, "Alice")
+        bucket = Metrics()
+        bucket.add("msgs_them", 4)
+        self.store.merge_daily(SESSION_ID, {"2026-03-10": bucket})
+        self.runtime = InsightsRuntime(self.store, analyzer_factory=lambda: None)
+        # 测试里固定 llm 策略：不依赖部署环境的深度策略变量。
+        self.strategy = SimpleNamespace(name="llm")
+        await super().asyncSetUp()
+
+    async def test_narrative_is_generated_once_and_cached_until_next_analysis(self) -> None:
+        with patch(
+            "wechat_insights.server.get_depth_strategy", return_value=self.strategy
+        ), patch(
+            "wechat_insights.llm.chat", return_value="今年的故事…"
+        ) as fake:
+            first = await (await self.client.get("/api/report?year=2026")).json()
+            second = await (await self.client.get("/api/report?year=2026")).json()
+        # 分析没更新：第二次请求直接读缓存，不重复调用 LLM。
+        self.assertEqual(fake.call_count, 1)
+        self.assertEqual(first["narrative"], "今年的故事…")
+        self.assertEqual(second["narrative"], "今年的故事…")
+        cache = self.store.get_json("report_narrative_2026")
+        self.assertEqual(cache["last_analyzed_at"], 1_700_000_000)
+        self.assertEqual(cache["text"], "今年的故事…")
+
+    async def test_narrative_regenerates_after_a_new_analysis(self) -> None:
+        replies = iter(["第一版", "第二版"])
+        with patch(
+            "wechat_insights.server.get_depth_strategy", return_value=self.strategy
+        ), patch(
+            "wechat_insights.llm.chat",
+            side_effect=lambda system, user: next(replies),
+        ) as fake:
+            first = await (await self.client.get("/api/report?year=2026")).json()
+            # 新一轮分析完成：分析时间戳变了，旧缓存失效，下次请求重新生成。
+            self.store.set_meta("last_analyzed_at", "1700000001")
+            second = await (await self.client.get("/api/report?year=2026")).json()
+        self.assertEqual(fake.call_count, 2)
+        self.assertEqual(
+            (first["narrative"], second["narrative"]), ("第一版", "第二版")
+        )
+        cache = self.store.get_json("report_narrative_2026")
+        self.assertEqual(cache["last_analyzed_at"], 1_700_000_001)
+
+    async def test_narrative_failure_degrades_with_stats_intact(self) -> None:
+        with patch(
+            "wechat_insights.server.get_depth_strategy", return_value=self.strategy
+        ), patch("wechat_insights.llm.chat", return_value=None) as fake:
+            body = await (await self.client.get("/api/report?year=2026")).json()
+        self.assertEqual(fake.call_count, 1)
+        self.assertIsNone(body["narrative"])
+        # 失败只影响叙事：年报统计照常返回。
+        self.assertEqual(body["stats"]["overview"]["messages"], 4)
 
 
 class AuthTests(AioHTTPTestCase):
@@ -273,6 +382,13 @@ class AuthTests(AioHTTPTestCase):
         )
         self.assertEqual(response.status, 200)
         self.assertFalse((await response.json())["progress"]["running"])
+
+    async def test_report_api_requires_a_token(self) -> None:
+        self.assertEqual((await self.client.get("/api/report")).status, 401)
+        response = await self.client.get(
+            "/api/report?year=2026", headers={"Authorization": "Bearer s3cret"}
+        )
+        self.assertEqual(response.status, 200)
 
     async def test_bearer_header_is_accepted(self) -> None:
         response = await self.client.get(

@@ -629,8 +629,12 @@ class LLMDepthRefreshTests(AnalyzerTestCase):
         self.assertEqual(result.llm_scored, 1)
 
     def test_fresh_cache_within_ttl_and_under_message_threshold_skips(self) -> None:
+        # 第一轮必须带 tags：tags 缺失（None）本身就是重评条件，会让第二轮
+        # 合法地再调一次，就测不到「保鲜期内跳过」了。
         build_database(self.database, [them(1, 0), me(2, 60)])
-        self.run_llm_analysis(chat=lambda system, user: '{"score": 50}')
+        self.run_llm_analysis(
+            chat=lambda system, user: '{"score": 50, "tags": ["游戏"]}'
+        )
 
         def unexpected(system: str, user: str) -> str:
             raise AssertionError("保鲜期内且消息增量不足，不该再调用 LLM")
@@ -716,6 +720,106 @@ class LLMDepthRefreshTests(AnalyzerTestCase):
             payload["llm_summary"], "你们最近聊工作与近况，相处轻松自然。"
         )
         self.assertEqual(payload["llm_summary_at"], NOW)
+
+    def test_tags_flow_into_cache_and_payload(self) -> None:
+        rows = []
+        for index in range(1, 21):
+            offset = index * 120
+            rows.append(them(index, offset) if index % 2 else me(index, offset))
+        build_database(self.database, rows)
+        self.seed_messages("friend2", "Bob", {BASE + 5 * 86400: 15})
+
+        def chat(system: str, user: str) -> str:
+            return (
+                '{"score": 72, "summary": "你们最近聊工作与近况。",'
+                ' "tags": ["工作吐槽", "深夜谈心"]}'
+            )
+
+        with patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10):
+            result, _ = self.run_llm_analysis(chat=chat)
+        self.assertEqual(result.llm_scored, 1)
+        row = self.store.get_llm_depth(SESSION_ID)
+        self.assertEqual(row.tags, ["工作吐槽", "深夜谈心"])
+        payload = {
+            p["display_name"]: p for p in self.store.all_scores()
+        }[DISPLAY_NAME]
+        self.assertEqual(payload["llm_tags"], ["工作吐槽", "深夜谈心"])
+
+    def test_empty_tags_stay_an_empty_list_in_cache_and_payload(self) -> None:
+        rows = []
+        for index in range(1, 21):
+            offset = index * 120
+            rows.append(them(index, offset) if index % 2 else me(index, offset))
+        build_database(self.database, rows)
+        self.seed_messages("friend2", "Bob", {BASE + 5 * 86400: 15})
+
+        with patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10):
+            result, _ = self.run_llm_analysis(
+                chat=lambda s, u: '{"score": 55, "tags": []}'
+            )
+        self.assertEqual(result.llm_scored, 1)
+        row = self.store.get_llm_depth(SESSION_ID)
+        self.assertEqual(row.tags, [])
+        payload = {
+            p["display_name"]: p for p in self.store.all_scores()
+        }[DISPLAY_NAME]
+        self.assertEqual(payload["llm_tags"], [])
+
+    def test_missing_or_non_list_tags_are_normalised_to_none(self) -> None:
+        rows = []
+        for index in range(1, 21):
+            offset = index * 120
+            rows.append(them(index, offset) if index % 2 else me(index, offset))
+        build_database(self.database, rows)
+        self.seed_messages("friend2", "Bob", {BASE + 5 * 86400: 15})
+
+        # 缺 tags 字段 / 给了字符串：都归一成 None。None 会触发下一轮重评
+        # 补齐，所以每轮都真的调了 LLM（llm_scored 仍为 1，只是没有标签）。
+        for reply in ('{"score": 55}', '{"score": 55, "tags": "游戏"}'):
+            with patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10):
+                result, _ = self.run_llm_analysis(chat=lambda s, u: reply)
+            self.assertEqual(result.llm_scored, 1)
+        self.assertIsNone(self.store.get_llm_depth(SESSION_ID).tags)
+
+    def test_overlong_and_non_string_tags_are_truncated_to_four(self) -> None:
+        rows = []
+        for index in range(1, 21):
+            offset = index * 120
+            rows.append(them(index, offset) if index % 2 else me(index, offset))
+        build_database(self.database, rows)
+        self.seed_messages("friend2", "Bob", {BASE + 5 * 86400: 15})
+
+        reply = (
+            '{"score": 55, "tags": ["超长标签超过八个字", "游戏", "深夜谈心",'
+            ' "工作吐槽", "电影", 42]}'
+        )
+        with patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10):
+            result, _ = self.run_llm_analysis(chat=lambda s, u: reply)
+        self.assertEqual(result.llm_scored, 1)
+        row = self.store.get_llm_depth(SESSION_ID)
+        # 超长截到 8 字、非字符串丢弃、最多保留 4 个（第 5 个之后的直接不管）。
+        self.assertEqual(
+            row.tags, ["超长标签超过八个", "游戏", "深夜谈心", "工作吐槽"]
+        )
+
+    def test_missing_tags_trigger_rescore_on_the_next_round(self) -> None:
+        # 第一轮模型没给 tags：缓存行 tags=None。第二轮在保鲜期内、消息
+        # 增量不足、异动没变——唯独 tags 缺失触发重评补齐。
+        build_database(self.database, [them(1, 0), me(2, 60)])
+        self.seed_messages("friend2", "Bob", {BASE + 5 * 86400: 15})
+
+        first, _ = self.run_llm_analysis(chat=lambda s, u: '{"score": 50}')
+        self.assertEqual(first.llm_scored, 1)
+        self.assertIsNone(self.store.get_llm_depth(SESSION_ID).tags)
+
+        second, fake = self.run_llm_analysis(
+            now=NOW + 5 * 86400,
+            chat=lambda s, u: '{"score": 50, "tags": ["游戏"]}',
+        )
+        self.assertEqual(second.llm_scored, 1)
+        self.assertEqual(fake.call_count, 1)
+        row = self.store.get_llm_depth(SESSION_ID)
+        self.assertEqual((row.score, row.tags), (50.0, ["游戏"]))
 
     def test_anomaly_fingerprint_change_triggers_rescore(self) -> None:
         # 第一轮：基线窗口 60 条、近期窗口 10 条，日均消息量掉到一半以下，
