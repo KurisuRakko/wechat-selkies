@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import json
 import logging
 import re
 import signal
@@ -19,6 +20,7 @@ from urllib.parse import urlencode
 from aiohttp import web
 
 from .analyzer import Analyzer
+from .classify import KIND_VALUES
 from .constants import (
     ANALYZE_TIME,
     AUTH_COOKIE,
@@ -272,8 +274,9 @@ async def auth_middleware(request: web.Request, handler):
         raise response
     response = await handler(request)
     if from_query:
-        # 非 GET/HEAD（目前只有 POST /api/refresh）没法安全重定向，
-        # 那就照旧在响应里写 cookie，之后同样靠 cookie 带凭证。
+        # 非 GET/HEAD（目前只有 POST /api/refresh 与
+        # POST /api/contact/{hash}/kind）没法安全重定向，那就照旧在响应里
+        # 写 cookie，之后同样靠 cookie 带凭证。
         response.set_cookie(
             AUTH_COOKIE,
             AUTH_TOKEN,
@@ -437,6 +440,70 @@ def create_app(runtime: InsightsRuntime) -> web.Application:
             }
         )
 
+    async def contact_kind(request: web.Request) -> web.Response:
+        """手动改判联系人的关系类型；'auto' = 清除手动、回到自动判定。
+
+        改完立即改写该联系人的 scores payload 里的 relation_kind /
+        kind_source，界面马上有反馈；下一轮分析会按新类型全面重算（事务
+        往来从百分位 cohort 剔除、家人豁免归零与淡出）。改判结果同样只
+        显示在响应里，联系人的 wxid 不出现在任何响应中。
+        """
+
+        value = request.match_info["hash"]
+        if not _HASH_PATTERN.fullmatch(value):
+            raise web.HTTPNotFound(text="not found")
+        row = store.get_contact_by_hash(value)
+        if row is None:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "CONTACT_NOT_FOUND",
+                        "message": "找不到该联系人，可能还没跑过分析",
+                    },
+                },
+                status=404,
+                headers={"Cache-Control": "no-store"},
+            )
+        try:
+            body = json.loads(await request.text())
+        except ValueError:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": {"code": "BAD_REQUEST", "message": "请求体不是合法 JSON"},
+                },
+                status=400,
+                headers={"Cache-Control": "no-store"},
+            )
+        kind = body.get("kind") if isinstance(body, dict) else None
+        if kind not in (*KIND_VALUES, "auto"):
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": {"code": "BAD_REQUEST", "message": "kind 取值非法"},
+                },
+                status=400,
+                headers={"Cache-Control": "no-store"},
+            )
+        if kind == "auto":
+            store.set_contact_kind_manual(row.session_id, "")
+            # 清除手动后回到自动判定；从未判过的自然回落到默认 friend
+            # （row 是 UPDATE 前的快照，手动值不能再算进去）。
+            effective = row.kind_auto or "friend"
+            source = "auto" if row.kind_auto else "default"
+        else:
+            store.set_contact_kind_manual(row.session_id, kind)
+            effective, source = kind, "manual"
+        payload = store.score_by_hash(value)
+        if payload is not None:
+            payload["relation_kind"] = effective
+            payload["kind_source"] = source
+            store.update_score_payload(row.session_id, payload)
+        return no_store(
+            {"ok": True, "relation_kind": effective, "kind_source": source}
+        )
+
     async def progress(_: web.Request) -> web.Response:
         # 快照是整体替换的，事件循环里直接读不需要拷贝。
         return no_store({"ok": True, "progress": runtime.progress})
@@ -466,6 +533,7 @@ def create_app(runtime: InsightsRuntime) -> web.Application:
     app.router.add_get("/api/status", status)
     app.router.add_get("/api/contacts", contacts)
     app.router.add_get("/api/contact/{hash}", contact_detail)
+    app.router.add_post("/api/contact/{hash}/kind", contact_kind)
     app.router.add_get("/api/report", report)
     app.router.add_get("/api/progress", progress)
     app.router.add_post("/api/refresh", refresh)

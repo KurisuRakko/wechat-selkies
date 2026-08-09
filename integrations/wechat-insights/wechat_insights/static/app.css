@@ -673,6 +673,31 @@ body {
   line-height: 14px;
 }
 
+/* 关系类型 badge：家人用次色描边、事务往来用禁用灰；friend 不显示 */
+.chip--family {
+  border-color: var(--md-secondary);
+  color: var(--md-secondary);
+}
+
+.chip--transactional {
+  border-color: var(--md-divider);
+  color: var(--md-on-surface-disabled);
+}
+
+/* 详情页页头副标题行：关系类型 badge + 状态文字一行排 */
+.contact-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.contact-meta > span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* 详情页「关系画像」卡里的标签行 */
 .tag-chips {
   display: flex;

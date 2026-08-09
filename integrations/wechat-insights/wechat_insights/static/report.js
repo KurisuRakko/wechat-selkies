@@ -148,6 +148,13 @@
   function overviewCard(overview) {
     var total = (overview.incoming || 0) + (overview.outgoing || 0);
     var themPct = total ? Math.round(((overview.incoming || 0) / total) * 100) : 0;
+    // 事务往来联系人不进任何榜单，overview 注脚说明排除个数（后端给的是
+    // 数字，直接拼接即可）。
+    var excluded = overview.excluded_transactional || 0;
+    var footnote =
+      excluded > 0
+        ? '<p class="md-caption">已排除 ' + excluded + " 个事务往来联系人</p>"
+        : "";
     return (
       card(
         "这一年",
@@ -158,7 +165,8 @@
             "双向比例",
             "TA " + themPct + "% / 我 " + (100 - themPct) + "%"
           ) +
-          "</div>"
+          "</div>" +
+          footnote
       )
     );
   }

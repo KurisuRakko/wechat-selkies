@@ -103,6 +103,13 @@ def yearly_report(store, year: int, now: int) -> dict:
     previous = store.load_window(previous_start, previous_end)
     contacts = {contact.session_id: contact for contact in store.all_contacts()}
 
+    def is_transactional(session_id: str) -> bool:
+        """事务往来不参与任何榜单：订票、快递这类是目的性沟通，
+        不是「聊得最多的朋友」。"""
+
+        contact = contacts.get(session_id)
+        return contact is not None and contact.relation_kind() == "transactional"
+
     incoming = int(sum(window.get("msgs_them") for window in windows.values()))
     outgoing = int(sum(window.get("msgs_me") for window in windows.values()))
 
@@ -112,7 +119,7 @@ def yearly_report(store, year: int, now: int) -> dict:
         rows = []
         for session_id, metrics in windows.items():
             count = int(key(metrics))
-            if count <= 0:
+            if count <= 0 or is_transactional(session_id):
                 continue
             contact = contacts.get(session_id)
             rows.append(
@@ -139,6 +146,8 @@ def yearly_report(store, year: int, now: int) -> dict:
         first = contact.first_message_at
         if first is None or not year_start_ts <= first < year_end_ts:
             continue
+        if is_transactional(session_id):
+            continue
         window = windows.get(session_id)
         if window is None:
             continue
@@ -160,6 +169,8 @@ def yearly_report(store, year: int, now: int) -> dict:
         previous_total = int(metrics.messages_total())
         if previous_total < REPORT_FADE_MIN_PREVIOUS_MESSAGES:
             continue
+        if is_transactional(session_id):
+            continue
         this_total = int(windows.get(session_id, empty).messages_total())
         if this_total >= previous_total * REPORT_FADE_DROP_RATIO:
             continue
@@ -180,7 +191,11 @@ def yearly_report(store, year: int, now: int) -> dict:
     # 哈哈哈之王：全时段成就，max_laugh_run 跨年累计，与年份无关。
     haha_king = None
     king = max(
-        (contact for contact in contacts.values() if contact.max_laugh_run > 0),
+        (
+            contact
+            for contact in contacts.values()
+            if contact.max_laugh_run > 0 and not is_transactional(contact.session_id)
+        ),
         key=lambda contact: contact.max_laugh_run,
         default=None,
     )
@@ -199,6 +214,12 @@ def yearly_report(store, year: int, now: int) -> dict:
             "contacts": len(windows),
             "incoming": incoming,
             "outgoing": outgoing,
+            # 被排除的事务往来联系人个数，前端注脚用；总量本身保留全部。
+            "excluded_transactional": sum(
+                1
+                for contact in contacts.values()
+                if is_transactional(contact.session_id)
+            ),
         },
         "top": rank(lambda metrics: metrics.messages_total(), REPORT_TOP_LIMIT),
         "night": rank(

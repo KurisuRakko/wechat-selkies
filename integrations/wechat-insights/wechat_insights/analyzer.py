@@ -16,6 +16,7 @@ from wechat_history.reader import HistoryReader, _read_connection
 from wechat_history.sessions import scan_direct_rows
 
 from . import llm
+from .classify import classify_contacts
 from .constants import (
     BACKFILL_BATCH,
     DECAY_HALF_LIFE_DAYS,
@@ -81,6 +82,7 @@ class AnalysisResult:
     messages_read: int = 0
     scored: int = 0
     llm_scored: int = 0
+    classified: int = 0
     per_session: dict[str, int] = field(default_factory=dict)
 
 
@@ -363,6 +365,14 @@ class Analyzer:
                     result.llm_scored = self._refresh_llm_depth(reader, moment)
                 except Exception:
                     LOG.exception("LLM 深度打分失败，本轮跳过")
+                # 关系类型分类同样要用 reader 读全时段样本；分类失败只影响
+                # 本轮判定，下一轮再试，不拖垮打分。
+                try:
+                    result.classified = classify_contacts(
+                        self.store, reader, self.gap_seconds, self._report
+                    )
+                except Exception:
+                    LOG.exception("关系类型分类失败，本轮跳过")
         finally:
             reader.close()
 
@@ -661,6 +671,60 @@ class Analyzer:
             longest = max(longest, day_span(score_start, stats.first_day) - 1)
         return longest
 
+    @staticmethod
+    def _kind_source(contact: ContactRow) -> str:
+        """关系类型来源：手动改判 > 自动判定 > 默认（未判定）。"""
+
+        if contact.kind_manual:
+            return "manual"
+        if contact.kind_auto:
+            return "auto"
+        return "default"
+
+    @staticmethod
+    def _unscored_payload(
+        contact: ContactRow,
+        stats: WindowStats | None,
+        recent_windows: dict[str, Metrics],
+        empty: Metrics,
+        kind: str,
+        kind_source: str,
+        sample_note: str,
+        zeroed: bool = False,
+    ) -> dict[str, object]:
+        """未打分分支的公共 payload：事务往来 / 家人零消息 / 普通归零。
+
+        zeroed 只在普通归零时为真：整体 0 分、七维全 0。事务往来与家人零
+        消息是「不打分」（None），与「归零」是两回事，前端展示也不同。
+        """
+
+        payload = {
+            "hash": contact.hash,
+            "display_name": contact.display_name,
+            "scored": False,
+            "overall": 0.0 if zeroed else None,
+            "dimensions": (
+                {name: 0.0 for name in DIMENSION_NAMES}
+                if zeroed
+                else {name: None for name in DIMENSION_NAMES}
+            ),
+            "trends": None,
+            "recent_messages": recent_windows.get(
+                contact.session_id, empty
+            ).messages_total(),
+            "window_messages": (
+                stats.raw.messages_total() if stats is not None else 0
+            ),
+            "last_message_at": contact.last_message_at,
+            "sample_note": sample_note,
+            "anomalies": [],
+            "relation_kind": kind,
+            "kind_source": kind_source,
+        }
+        if zeroed:
+            payload["zeroed"] = True
+        return payload
+
     def _recompute(self, moment: int) -> int:
         """重算所有联系人的七维分、趋势与异动，整体替换 scores 表。"""
 
@@ -681,10 +745,13 @@ class Analyzer:
         }
 
         # 门槛只看未加权的原始消息数：衰减是「远记忆变淡」，不是「远消息作废」。
+        # 事务往来整体剔除：不打分、不进百分位 cohort——订票、快递这类目的性
+        # 沟通的消息量会污染参照系，把正常朋友的相对分压扁。
         eligible = sorted(
             session_id
             for session_id, stats in score_stats.items()
             if stats.raw.messages_total() >= MIN_SCORE_MESSAGES
+            and contacts_by_id[session_id].relation_kind() != "transactional"
         )
 
         empty = Metrics()
@@ -742,26 +809,33 @@ class Analyzer:
         payloads: list[tuple[str, dict[str, object]]] = []
         for contact in contacts_by_id.values():
             session_id = contact.session_id
+            kind = contact.relation_kind()
+            kind_source = self._kind_source(contact)
             stats = score_stats.get(session_id)
+            if kind == "transactional":
+                # 事务往来不参与打分、不进百分位 cohort：目的性沟通的消息量
+                # 会污染参照系。不归零、不记温度历史、不进「正在淡出」。
+                payload = self._unscored_payload(
+                    contact, stats, recent_windows, empty, kind, kind_source,
+                    "事务往来，不参与打分",
+                )
+                payloads.append((session_id, payload))
+                continue
             if stats is None or stats.raw.messages_total() <= 0:
-                # 打分窗口里一条消息都没有（或根本没有天桶）：两年内没有往来，
-                # 全部归零；有消息但不够门槛的仍走下面的「数据不足」。
-                payload: dict[str, object] = {
-                    "hash": contact.hash,
-                    "display_name": contact.display_name,
-                    "scored": False,
-                    "zeroed": True,
-                    "overall": 0,
-                    "dimensions": {name: 0.0 for name in DIMENSION_NAMES},
-                    "trends": None,
-                    "recent_messages": recent_windows.get(
-                        session_id, empty
-                    ).messages_total(),
-                    "window_messages": 0,
-                    "last_message_at": contact.last_message_at,
-                    "sample_note": "两年内没有往来",
-                    "anomalies": [],
-                }
+                if kind == "family":
+                    # 家人久不聊天不代表疏远：窗口内零消息不归零、不记 0 分
+                    # 历史，只标注原因；有数据时照常打分记历史。
+                    payload = self._unscored_payload(
+                        contact, stats, recent_windows, empty, kind, kind_source,
+                        "家人，久未聊天不代表疏远",
+                    )
+                else:
+                    # 打分窗口里一条消息都没有（或根本没有天桶）：两年内没有往来，
+                    # 全部归零；有消息但不够门槛的仍走下面的「数据不足」。
+                    payload = self._unscored_payload(
+                        contact, stats, recent_windows, empty, kind, kind_source,
+                        "两年内没有往来", zeroed=True,
+                    )
                 payloads.append((session_id, payload))
                 continue
             scored = session_id in scores
@@ -811,6 +885,9 @@ class Analyzer:
                 "last_message_at": contact.last_message_at,
                 "sample_note": "" if scored else "数据不足",
                 "anomalies": anomalies,
+                # 关系类型与来源：前端 badge 与「事务往来/家人」差异化展示用。
+                "relation_kind": kind,
+                "kind_source": kind_source,
             }
             if scored and self.strategy.name == "llm":
                 # 画像、话题标签与异动解释只在详情页展示；归零/数据不足不发，
@@ -860,6 +937,9 @@ class Analyzer:
         fading = []
         for session_id, payload in payloads:
             if not payload["scored"]:
+                continue
+            if payload["relation_kind"] == "family":
+                # 家人久不聊天不代表疏远，「正在淡出」只针对朋友关系。
                 continue
             gap_days = raw_score[session_id]["current_gap_days"]
             if gap_days is None or gap_days < FADE_MIN_GAP_DAYS:

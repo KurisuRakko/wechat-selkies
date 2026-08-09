@@ -345,6 +345,81 @@ class ScoreHistoryTests(StoreTestCase):
         self.assertEqual(self.store.load_score_history("friend"), [])
 
 
+class ContactKindTests(StoreTestCase):
+    """关系类型两列：幂等补列迁移、relation_kind 优先级、手动/自动读写。"""
+
+    def test_kind_columns_migrate_in_place_idempotently(self) -> None:
+        # 模拟生产旧库（没有两列）：_initialize 幂等补列、旧行保留。
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        path = Path(temporary.name) / "metrics.db"
+        seed = MetricsStore(path)
+        seed.ensure_contact("friend", "Alice")
+        seed.close()
+        with sqlite3.connect(path) as connection:
+            connection.execute("ALTER TABLE contacts DROP COLUMN kind_auto")
+            connection.execute("ALTER TABLE contacts DROP COLUMN kind_manual")
+
+        store = MetricsStore(path)
+        self.addCleanup(store.close)
+        columns = {
+            row[1] for row in store.connection.execute("PRAGMA table_info(contacts)")
+        }
+        self.assertLessEqual({"kind_auto", "kind_manual"}, columns)
+        # 旧联系人读回两个空串：未判定的按默认 friend 处理。
+        row = store.get_contact("friend")
+        self.assertEqual((row.kind_auto, row.kind_manual), ("", ""))
+        self.assertEqual(row.relation_kind(), "friend")
+        # 再初始化一次仍然幂等（列已存在，ALTER 静默跳过）。
+        store.close()
+        reopened = MetricsStore(path)
+        self.addCleanup(reopened.close)
+        self.assertIn(
+            "kind_auto",
+            {r[1] for r in reopened.connection.execute("PRAGMA table_info(contacts)")},
+        )
+
+    def test_save_contact_round_trips_the_kind_columns(self) -> None:
+        contact = self.store.ensure_contact("friend", "Alice")
+        contact.kind_auto = "family"
+        contact.kind_manual = "transactional"
+        self.store.save_contact(contact)
+        stored = self.store.get_contact("friend")
+        self.assertEqual(
+            (stored.kind_auto, stored.kind_manual), ("family", "transactional")
+        )
+
+    def test_relation_kind_prefers_manual_then_auto_then_default(self) -> None:
+        self.store.ensure_contact("friend", "Alice")
+        self.assertEqual(self.store.get_contact("friend").relation_kind(), "friend")
+        self.store.set_contact_kind_auto("friend", "family")
+        self.assertEqual(self.store.get_contact("friend").relation_kind(), "family")
+        self.store.set_contact_kind_manual("friend", "transactional")
+        self.assertEqual(
+            self.store.get_contact("friend").relation_kind(), "transactional"
+        )
+        # 清除手动：回到自动判定结果；手动操作不碰 kind_auto 本身。
+        self.store.set_contact_kind_manual("friend", "")
+        self.assertEqual(self.store.get_contact("friend").relation_kind(), "family")
+        self.assertEqual(self.store.get_contact("friend").kind_auto, "family")
+
+    def test_update_score_payload_overwrites_only_the_given_row(self) -> None:
+        self.store.save_scores(
+            [
+                ("a", {"hash": "a" * 24, "display_name": "A"}),
+                ("b", {"hash": "b" * 24, "display_name": "B"}),
+            ]
+        )
+        payload = self.store.score_by_hash("a" * 24)
+        payload["relation_kind"] = "transactional"
+        self.store.update_score_payload("a", payload)
+        self.assertEqual(
+            self.store.score_by_hash("a" * 24)["relation_kind"], "transactional"
+        )
+        # 其他行原样保留。
+        self.assertNotIn("relation_kind", self.store.score_by_hash("b" * 24))
+
+
 class SchemaMigrationTests(unittest.TestCase):
     def test_stale_schema_is_rebuilt_from_scratch(self) -> None:
         # 模拟旧版本 metrics.db：contacts 没有 cursor_shard 列。

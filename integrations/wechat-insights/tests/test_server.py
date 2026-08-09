@@ -196,6 +196,79 @@ class ApiTests(AioHTTPTestCase):
     async def test_malformed_hash_is_rejected(self) -> None:
         self.assertEqual((await self.client.get("/api/contact/nope")).status, 404)
 
+    async def test_contact_kind_override_updates_row_and_payload(self) -> None:
+        response = await self.client.post(
+            f"/api/contact/{HASH}/kind", json={"kind": "transactional"}
+        )
+        self.assertEqual(response.status, 200)
+        body = await response.json()
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["relation_kind"], "transactional")
+        self.assertEqual(body["kind_source"], "manual")
+        # 联系人行落库手动类型。
+        self.assertEqual(
+            self.store.get_contact(SESSION_ID).kind_manual, "transactional"
+        )
+        # scores payload 就地改写：列表页与详情页马上能看到新类型，不用等
+        # 下一轮分析（下一轮会完全重算，这里的改写只是即时反馈）。
+        stored = self.store.score_by_hash(HASH)
+        self.assertEqual(stored["relation_kind"], "transactional")
+        self.assertEqual(stored["kind_source"], "manual")
+        # 只改这一个联系人，不碰其他行。
+        self.assertEqual(len(self.store.all_scores()), 1)
+
+    async def test_contact_kind_auto_clears_the_manual_override(self) -> None:
+        self.store.set_contact_kind_auto(SESSION_ID, "family")
+        self.store.set_contact_kind_manual(SESSION_ID, "transactional")
+        response = await self.client.post(
+            f"/api/contact/{HASH}/kind", json={"kind": "auto"}
+        )
+        self.assertEqual(response.status, 200)
+        body = await response.json()
+        # 清除手动后回到自动判定结果（没有自动判定时落默认 friend）。
+        self.assertEqual(body["relation_kind"], "family")
+        self.assertEqual(body["kind_source"], "auto")
+        self.assertEqual(self.store.get_contact(SESSION_ID).kind_manual, "")
+        stored = self.store.score_by_hash(HASH)
+        self.assertEqual(
+            (stored["relation_kind"], stored["kind_source"]), ("family", "auto")
+        )
+
+    async def test_contact_kind_auto_falls_back_to_friend_when_never_judged(self) -> None:
+        response = await self.client.post(
+            f"/api/contact/{HASH}/kind", json={"kind": "auto"}
+        )
+        self.assertEqual(response.status, 200)
+        body = await response.json()
+        self.assertEqual(body["relation_kind"], "friend")
+        self.assertEqual(body["kind_source"], "default")
+        self.assertEqual(self.store.get_contact(SESSION_ID).kind_manual, "")
+
+    async def test_contact_kind_rejects_invalid_values(self) -> None:
+        for bad in ("boss", "FRIEND", "", 42, None):
+            response = await self.client.post(
+                f"/api/contact/{HASH}/kind", json={"kind": bad}
+            )
+            self.assertEqual(response.status, 400)
+            body = await response.json()
+            self.assertEqual(body["error"]["code"], "BAD_REQUEST")
+        # 手动改判只接受 JSON body。
+        self.assertEqual(
+            (await self.client.post(f"/api/contact/{HASH}/kind")).status, 400
+        )
+
+    async def test_contact_kind_requires_an_existing_contact(self) -> None:
+        response = await self.client.post(
+            f"/api/contact/{'0' * 24}/kind", json={"kind": "family"}
+        )
+        self.assertEqual(response.status, 404)
+        body = await response.json()
+        self.assertEqual(body["error"]["code"], "CONTACT_NOT_FOUND")
+        self.assertEqual(
+            (await self.client.post("/api/contact/nope/kind", json={"kind": "family"})).status,
+            404,
+        )
+
     async def test_progress_reports_idle_state_by_default(self) -> None:
         body = await (await self.client.get("/api/progress")).json()
         self.assertTrue(body["ok"])
@@ -262,7 +335,13 @@ class ApiTests(AioHTTPTestCase):
         self.assertGreaterEqual(stats["window"]["end"], "2026-03-10")
         self.assertEqual(
             stats["overview"],
-            {"messages": 4, "contacts": 1, "incoming": 4, "outgoing": 0},
+            {
+                "messages": 4,
+                "contacts": 1,
+                "incoming": 4,
+                "outgoing": 0,
+                "excluded_transactional": 0,
+            },
         )
         self.assertEqual(stats["top"][0]["display_name"], "Alice")
         self.assertEqual(stats["top"][0]["messages"], 4)
@@ -361,6 +440,8 @@ class AuthTests(AioHTTPTestCase):
         self.store = MetricsStore(Path(self.temporary.name) / "metrics.db")
         self.addCleanup(self.store.close)
         self.store.set_meta("last_analyzed_at", "1700000000")
+        # 关系类型改判要改库，AuthTests 里备一个联系人供带 token 的请求用。
+        self.store.ensure_contact(SESSION_ID, "Alice")
         self.runtime = InsightsRuntime(self.store, analyzer_factory=lambda: None)
         patcher = patch("wechat_insights.server.AUTH_TOKEN", "s3cret")
         patcher.start()
@@ -435,6 +516,19 @@ class AuthTests(AioHTTPTestCase):
             response = await self.client.post("/api/refresh?token=s3cret")
         self.assertEqual(response.status, 202)
         self.assertIn("wechat_insights_token", response.cookies)
+
+    async def test_kind_override_requires_a_token(self) -> None:
+        response = await self.client.post(
+            f"/api/contact/{HASH}/kind", json={"kind": "family"}
+        )
+        self.assertEqual(response.status, 401)
+        response = await self.client.post(
+            f"/api/contact/{HASH}/kind",
+            json={"kind": "family"},
+            headers={"Authorization": "Bearer s3cret"},
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(self.store.get_contact(SESSION_ID).kind_manual, "family")
 
     async def test_unknown_paths_require_auth_too(self) -> None:
         # 404 响应同样要过鉴权，不能成为未授权探测的信息源。

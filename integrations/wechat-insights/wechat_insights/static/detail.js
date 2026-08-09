@@ -134,6 +134,71 @@
     return card("关系画像", body, subtitle);
   }
 
+  /** 「关系类型」小卡：手动改判控件，改动立即 POST 并重载页面。 */
+  function kindCard(contact) {
+    var current = contact.relation_kind || "friend";
+    var source = contact.kind_source || "default";
+    var currentLabel = I.KIND_RELATION_LABELS[current] || "朋友";
+    // 手动改判过的联系人不显示自动判定结果（前端看不到底下的 kind_auto）。
+    var autoLabel =
+      source === "manual" ? "自动判定" : "自动判定（" + currentLabel + "）";
+    var options = [
+      { value: "auto", label: autoLabel },
+      { value: "friend", label: "朋友" },
+      { value: "family", label: "家人" },
+      { value: "transactional", label: "事务往来" }
+    ];
+    // 手动改判过的选中对应类型，其余选中「自动判定」。
+    var selected = source === "manual" ? current : "auto";
+    return (
+      card(
+        "关系类型",
+        '<span class="select">' +
+          '<select class="kind-picker__select" aria-label="关系类型">' +
+          options
+            .map(function (option) {
+              return (
+                '<option value="' +
+                option.value +
+                '"' +
+                (option.value === selected ? " selected" : "") +
+                ">" +
+                I.escapeHtml(option.label) +
+                "</option>"
+              );
+            })
+            .join("") +
+          "</select>" +
+          "</span>" +
+          '<p class="md-caption">手动改判立即生效，下一轮分析会按新类型全面重算：' +
+          "事务往来不参与打分，家人不会被判淡出。</p>",
+        "影响打分与年报"
+      )
+    );
+  }
+
+  /** 手动改判关系类型：POST 后重载页面（服务端已改写该联系人的 payload）。 */
+  async function changeKind(kind) {
+    var result;
+    try {
+      result = await I.apiPost(
+        "/api/contact/" + encodeURIComponent(readHash()) + "/kind",
+        { kind: kind }
+      );
+    } catch (err) {
+      I.snackbar(err.message || "改判失败");
+      return;
+    }
+    var data = result.data || {};
+    if (result.status !== 200 || !data.ok) {
+      var info = data.error || {};
+      I.snackbar(info.message || "改判失败");
+      return;
+    }
+    I.snackbar("已更新关系类型");
+    global.location.reload();
+  }
+
   function render(payload) {
     var contact = payload.contact || {};
     var monthly = payload.monthly || [];
@@ -142,13 +207,21 @@
 
     els.name.textContent = contact.display_name || "联系人详情";
     document.title = (contact.display_name || "联系人详情") + " · 关系洞察";
-    els.meta.textContent = contact.scored
+    // 页头副标题一行排：关系类型 badge + 状态文字（文本来自后端，逐个转义）。
+    var metaText = contact.scored
       ? "综合分 " +
         I.formatNumber(contact.overall, 1) +
         " · 近 30 天 " +
         (contact.recent_messages || 0) +
         " 条"
       : contact.sample_note || "数据不足";
+    els.meta.innerHTML =
+      '<span class="contact-meta">' +
+      I.kindBadgeHtml(contact.relation_kind) +
+      "<span>" +
+      I.escapeHtml(metaText) +
+      "</span>" +
+      "</span>";
 
     var radarBody = contact.scored
       ? '<div class="chart chart--tall" id="radar-chart"></div>'
@@ -185,6 +258,7 @@
             "每天记录一次综合分 · 自 " + history[0].day + " 起"
           )
         : "") +
+      kindCard(contact) +
       card("七维画像", radarBody, contact.scored ? "与全联系人中位数对比" : "") +
       // 画像与标签由大模型生成，文本不可信，必须整体 escapeHtml。
       portraitCard(contact) +
@@ -197,6 +271,13 @@
         anomaliesHtml(payload.anomalies || [], contact.anomaly_note)
       ) +
       "</div>";
+
+    var picker = els.content.querySelector(".kind-picker__select");
+    if (picker) {
+      picker.addEventListener("change", function () {
+        changeKind(picker.value);
+      });
+    }
 
     if (history.length >= 2) {
       I.mountChart(document.getElementById("temp-chart"), tempOption(history));

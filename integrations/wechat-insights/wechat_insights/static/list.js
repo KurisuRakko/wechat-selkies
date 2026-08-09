@@ -44,6 +44,7 @@
   var PROGRESS_LABELS = {
     sync: "同步聊天记录",
     llm: "AI 分析",
+    classify: "关系分类",
     score: "重算打分"
   };
 
@@ -282,7 +283,8 @@
   }
 
   /* ------------------------------------------------------------------ *
-   * 排序：有分的 > 数据不足 > 归零（未打分的都沉底，归零沉到最深）
+   * 排序：有分的 > 数据不足 > 归零 > 事务往来
+   * （未打分的都沉底、归零沉到最深；事务往来不参与打分，沉到最底）
    * ------------------------------------------------------------------ */
 
   var SORT_KEYS = {
@@ -298,6 +300,9 @@
   };
 
   function itemTier(item) {
+    if (item.relation_kind === "transactional") {
+      return -1;
+    }
     if (item.scored) {
       return 2;
     }
@@ -573,6 +578,7 @@
       '<span class="contact-card__name">' +
       I.escapeHtml(item.display_name) +
       "</span>" +
+      I.kindBadgeHtml(item.relation_kind) +
       anomalyBadgeHtml(item) +
       "</span>" +
       cardTagsHtml(item.llm_tags) +
@@ -584,7 +590,14 @@
       (item.scored || item.zeroed ? ringSvg(item.overall) : "") +
       "</div>";
 
-    if (item.zeroed) {
+    if (item.relation_kind === "transactional") {
+      // 事务往来不参与打分：不显示圆环与雷达，正文一行说明即可。
+      card.innerHTML =
+        head +
+        '<div class="insufficient">' +
+        '<div class="insufficient__title">事务往来，不参与打分</div>' +
+        "</div>";
+    } else if (item.zeroed) {
       card.innerHTML =
         head +
         '<div class="insufficient">' +

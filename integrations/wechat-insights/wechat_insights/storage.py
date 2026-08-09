@@ -39,6 +39,10 @@ _ROW_COLUMNS = METRIC_COLUMNS + HISTOGRAM_COLUMNS
 #: llm_depth 在 CREATE TABLE 之外的幂等补列清单（见 _initialize）。
 _LLM_DEPTH_EXTRA_COLUMNS = ("summary", "anomaly_note", "anomalies_key", "tags")
 
+#: contacts 在 CREATE TABLE 之外的幂等补列清单（见 _initialize）。
+#: contacts 里存着游标与里程碑，生产库上补列只能 ALTER，绝不能重建回填。
+_CONTACT_KIND_EXTRA_COLUMNS = ("kind_auto", "kind_manual")
+
 #: get_llm_depth / all_llm_depth 的共享列清单，两处查询保持一致。
 _LLM_DEPTH_COLUMNS = (
     "score, scored_at, total_messages, summary, anomaly_note, anomalies_key, tags"
@@ -67,7 +71,12 @@ CREATE TABLE IF NOT EXISTS contacts (
     latest_night_at          INTEGER,
     -- 凌晨窗口内距 00:00 的秒数，-1 表示还没有凌晨消息。
     latest_night_offset      INTEGER NOT NULL DEFAULT -1,
-    max_laugh_run            INTEGER NOT NULL DEFAULT 0
+    max_laugh_run            INTEGER NOT NULL DEFAULT 0,
+    -- LLM 自动判定的关系类型：'' = 尚未判定，'friend'/'family'/'transactional'。
+    -- 分类是稳定属性，写过就不再重评；手动改判随时可以覆盖它。
+    kind_auto                TEXT NOT NULL DEFAULT '',
+    -- 用户手动改判的关系类型：'' = 未设置（沿用自动判定或默认 friend）。
+    kind_manual              TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS stats_daily (
@@ -137,10 +146,21 @@ class ContactRow:
     latest_night_at: int | None
     latest_night_offset: int
     max_laugh_run: int
+    kind_auto: str
+    kind_manual: str
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> ContactRow:
         return cls(**{key: row[key] for key in cls.__slots__})
+
+    def relation_kind(self) -> str:
+        """当前生效的关系类型：手动改判优先，其次自动判定，都空默认 friend。
+
+        合法值是 'friend'/'family'/'transactional'；默认 friend 保证任何旧
+        数据按原样处理——升级前的关系在升级后依然是普通朋友。
+        """
+
+        return self.kind_manual or self.kind_auto or "friend"
 
     def milestones(self) -> dict[str, object]:
         """详情页里程碑卡片用的字段。"""
@@ -240,6 +260,16 @@ class MetricsStore:
                 try:
                     setup.execute(
                         f"ALTER TABLE llm_depth ADD COLUMN {column} "
+                        "TEXT NOT NULL DEFAULT ''"
+                    )
+                except sqlite3.OperationalError:
+                    pass  # 列已存在（新形状的库）
+            # contacts 存着游标与里程碑，同样不能重建：幂等补列，旧行直接
+            # 读回两个空串，未判定的联系人按默认 friend 处理，升级后一切照旧。
+            for column in _CONTACT_KIND_EXTRA_COLUMNS:
+                try:
+                    setup.execute(
+                        f"ALTER TABLE contacts ADD COLUMN {column} "
                         "TEXT NOT NULL DEFAULT ''"
                     )
                 except sqlite3.OperationalError:
@@ -353,7 +383,8 @@ class MetricsStore:
                 cursor_shard = ?,
                 first_message_at = ?, last_message_at = ?, total_messages = ?,
                 longest_silence_seconds = ?, longest_silence_ended_at = ?,
-                latest_night_at = ?, latest_night_offset = ?, max_laugh_run = ?
+                latest_night_at = ?, latest_night_offset = ?, max_laugh_run = ?,
+                kind_auto = ?, kind_manual = ?
             WHERE session_id = ?
             """,
             (
@@ -369,9 +400,32 @@ class MetricsStore:
                 contact.latest_night_at,
                 contact.latest_night_offset,
                 contact.max_laugh_run,
+                contact.kind_auto,
+                contact.kind_manual,
                 contact.session_id,
             ),
         )
+
+    def set_contact_kind_manual(self, session_id: str, kind: str) -> None:
+        """设置或清除手动关系类型（'' = 清除、回到自动判定）。
+
+        只改这一列，kind_auto 原样保留——清除手动后自动判定结果立即恢复。
+        """
+
+        with self.connection as connection:
+            connection.execute(
+                "UPDATE contacts SET kind_manual = ? WHERE session_id = ?",
+                (kind, session_id),
+            )
+
+    def set_contact_kind_auto(self, session_id: str, kind: str) -> None:
+        """写入自动判定的关系类型；分类只判一次，写入后不再重评。"""
+
+        with self.connection as connection:
+            connection.execute(
+                "UPDATE contacts SET kind_auto = ? WHERE session_id = ?",
+                (kind, session_id),
+            )
 
     # —— llm_depth ——
 
@@ -613,6 +667,26 @@ class MetricsStore:
             "SELECT payload FROM scores WHERE hash = ?", (value,)
         ).fetchone()
         return None if row is None else json.loads(row["payload"])
+
+    def update_score_payload(
+        self, session_id: str, payload: dict[str, object]
+    ) -> None:
+        """改写单个联系人的预计算 payload（UPSERT），不动其他行。
+
+        手动改判等小修用：save_scores 是整体替换，为改一个字段重写全表
+        不划算。
+        """
+
+        with self.connection as connection:
+            connection.execute(
+                "INSERT INTO scores (session_id, hash, payload) VALUES (?, ?, ?) "
+                "ON CONFLICT(session_id) DO UPDATE SET payload = excluded.payload",
+                (
+                    session_id,
+                    str(payload["hash"]),
+                    json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                ),
+            )
 
     # —— score_history ——
 

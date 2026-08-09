@@ -34,71 +34,72 @@ def bucket(**counts: int) -> Metrics:
 NOW = int(datetime(2026, 8, 15, 12, 0).timestamp())
 
 
+def _seed_report_data(store: MetricsStore) -> None:
+    """两个年度的固定数据（YearlyReportTests 与事务排除测试共用）：
+
+    - 老友：2025 年 200 条、2026 年 5 条 → 淡出；
+    - 常青：2025 年 300 条、2026 年 30 条（恰好 10%，不淡出）；
+    - 话痨 / 夜猫 / 周末搭子 / 新朋友 / 哈哈怪：只在 2026 年有数据。
+    """
+    for session_id, name in (
+        ("old_friend", "老友"),
+        ("steady", "常青"),
+        ("active", "话痨"),
+        ("night_owl", "夜猫"),
+        ("weekend_pal", "周末搭子"),
+        ("new_pal", "新朋友"),
+        ("king", "哈哈怪"),
+    ):
+        store.ensure_contact(session_id, name)
+
+    store.merge_daily(
+        "old_friend",
+        {"2025-06-01": bucket(msgs_them=100, msgs_me=100)},
+    )
+    store.merge_daily("old_friend", {"2026-06-01": bucket(msgs_me=5)})
+    store.merge_daily(
+        "steady",
+        {"2025-06-01": bucket(msgs_them=150, msgs_me=150)},
+    )
+    store.merge_daily(
+        "steady", {"2026-06-01": bucket(msgs_them=15, msgs_me=15)}
+    )
+    store.merge_daily(
+        "active", {"2026-06-10": bucket(msgs_them=300, msgs_me=200)}
+    )
+    store.merge_daily(
+        "night_owl",
+        {
+            "2026-06-11": bucket(
+                msgs_them=10, msgs_me=2, night_msgs_them=8, night_msgs_me=2
+            )
+        },
+    )
+    store.merge_daily(
+        "weekend_pal",
+        {"2026-06-13": bucket(msgs_them=2, msgs_me=2, weekend_msgs_them=6)},
+    )
+    store.merge_daily(
+        "new_pal", {"2026-07-01": bucket(msgs_them=3, msgs_me=3)}
+    )
+    store.merge_daily("king", {"2026-06-20": bucket(msgs_them=1, msgs_me=1)})
+
+    # 里程碑字段：新朋友的第一条消息落在 2026 年内；哈哈怪的全时段连击。
+    new_pal = store.get_contact("new_pal")
+    new_pal.first_message_at = int(datetime(2026, 6, 15).timestamp())
+    store.save_contact(new_pal)
+    king = store.get_contact("king")
+    king.max_laugh_run = 23
+    store.save_contact(king)
+
+
 class YearlyReportTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.store = MetricsStore(Path(self.temporary.name) / "metrics.db")
         self.addCleanup(self.store.close)
-        self._seed()
-
-    def _seed(self) -> None:
-        """两个年度的固定数据：
-
-        - 老友：2025 年 200 条、2026 年 5 条 → 淡出；
-        - 常青：2025 年 300 条、2026 年 30 条（恰好 10%，不淡出）；
-        - 话痨 / 夜猫 / 周末搭子 / 新朋友 / 哈哈怪：只在 2026 年有数据。
-        """
-        for session_id, name in (
-            ("old_friend", "老友"),
-            ("steady", "常青"),
-            ("active", "话痨"),
-            ("night_owl", "夜猫"),
-            ("weekend_pal", "周末搭子"),
-            ("new_pal", "新朋友"),
-            ("king", "哈哈怪"),
-        ):
-            self.store.ensure_contact(session_id, name)
-
-        self.store.merge_daily(
-            "old_friend",
-            {"2025-06-01": bucket(msgs_them=100, msgs_me=100)},
-        )
-        self.store.merge_daily("old_friend", {"2026-06-01": bucket(msgs_me=5)})
-        self.store.merge_daily(
-            "steady",
-            {"2025-06-01": bucket(msgs_them=150, msgs_me=150)},
-        )
-        self.store.merge_daily(
-            "steady", {"2026-06-01": bucket(msgs_them=15, msgs_me=15)}
-        )
-        self.store.merge_daily(
-            "active", {"2026-06-10": bucket(msgs_them=300, msgs_me=200)}
-        )
-        self.store.merge_daily(
-            "night_owl",
-            {
-                "2026-06-11": bucket(
-                    msgs_them=10, msgs_me=2, night_msgs_them=8, night_msgs_me=2
-                )
-            },
-        )
-        self.store.merge_daily(
-            "weekend_pal",
-            {"2026-06-13": bucket(msgs_them=2, msgs_me=2, weekend_msgs_them=6)},
-        )
-        self.store.merge_daily(
-            "new_pal", {"2026-07-01": bucket(msgs_them=3, msgs_me=3)}
-        )
-        self.store.merge_daily("king", {"2026-06-20": bucket(msgs_them=1, msgs_me=1)})
-
-        # 里程碑字段：新朋友的第一条消息落在 2026 年内；哈哈怪的全时段连击。
-        new_pal = self.store.get_contact("new_pal")
-        new_pal.first_message_at = int(datetime(2026, 6, 15).timestamp())
-        self.store.save_contact(new_pal)
-        king = self.store.get_contact("king")
-        king.max_laugh_run = 23
-        self.store.save_contact(king)
+        _seed_report_data(self.store)
 
     def report(self) -> dict:
         return yearly_report(self.store, 2026, NOW)
@@ -174,6 +175,54 @@ class YearlyReportTests(unittest.TestCase):
         )
         self.assertEqual(len(report["monthly"]), 12)
         self.assertEqual(report["monthly"][0]["count"], 0)
+
+
+class TransactionalExclusionTests(unittest.TestCase):
+    """事务往来联系人：不进任何榜单；overview 保留总量并给出排除个数。"""
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.store = MetricsStore(Path(self.temporary.name) / "metrics.db")
+        self.addCleanup(self.store.close)
+        _seed_report_data(self.store)
+        # 话痨（500 条，本应是 top/深夜/周末/哈哈王）标成事务往来；再补上
+        # 2026 年内的首条时间与全时段连击，让它也是新朋友/哈哈王候选——
+        # 排除与否在各榜上都可分辨。
+        self.store.set_contact_kind_manual("active", "transactional")
+        active = self.store.get_contact("active")
+        active.first_message_at = int(datetime(2026, 6, 10).timestamp())
+        active.max_laugh_run = 30
+        self.store.save_contact(active)
+
+    def report(self) -> dict:
+        return yearly_report(self.store, 2026, NOW)
+
+    def test_transactional_contact_vanishes_from_every_ranking(self) -> None:
+        report = self.report()
+        for section in ("top", "night", "weekend", "new_friends", "faded"):
+            self.assertNotIn(
+                "话痨", [row["display_name"] for row in report[section]]
+            )
+        self.assertEqual(report["haha_king"]["display_name"], "哈哈怪")
+        # 朋友照常上榜：排除机制不是把所有联系人都拦下来。周末搭子 4 条
+        # 在榜尾，把 2 条的哈哈怪挤到第六——人数不满 5 才会被顶上。
+        self.assertEqual(
+            [row["display_name"] for row in report["top"]],
+            ["常青", "夜猫", "新朋友", "老友", "周末搭子"],
+        )
+        # overview 保留全部消息与联系人（口径与榜单不同），只标注排除个数。
+        self.assertEqual(report["overview"]["messages"], 559)
+        self.assertEqual(report["overview"]["contacts"], 7)
+        self.assertEqual(report["overview"]["excluded_transactional"], 1)
+
+    def test_family_contacts_still_participate_in_the_rankings(self) -> None:
+        # 家人和默认 friend 一样正常参与：夜猫（家人）照常进深夜榜。
+        self.store.set_contact_kind_auto("night_owl", "family")
+        report = self.report()
+        self.assertEqual(
+            [row["display_name"] for row in report["night"]], ["夜猫"]
+        )
 
 
 class NarrativeTests(unittest.TestCase):

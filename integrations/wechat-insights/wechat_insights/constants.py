@@ -114,6 +114,13 @@ LLM_MAX_CALLS_PER_RUN = _int_env("INSIGHTS_LLM_MAX_CALLS_PER_RUN", 40, 1, 1000)
 # 一次采样最多送多少字的聊天文本（越长越贵；达到即停，不足就送全部）。
 LLM_SAMPLE_MAX_CHARS = _int_env("INSIGHTS_LLM_SAMPLE_MAX_CHARS", 4000, 500, 20000)
 
+# —— 关系类型分类（仅 llm 策略）——
+# 单轮分析最多给多少个新联系人做关系类型判定：候选按消息量降序（事务号
+# 往往消息多、污染最重，优先处理），超出部分下一轮再判。
+CLASSIFY_MAX_PER_RUN = _int_env("INSIGHTS_CLASSIFY_MAX_PER_RUN", 20, 1, 500)
+# 一次判定采样最多送出的总字数（三段全时段样本合计，达到即停）。
+CLASSIFY_SAMPLE_CHARS = _int_env("INSIGHTS_CLASSIFY_SAMPLE_CHARS", 2000, 500, 10000)
+
 # —— 增量读取 ——
 # 单批读取的消息条数上限；首轮回填靠多批循环推进。
 BACKFILL_BATCH = _int_env("INSIGHTS_BACKFILL_BATCH", 5000, 100, 200000)

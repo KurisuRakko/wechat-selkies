@@ -89,9 +89,15 @@
   /**
    * POST 请求：返回 { status, data }。
    * 刷新接口需要区分 202（已启动）与 409（正在运行），所以这里不吞掉状态码。
+   * body 存在时以 JSON 发送。
    */
-  async function apiPost(path) {
-    return request(path, { method: "POST" });
+  async function apiPost(path, body) {
+    var init = { method: "POST" };
+    if (body !== undefined) {
+      init.headers = { "Content-Type": "application/json" };
+      init.body = JSON.stringify(body);
+    }
+    return request(path, init);
   }
 
   /** 页面链接原样返回：鉴权靠 cookie，链接里不需要再拼任何参数。 */
@@ -204,6 +210,27 @@
         "'": "&#39;"
       }[ch];
     });
+  }
+
+  // 关系类型取值 → 中文名，与后端 classify 模块的 KIND_VALUES 一致。
+  var KIND_RELATION_LABELS = {
+    friend: "朋友",
+    family: "家人",
+    transactional: "事务往来"
+  };
+
+  /**
+   * 关系类型 badge：家人用次色描边 chip、事务往来用禁用灰；friend 不显示。
+   * kind 缺失或未知时按默认 friend 处理，旧数据无需任何迁移。
+   */
+  function kindBadgeHtml(kind) {
+    if (kind === "family") {
+      return '<span class="chip chip--small chip--family">家人</span>';
+    }
+    if (kind === "transactional") {
+      return '<span class="chip chip--small chip--transactional">事务往来</span>';
+    }
+    return "";
   }
 
   /* ------------------------------------------------------------------ *
@@ -530,8 +557,10 @@
   global.Insights = {
     DIMENSIONS: DIMENSIONS,
     DASH: DASH,
+    KIND_RELATION_LABELS: KIND_RELATION_LABELS,
     api: api,
     apiPost: apiPost,
+    kindBadgeHtml: kindBadgeHtml,
     linkTo: linkTo,
     formatDuration: formatDuration,
     formatDateTime: formatDateTime,
