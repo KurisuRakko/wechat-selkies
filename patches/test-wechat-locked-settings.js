@@ -304,8 +304,10 @@ function resetDom() {
   observerCallback = null;
   observeArgs = null;
   rafCallbacks.length = 0;
-  delete fakeWindow.wechatLockedSettingsInstalled;
-  delete fakeWindow.wechatLockedSettingsObserver;
+  // 安装守卫现在按文档粒度：软重载模拟新文档时旗标随旧文档一起消失。
+  document.wechatLockedSettingsInstalled = undefined;
+  document.documentElement = body;
+  document.body = body;
   fakeWindow.location.hash = "";
 }
 
@@ -320,7 +322,7 @@ resetDom();
 fakeWindow.location.hash = "#shared";
 run();
 assert.equal(store.size, 0, "#shared writes nothing");
-assert.equal(fakeWindow.wechatLockedSettingsInstalled, undefined);
+assert.equal(document.wechatLockedSettingsInstalled, undefined);
 
 /* 0.5 player 页面只隐藏浮动手柄按钮，不写设置 --------------------------- */
 
@@ -336,6 +338,13 @@ const latePlayerButton = makeGamepadButton();
 observerCallback([]);
 flushRaf();
 assert.equal(latePlayerButton.style.display, "none", "late gamepad button is hidden");
+// player 页也常驻仅隐藏的 enforce 节拍：错过观察器的渲染由节拍兜底。
+const timerHiddenButton = makeGamepadButton();
+assert.notEqual(timerHiddenButton.style.display, "none", "not hidden before the enforce tick");
+fireInterval(1000);
+assert.equal(timerHiddenButton.style.display, "none", "player enforce tick hides late gamepad button");
+assert.equal(store.size, 0, "player enforce tick does not seed settings");
+assert.equal(posts.length, 0, "player enforce tick does not post settings");
 
 /* 1. 首次加载写入十个键并隐藏已渲染设置行 -------------------------------- */
 
@@ -484,13 +493,56 @@ assert.equal(store.get(key("use_cpu")), "false", "locked value is re-seeded");
 /* 6. 重复安装不产生重复副作用 -------------------------------------------- */
 
 const postsBeforeReload = posts.length;
+const observeArgsBeforeRerun = observeArgs;
 run();
 fireInterval(500);
 assert.equal(posts.length, postsBeforeReload, "no second live post");
+assert.deepEqual(observeArgs, observeArgsBeforeRerun, "same-document re-run does not reinstall the observer");
 assert.equal(
   allElements.filter((el) => el.id === "wechat-topbar").length,
   0,
   "this script creates no UI"
 );
+
+/* 7. 同窗口软重载：文档整体重建后脚本重新求值，文档粒度守卫允许完整重装 - */
+
+resetDom();
+makeControl("hidpiToggle");
+makeControl("useCpuToggle");
+const rebuiltSection = makeSection("apps-content", "应用程序");
+makeGamepadButton();
+run();
+fireInterval(500);
+assert.equal(store.get(key("use_cpu")), "false", "soft reload re-seeds locked values");
+assert.ok(posts.length > 0, "soft reload re-posts settings for the new bundle");
+assert.equal(byId.get("hidpiToggle").parentNode.style.display, "none", "soft reload re-hides setting rows");
+assert.equal(byId.get("useCpuToggle").parentNode.style.display, "none", "soft reload re-hides locked rows");
+assert.equal(rebuiltSection.style.display, "none", "soft reload re-hides sections");
+assert.ok(observerCallback, "soft reload reinstalls the observer");
+// 重装后新渲染的节点仍由观察器接管。
+const softReloadLateToggle = makeControl("antiAliasingToggle");
+observerCallback([]);
+flushRaf();
+assert.equal(softReloadLateToggle.parentNode.style.display, "none", "reinstalled observer hides late rows");
+
+/* 8. 观察器自愈：文档根被整体替换（旧文档丢弃），enforce 节拍重新挂载 ------ */
+
+allElements.length = 0;
+byId = new Map();
+const rebuiltRoot = new FakeElement("HTML");
+document.documentElement = rebuiltRoot;
+document.body = rebuiltRoot;
+makeControl("antiAliasingToggle");
+const healedToggleRow = byId.get("antiAliasingToggle").parentNode;
+observerCallback = null;
+observeArgs = null;
+fireInterval(1000);
+assert.ok(observerCallback, "enforce tick re-attaches the observer to the rebuilt document root");
+assert.deepEqual(observeArgs.options, { childList: true, subtree: true });
+assert.equal(healedToggleRow.style.display, "none", "enforce tick re-hides rows in the rebuilt document");
+const postHealButton = makeGamepadButton();
+observerCallback([]);
+flushRaf();
+assert.equal(postHealButton.style.display, "none", "re-attached observer hides late nodes");
 
 console.log("wechat-locked-settings DOM tests passed");

@@ -11,6 +11,13 @@
  *
  * 编码器和码率控制模式刻意与 patches/wechat-quality-presets.js 保持一致；
  * 帧率/比特率仍由预设脚本负责，这里不会写这两个键。
+ *
+ * 加固（2026-08-10）：跨容器重启重连时，页面会在同一窗口内整体重建文档
+ * （软重载），重连后侧边栏随之整棵重建。安装守卫与观察器原先挂在 window 上，
+ * 文档重建后脚本重新求值会被守卫拦下、旧观察器也指向被丢弃的旧文档，隐藏
+ * pass 从此失活——而锁定值靠 localStorage 持久化仍在生效，表现为“锁定了但
+ * 隐藏消失”。现在守卫按文档粒度、观察器按当前文档根挂载，1 秒 enforce 节拍
+ * 在根被替换时把观察器挂回新文档，player 页也常驻仅隐藏的兜底节拍。
  */
 (function () {
   "use strict";
@@ -21,8 +28,10 @@
   if (String(location.hash).indexOf("shared") !== -1) {
     return;
   }
-  if (window.wechatLockedSettingsInstalled) return;
-  window.wechatLockedSettingsInstalled = true;
+  // 文档粒度守卫：文档被整体重建（软重载/重连）后旗标随旧文档一起消失，脚本在
+  // 新文档重新求值会完整重装；同一文档内的重复注入仍会被拦住。
+  if (document.wechatLockedSettingsInstalled) return;
+  document.wechatLockedSettingsInstalled = true;
 
   /*
    * 十个设置值都来自 src/selkies-core.js 里的真实键名：
@@ -222,13 +231,20 @@
   }
 
   var enforceTimer = null;
-  function enforce() {
-    seed();
+  // dashboard 页写设置，player 页只隐藏不写设置——两种节拍共用“根变了就重挂
+  // 观察器”的自愈检查，保证隐藏 pass 对任何后续重渲染常驻。
+  function enforce(applySettings) {
+    if (observedRoot !== currentRoot()) {
+      observe();
+    }
+    if (applySettings) seed();
     applyDom();
   }
-  function startEnforceTimer() {
+  function startEnforceTimer(applySettings) {
     if (enforceTimer) return;
-    enforceTimer = setInterval(enforce, 1000);
+    enforceTimer = setInterval(function () {
+      enforce(applySettings);
+    }, 1000);
   }
 
   var applyPending = false;
@@ -247,17 +263,24 @@
     }
   }
 
+  // 观察器挂在“当前文档的根”上并记录 observedRoot：文档整体重建后旧观察器指向
+  // 被丢弃的旧文档，enforce 节拍发现根变了就重新挂载。观察器本身永不
+  // disconnect，生命周期与所在文档一致；挂 documentElement 而非 body，body 被
+  // 整体替换时观察器仍然活着。
+  var observedRoot = null;
+  function currentRoot() {
+    return document.documentElement || document.body;
+  }
   function observe() {
-    if (window.wechatLockedSettingsObserver) return;
-    if (typeof MutationObserver === "undefined") return;
-    var observer = new MutationObserver(function () {
-      scheduleApply();
-    });
-    observer.observe(
-      document.documentElement || document.body,
-      { childList: true, subtree: true }
-    );
-    window.wechatLockedSettingsObserver = observer;
+    var root = currentRoot();
+    if (observedRoot === root) return;
+    if (typeof MutationObserver !== "undefined") {
+      var observer = new MutationObserver(function () {
+        scheduleApply();
+      });
+      observer.observe(root, { childList: true, subtree: true });
+    }
+    observedRoot = root;
   }
 
   function boot(applySettings) {
@@ -267,11 +290,11 @@
       if (document.body) {
         clearInterval(timer);
         applyDom();
+        observe();
+        startEnforceTimer(applySettings);
         if (applySettings) {
           postLive();
-          startEnforceTimer();
         }
-        observe();
       } else if (tries > 120) {
         clearInterval(timer);
         console.warn(TAG, "gave up waiting for document.body");
