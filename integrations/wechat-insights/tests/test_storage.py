@@ -3,7 +3,9 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
+from unittest.mock import patch
 
 from wechat_insights.constants import SCHEMA_VERSION
 from wechat_insights.metrics import Metrics, quantile
@@ -16,6 +18,30 @@ def bucket(**counts: int) -> Metrics:
     for name, value in counts.items():
         metrics.add(name, value)
     return metrics
+
+
+def seed_legacy_llm_depth(path: Path) -> None:
+    """建一个带 score 列的老形状 metrics.db（llm_depth 去列迁移的输入形状）。"""
+
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE llm_depth (
+                session_id     TEXT PRIMARY KEY,
+                score          REAL NOT NULL,
+                scored_at      INTEGER NOT NULL,
+                total_messages INTEGER NOT NULL,
+                summary        TEXT NOT NULL DEFAULT '',
+                anomaly_note   TEXT NOT NULL DEFAULT '',
+                anomalies_key  TEXT NOT NULL DEFAULT '',
+                tags           TEXT NOT NULL DEFAULT ''
+            );
+            INSERT INTO meta (key, value) VALUES ('schema_version', '2');
+            INSERT INTO llm_depth VALUES ('friend', 55.0, 1000, 42,
+                '旧摘要', '旧解释', 'old:key', '["游戏"]');
+            """
+        )
 
 
 class StoreTestCase(unittest.TestCase):
@@ -294,25 +320,7 @@ class LLMDepthTests(StoreTestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         path = Path(temporary.name) / "metrics.db"
-        with sqlite3.connect(path) as connection:
-            connection.executescript(
-                """
-                CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                CREATE TABLE llm_depth (
-                    session_id     TEXT PRIMARY KEY,
-                    score          REAL NOT NULL,
-                    scored_at      INTEGER NOT NULL,
-                    total_messages INTEGER NOT NULL,
-                    summary        TEXT NOT NULL DEFAULT '',
-                    anomaly_note   TEXT NOT NULL DEFAULT '',
-                    anomalies_key  TEXT NOT NULL DEFAULT '',
-                    tags           TEXT NOT NULL DEFAULT ''
-                );
-                INSERT INTO meta (key, value) VALUES ('schema_version', '2');
-                INSERT INTO llm_depth VALUES ('friend', 55.0, 1000, 42,
-                    '旧摘要', '旧解释', 'old:key', '["游戏"]');
-                """
-            )
+        seed_legacy_llm_depth(path)
 
         store = MetricsStore(path)
         self.addCleanup(store.close)
@@ -330,6 +338,54 @@ class LLMDepthTests(StoreTestCase):
         # 迁移后的形状可以正常再次写入（重建前这一步会违反 score 的 NOT NULL）。
         store.set_llm_depth("friend", 1001, 43, "新摘要")
         self.assertEqual(store.get_llm_depth("friend").summary, "新摘要")
+
+    def test_llm_depth_rebuild_backs_up_before_dropping_the_score_column(self) -> None:
+        # 去 score 列之前必须留一份快照：备份拍在动手之前，里面还有 score。
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        path = Path(temporary.name) / "metrics.db"
+        seed_legacy_llm_depth(path)
+
+        store = MetricsStore(path)
+        self.addCleanup(store.close)
+        columns = {
+            row[1] for row in store.connection.execute("PRAGMA table_info(llm_depth)")
+        }
+        self.assertNotIn("score", columns)
+        backup = path.parent / (
+            f"metrics-backup-llm-depth-rebuild-{date.today().isoformat()}.db"
+        )
+        self.assertTrue(backup.exists())
+        with sqlite3.connect(backup) as old:
+            old_columns = {
+                row[1] for row in old.execute("PRAGMA table_info(llm_depth)")
+            }
+        self.assertIn("score", old_columns)
+
+    def test_failed_backup_leaves_the_legacy_score_column_in_place(self) -> None:
+        # 备份拿不到就跳过重建（服务照常能起来）：score 列原样保留，其余
+        # 补列不受影响，日志留一条 ERROR 供运维定位。
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        path = Path(temporary.name) / "metrics.db"
+        seed_legacy_llm_depth(path)
+
+        with patch(
+            "wechat_insights.migrations.backup_database", return_value=None
+        ), self.assertLogs("wechat-insights", level="ERROR") as logs:
+            store = MetricsStore(path)
+        self.addCleanup(store.close)
+        columns = {
+            row[1] for row in store.connection.execute("PRAGMA table_info(llm_depth)")
+        }
+        self.assertIn("score", columns)
+        # 其余补列照常：llm_depth 的补列清单与 contacts 的补列都跑过了。
+        self.assertLessEqual({"summary", "tags"}, columns)
+        contact_columns = {
+            row[1] for row in store.connection.execute("PRAGMA table_info(contacts)")
+        }
+        self.assertIn("kind_auto", contact_columns)
+        self.assertTrue(any("备份失败" in line for line in logs.output))
 
     def test_tags_round_trip_none_empty_list_and_list(self) -> None:
         # None → ''（读回 None，触发重评补齐）；[] 是合法值照存、读回空

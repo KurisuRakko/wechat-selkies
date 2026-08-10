@@ -13,6 +13,7 @@ from collections.abc import Callable
 from datetime import date, timedelta
 from typing import TYPE_CHECKING
 
+from .backup import REASON_FORMULA_RESET, backup_database
 from .constants import INSIGHTS_FORCE_HISTORY_BACKFILL, SCORE_FORMULA_VERSION
 from .metrics import day_key, day_moment, day_span
 from .scoring import DIMENSION_NAMES
@@ -128,14 +129,20 @@ def apply_formula_reset(store: MetricsStore) -> bool:
     """打分口径版本变了就把历史标记与逐日进度清零，让本轮自动重放全史。
 
     meta.score_formula_version 记的是「哪个口径版本的重置已经执行过」。
-    版本不一致（含从未写过）时：删掉 score_history_backfilled 标记、把所有
-    每日粒度联系人的 history_daily_until 清空，然后立刻写下新版本号——
-    重置本身是一次性的，真正的重算由 backfill_history 与 refine_daily_history
-    各自的续跑机制驱动，中途崩溃不会丢进度。返回是否执行了重置。
+    版本不一致（含从未写过）时：先 VACUUM INTO 一份整库备份——备份拿不到
+    就不重置、也不写版本号，下一轮自动重试（曲线暂时停在旧口径，没有数据
+    被破坏）；备份到手后删掉 score_history_backfilled 标记、把所有每日粒度
+    联系人的 history_daily_until 清空，然后立刻写下新版本号——重置本身是
+    一次性的，真正的重算由 backfill_history 与 refine_daily_history 各自的
+    续跑机制驱动，中途崩溃不会丢进度。返回是否执行了重置。
     """
 
     current = store.get_meta("score_formula_version")
     if current == str(SCORE_FORMULA_VERSION):
+        return False
+    if backup_database(store.path, REASON_FORMULA_RESET) is None:
+        # 关键：此时不写 score_formula_version，所以下一轮还会再试。
+        LOG.error("打分口径重置前的备份失败，本轮不重置，下一轮自动重试")
         return False
     store.delete_meta("score_history_backfilled")
     store.reset_daily_refine_progress()

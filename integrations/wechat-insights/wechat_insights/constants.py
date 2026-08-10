@@ -144,6 +144,12 @@ LLM_PERIOD_SAMPLE_BLOCKS = 6
 # INSIGHTS_FORCE_HISTORY_BACKFILL。
 SCORE_FORMULA_VERSION = 2
 
+# —— 破坏性操作前的自动备份 ——
+# 打分口径重置与 llm_depth 去 score 列这两个不可逆时刻，会先 VACUUM INTO 一份
+# 完整库快照到 DB_PATH 同目录（文件名带原因与日期）；备份拿不到就不动数据。
+# 这里配的是保留份数，超出的按修改时间删最旧的。
+BACKUP_KEEP = _int_env("INSIGHTS_BACKUP_KEEP", 5, 1, 100)
+
 # —— 关系类型分类（仅 llm 策略）——
 # 单轮分析最多给多少个新联系人做关系类型判定：候选按消息量降序（事务号
 # 往往消息多、污染最重，优先处理），超出部分下一轮再判。

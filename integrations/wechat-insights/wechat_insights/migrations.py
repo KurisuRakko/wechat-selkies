@@ -11,6 +11,8 @@ import sqlite3
 from contextlib import closing
 from pathlib import Path
 
+from .backup import REASON_LLM_DEPTH_REBUILD, backup_database
+
 
 LOG = logging.getLogger("wechat-insights")
 
@@ -78,6 +80,17 @@ def apply_migrations(path: Path) -> None:
             row[1] for row in connection.execute("PRAGMA table_info(llm_depth)")
         }
     if not legacy:
+        return
+    if backup_database(path, REASON_LLM_DEPTH_REBUILD) is None:
+        # 备份失败时「跳过重建」是安全的降级：_LLM_DEPTH_COLUMNS 不含 score，
+        # 所有 SELECT 照常；唯一失效的是 set_llm_depth 的 INSERT（score 是
+        # NOT NULL 无默认值），而它的调用方 refresh_portraits 已被
+        # analyzer.run 的 try/except 包住——服务照常启动、打分/曲线/时段评分
+        # 全部照常，只有画像停更且每轮留一条醒目异常。
+        LOG.error(
+            "llm_depth 去 score 列之前的备份失败，本轮跳过重建："
+            "关系画像会暂时写不进去（每轮记一次异常），其余功能照常"
+        )
         return
     with closing(sqlite3.connect(path)) as connection, connection:
         connection.executescript(_REBUILD_LLM_DEPTH)

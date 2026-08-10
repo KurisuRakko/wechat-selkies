@@ -535,6 +535,31 @@ class FormulaResetTests(AnalyzerTestCase):
             again = self.run_round(self.NOW_RESET)
         self.assertGreater(again.history_points, 0)
 
+    def test_formula_reset_is_skipped_when_the_backup_fails(self) -> None:
+        # 备份拿不到就不动数据：版本号不写（下一轮会重试）、回放标记与
+        # 逐日进度原样保留，只留一条 ERROR。
+        self.store.set_meta("score_history_backfilled", "1700000000")
+        self.store.set_meta("score_formula_version", "1")
+        with self.store.connection as connection:
+            connection.execute(
+                "UPDATE contacts SET history_daily_until = '2026-01-01' "
+                "WHERE session_id = 'day'"
+            )
+
+        with patch(
+            "wechat_insights.history.backup_database", return_value=None
+        ), self.assertLogs("wechat-insights", level="ERROR") as logs:
+            reset = apply_formula_reset(self.store)
+        self.assertFalse(reset)
+        self.assertEqual(self.store.get_meta("score_formula_version"), "1")
+        self.assertEqual(
+            self.store.get_meta("score_history_backfilled"), "1700000000"
+        )
+        self.assertEqual(
+            self.store.get_contact("day").history_daily_until, "2026-01-01"
+        )
+        self.assertTrue(any("备份失败" in line for line in logs.output))
+
 
 if __name__ == "__main__":
     unittest.main()
