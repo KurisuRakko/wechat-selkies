@@ -31,7 +31,7 @@ This project packages the official WeChat/QQ Linux client in a Docker container,
 - 🔒 **Data Persistence**: Supports persistent storage of configurations and chat records
 - 🎨 **Chinese Support**: Complete Chinese fonts and localization support, including local Chinese input methods
 - 🖼️ **Image Copy**: Support image copying through sidebar panel
-- 📁 **File Transfer**: Support file transfer through sidebar panel
+- 📁 **File Transfer**: Support file transfer through sidebar panel; the sidebar's Files panel is a visual file browser (see [Files Panel](#files-panel))
 - ⤓ **Drag-out Export**: Drag an image or file out of a WeChat chat into the top-right corner to download it locally (see [Drag-out Export](#drag-out-export))
 - 🖥️ **AMD64 and ARM64 Architecture Support**: Compatible with mainstream CPU architectures
 - 🔧 **Hardware Acceleration**: Optional GPU hardware acceleration support
@@ -71,6 +71,32 @@ The top bar offers four quality presets, all using `x264enc-striped` with CBR ra
 | 极致 | 60 fps | 20 Mbps | 18 |
 
 Every page load runs an automatic speed test against a generated 1 MiB same-origin file: measured download `< 3 Mbps` selects 省流, `3–8 Mbps` selects 流畅, `8–15 Mbps` selects 高清, and `>= 15 Mbps` selects 极致. If RTT exceeds 150ms, the automatic pick is capped at 流畅. A 3-second timeout or failure keeps the current preset. Once the user manually clicks any preset, auto selection is disabled for that session and returns after a page refresh.
+
+### Files Panel
+
+The sidebar's Files panel is a visual browser for the downloads directory
+(`~/Desktop` by default): breadcrumb (always starting at "桌面") plus
+up/refresh/filter, a sortable four-column table (name / modified / type /
+size, directories always before files), double-click a directory to enter,
+double-click a file to download, and drag a file row onto the host desktop to
+download it directly. Entries whose names start with `.` (including internal
+queue files like `.wechat-open-urls`) are hidden by default.
+
+Why the old panel was completely blank: the nginx `/files` block has no
+`index` directive, so the built-in default `index index.html` applies — if the
+downloads directory contains a user file named `index.html`, a request for
+`/files/` returns that HTML instead of the directory listing, and the same
+block's `Content-Disposition: attachment` makes the browser download it
+instead of rendering it inside the iframe. At build time the block is now
+switched to nginx autoindex JSON (with `index` pointing at a name that can
+never exist, `.selkies-no-index`), and the panel is drawn by the injected
+`wechat-file-manager.js` fetching that JSON directly, so no fancyindex HTML
+page is involved anymore.
+
+> When `SELKIES_FILE_TRANSFERS` lacks `download` or `HARDEN_DESKTOP=true` is
+> set, upstream init-nginx deletes the whole `/files` block and the panel
+> reports a read failure — that is the upstream hardening switch working as
+> intended.
 
 ### Drag-out Export
 
