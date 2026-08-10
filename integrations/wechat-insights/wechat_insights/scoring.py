@@ -109,9 +109,10 @@ def raw_metrics(
         # 对等维度：双方量级之比，纯 Metrics 可算。
         "balance_msgs": _balance(window.get("msgs_them"), window.get("msgs_me")),
         "balance_chars": _balance(window.get("chars_them"), window.get("chars_me")),
-        "balance_started": _balance(
-            window.get("conv_started_them"), window.get("conv_started_me")
-        ),
+        # 对等维的绝对量级项：双方投入的「下限」。两边都在大量投入时它才高，
+        # 一边热一边冷时被 min 掐住。单位与投入维的 cost_them_per_day 一致，
+        # 复用同一套类型成本折算，不另造一套货币。
+        "mutual_cost_per_day": min(window.cost("them"), window.cost("me")) / span,
     }
     values.update(strategy.raw_metrics(window))
     if extras is not None:
@@ -170,9 +171,14 @@ def dimensions(strategy: DepthStrategy) -> tuple[tuple[str, tuple[Component, ...
         (
             "reciprocity",
             (
-                Component("balance_msgs", 0.4, True),
-                Component("balance_chars", 0.3, True),
-                Component("balance_started", 0.3, True),
+                # 双向投入的绝对下限：min(cost_them, cost_me) 日均。比例项
+                # 看不出「一方疯狂输出、另一方沉默」，只有 min 项掐得住。
+                Component("mutual_cost_per_day", 0.35, True),
+                Component("balance_msgs", 0.2, True),
+                Component("balance_chars", 0.15, True),
+                # LLM 判定的双向性：能看见「谁在接话、谁在敷衍」这种比例项
+                # 看不见的东西；没评过分的联系人缺值自动回流到前三项。
+                Component("llm_mutuality_score", 0.3, True),
             ),
         ),
     )

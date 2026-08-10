@@ -13,13 +13,25 @@ class LLMDepthStrategyTests(unittest.TestCase):
             sum(component.weight for component in LLMDepth().components()), 1.0
         )
 
-    def test_llm_components_halve_lexical_weights(self) -> None:
+    def test_llm_components_keep_lexical_ratio_at_thirty_percent(self) -> None:
         llm_components = {c.metric: c.weight for c in LLMDepth().components()}
         lexical = {c.metric: c.weight for c in LexicalDepth().components()}
         for metric, weight in lexical.items():
-            self.assertAlmostEqual(llm_components[metric], weight * 0.5)
-        self.assertEqual(llm_components["llm_depth_score"], 0.5)
-        self.assertEqual(set(llm_components), set(lexical) | {"llm_depth_score"})
+            self.assertAlmostEqual(llm_components[metric], weight * 0.3)
+        # 词法三项整体缩到 0.30（内部仍是 4:3:3），LLM 两项各 0.35、合计 0.7。
+        self.assertAlmostEqual(
+            sum(llm_components[metric] for metric in lexical), 0.3
+        )
+        self.assertAlmostEqual(llm_components["llm_depth_score"], 0.35)
+        self.assertAlmostEqual(llm_components["llm_warmth_score"], 0.35)
+        self.assertAlmostEqual(
+            llm_components["llm_depth_score"] + llm_components["llm_warmth_score"],
+            0.7,
+        )
+        self.assertEqual(
+            set(llm_components),
+            set(lexical) | {"llm_depth_score", "llm_warmth_score"},
+        )
 
     def test_raw_metrics_delegate_to_lexical(self) -> None:
         self.assertEqual(
@@ -44,13 +56,14 @@ class LLMDepthStrategyTests(unittest.TestCase):
             self.assertEqual(get_depth_strategy("llm").name, "llm")
 
     def test_missing_llm_score_degrades_to_lexical_terms(self) -> None:
-        # b 没有 LLM 分：llm 组件的 0.5 权重回流给词法三项，深度维度仍可算。
+        # b 没有 LLM 分：LLM 两项的 0.7 权重回流给词法三项，深度维度仍可算。
         cohort = {
             "a": {
                 "avg_len_them": 100.0,
                 "question_rate_them": 0.8,
                 "long_msg_rate_them": 0.8,
                 "llm_depth_score": 90.0,
+                "llm_warmth_score": 90.0,
             },
             "b": {
                 "avg_len_them": 10.0,
@@ -64,8 +77,8 @@ class LLMDepthStrategyTests(unittest.TestCase):
         self.assertGreater(scores["a"]["depth"], scores["b"]["depth"])
 
     def test_llm_score_dominates_when_lexical_terms_are_equal(self) -> None:
-        # 词法三项完全相同的两人百分位相同（并列取中点 → 50），LLM 分成为
-        # 唯一分项，深度维度完全由它决定。
+        # 词法三项完全相同的两人百分位相同（并列取中点 → 50），LLM 两项成为
+        # 唯一分项，深度维度完全由它们决定。
         base = {
             "avg_len_them": 50.0,
             "question_rate_them": 0.5,
@@ -73,16 +86,23 @@ class LLMDepthStrategyTests(unittest.TestCase):
         }
         scores = score_cohort(
             {
-                "deep": {**base, "llm_depth_score": 90.0},
-                "shallow": {**base, "llm_depth_score": 10.0},
+                "deep": {
+                    **base,
+                    "llm_depth_score": 90.0,
+                    "llm_warmth_score": 90.0,
+                },
+                "shallow": {
+                    **base,
+                    "llm_depth_score": 10.0,
+                    "llm_warmth_score": 10.0,
+                },
             },
             LLMDepth(),
         )
-        # 两人词法项并列取中点 → 50；LLM 分 90 在 [90, 10] 里排 75 分位、
-        # 10 排 25 分位，深度维度完全由 LLM 分拉开：
-        # 25 + 75×0.5 = 62.5，25 + 25×0.5 = 37.5。
-        self.assertAlmostEqual(scores["deep"]["depth"], 62.5)
-        self.assertAlmostEqual(scores["shallow"]["depth"], 37.5)
+        # 词法三项并列取中点 → 50；LLM 两项 90 在 [90, 10] 里排 75 分位、
+        # 10 排 25 分位。深度 = 0.3×50 + 0.7×75 = 67.5 / 0.3×50 + 0.7×25 = 32.5。
+        self.assertAlmostEqual(scores["deep"]["depth"], 67.5)
+        self.assertAlmostEqual(scores["shallow"]["depth"], 32.5)
 
 
 if __name__ == "__main__":
