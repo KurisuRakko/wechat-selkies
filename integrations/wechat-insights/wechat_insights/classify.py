@@ -13,8 +13,9 @@ import logging
 
 from . import llm
 from .constants import CLASSIFY_MAX_PER_RUN, CLASSIFY_SAMPLE_CHARS
-from .conversation import ME, split_conversations
+from .conversation import split_conversations
 from .masking import mask
+from .reading import Cursor, read_messages_after, transcript_lines
 from .storage import ContactRow, MetricsStore
 
 
@@ -142,10 +143,6 @@ def _classify_sample(reader, contact: ContactRow, gap_seconds: int) -> str | Non
 
     if contact.first_message_at is None or contact.last_message_at is None:
         return None
-    # 延迟导入打破循环依赖：analyzer 在顶部导入本模块，而
-    # read_messages_after / Cursor 定义在 analyzer 里，运行期再取即可。
-    from .analyzer import Cursor, read_messages_after
-
     span = contact.last_message_at - contact.first_message_at
     blocks: list[str] = []
     seen_starts: set[tuple[int, str, int]] = set()
@@ -172,11 +169,7 @@ def _classify_sample(reader, contact: ContactRow, gap_seconds: int) -> str | Non
         if key in seen_starts:
             continue
         seen_starts.add(key)
-        lines = [
-            f"{'我' if message.direction == ME else 'TA'}: {message.text}"
-            for message in conversations[0]
-            if message.kind == "text" and message.text
-        ]
+        lines = transcript_lines(conversations[0])
         if not lines:
             continue
         block = "\n".join(lines)

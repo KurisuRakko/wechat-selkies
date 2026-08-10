@@ -9,14 +9,11 @@ from __future__ import annotations
 import json
 import logging
 import time
-from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
 
-from wechat_history.reader import HistoryReader, _read_connection
+from wechat_history.reader import HistoryReader
 from wechat_history.sessions import scan_direct_rows
 
-from . import llm
 from .classify import classify_contacts
 from .constants import (
     BACKFILL_BATCH,
@@ -24,21 +21,15 @@ from .constants import (
     FADE_LIST_LIMIT,
     FADE_MIN_GAP_DAYS,
     FADE_MIN_OVERALL,
-    INSIGHTS_FORCE_HISTORY_BACKFILL,
-    LLM_MAX_CALLS_PER_RUN,
-    LLM_REFRESH_DAYS,
-    LLM_REFRESH_MESSAGES,
-    LLM_SAMPLE_DAYS,
-    LLM_SAMPLE_MAX_CHARS,
     MIN_SCORE_MESSAGES,
     SCORE_WINDOW_DAYS,
     SESSION_GAP_SECONDS,
     TREND_BASELINE_DAYS,
     TREND_RECENT_DAYS,
 )
-from .conversation import ME, Message, split_conversations
-from .masking import mask
+from .conversation import Message, split_conversations
 from .depth import DepthStrategy, get_depth_strategy
+from .history import backfill_history, prune_pre_acquaintance, refine_daily_history
 from .metrics import (
     Aggregation,
     Metrics,
@@ -49,6 +40,8 @@ from .metrics import (
     decayed_weight,
     late_night_offset,
 )
+from .portrait import refresh_portraits
+from .reading import Cursor, read_messages_after
 from .scoring import (
     DIMENSION_NAMES,
     anomalies_key,
@@ -61,19 +54,6 @@ from .storage import ContactRow, LLMDepthRow, MetricsStore, WindowStats
 
 
 LOG = logging.getLogger("wechat-insights")
-
-
-@dataclass(frozen=True, slots=True)
-class Cursor:
-    """已提交的最后一条消息位置；(0, "", -1) 表示还没读过任何消息。
-
-    local_id 只在单个分片内唯一，必须带上分片路径才能构成全局唯一的全序；
-    空分片排在一切真实分片之前。排序键与恢复谓词都用这个三元组。
-    """
-
-    timestamp: int
-    shard: str
-    local_id: int
 
 
 @dataclass(slots=True)
@@ -110,112 +90,6 @@ class ScoresAsOf:
     equivalent_days: float
 
 
-@dataclass(frozen=True, slots=True)
-class MessageBatch:
-    """一批读到的消息，以及推进游标需要的元信息。"""
-
-    #: 已剔除无方向系统噪声的消息，按时间升序。
-    messages: list[Message]
-    #: 与 messages 一一对应的游标位置；对话被截断时按前缀取最后一条。
-    positions: list[Cursor]
-    #: 本批最后一行（含被剔除的行）的位置；一行都没有时为 None。
-    last: Cursor | None
-    #: 数据库里还有更多行没读。
-    has_more: bool
-
-
-def _resume_where(cursor: Cursor, shard: str) -> tuple[str, tuple[object, ...]]:
-    """按 (时间戳, 分片, local_id) 全序生成单个分片的恢复谓词。
-
-    分片之间共享 local_id，游标必须带上分片，否则同刻同号的两行会互相
-    吞掉。游标分片之后的分片，同一时间戳下的行都在游标之后，全部要读；
-    游标分片之前的分片则整片已读完，只有更晚的时间戳才有效。
-    """
-
-    if shard > cursor.shard:
-        return "create_time >= ?", (cursor.timestamp,)
-    if shard == cursor.shard:
-        return (
-            "create_time > ? OR (create_time = ? AND local_id > ?)",
-            (cursor.timestamp, cursor.timestamp, cursor.local_id),
-        )
-    return "create_time > ?", (cursor.timestamp,)
-
-
-def read_messages_after(
-    reader: HistoryReader,
-    session_id: str,
-    display_name: str,
-    contacts: dict[str, dict],
-    cursor: Cursor,
-    limit: int,
-) -> MessageBatch:
-    """读取游标之后最多 limit 条消息，按时间升序。
-
-    查询模式照抄 notifications.read_new_messages 的游标窗口，区别是不设上界：
-    分析器不需要和会话行对齐，读到哪算哪，剩下的留给下一批。
-    """
-
-    table = reader._message_table(session_id)
-    session = {
-        "session_id": session_id,
-        "display_name": display_name,
-        "alias": "",
-        "kind": "direct",
-    }
-    collected: list[tuple[tuple[int, str, int], Message | None]] = []
-    for relative_db in reader._message_database_keys():
-        database = reader.cache.get(relative_db)
-        with _read_connection(database) as connection:
-            exists = connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
-                (table,),
-            ).fetchone()
-            if not exists:
-                continue
-            names = reader._name_map(connection)
-            where, parameters = _resume_where(cursor, relative_db)
-            rows = connection.execute(
-                f"""
-                SELECT local_id, local_type, create_time, real_sender_id,
-                       message_content, WCDB_CT_message_content
-                FROM [{table}]
-                WHERE {where}
-                ORDER BY create_time ASC, local_id ASC
-                LIMIT ?
-                """,
-                (*parameters, limit + 1),
-            ).fetchall()
-            for row in rows:
-                item = reader._message_item(row, relative_db, session, contacts, names)
-                timestamp = int(row["create_time"] or 0)
-                local_id = int(row["local_id"] or 0)
-                # 没有发送者的系统噪声参与不了「谁回谁」的判定，占位成 None：
-                # 它不进统计，但游标仍要跨过它，否则每轮都会重复读到。
-                message = (
-                    None
-                    if item["direction"] == "unknown"
-                    else Message(
-                        timestamp=timestamp,
-                        local_id=local_id,
-                        direction=str(item["direction"]),
-                        kind=str(item["type"]),
-                        text=str(item["text"] or ""),
-                    )
-                )
-                collected.append(((timestamp, relative_db, local_id), message))
-
-    collected.sort(key=lambda entry: entry[0])
-    window = collected[:limit]
-    kept = [entry for entry in window if entry[1] is not None]
-    return MessageBatch(
-        messages=[entry[1] for entry in kept],
-        positions=[Cursor(*entry[0]) for entry in kept],
-        last=Cursor(*window[-1][0]) if window else None,
-        has_more=len(collected) > limit,
-    )
-
-
 def update_milestones(
     contact: ContactRow, messages: list[Message], aggregation: Aggregation
 ) -> None:
@@ -244,102 +118,6 @@ def update_milestones(
     contact.last_message_at = messages[-1].timestamp
     contact.total_messages += len(messages)
     contact.max_laugh_run = max(contact.max_laugh_run, aggregation.max_laugh_run)
-
-
-_LLM_SYSTEM_PROMPT = (
-    "你是一个亲密关系分析助手。用户会给你他和一位朋友最近的聊天记录（已做隐私脱敏，"
-    "部分词被替换成星号），可能还附有一份检测到的近期变化列表。只回复 JSON，不要任何"
-    "其他文字，字段如下：\n"
-    '"score"：0 到 100 的整数。从话题实质性、情感袒露程度、相互追问与回应的质量三个'
-    "方面评估对话深度：日常寒暄、斗图、纯事务性沟通在 30 以下；有实质话题讨论在 "
-    "30–60；有情感袒露、深度交流在 60 以上。\n"
-    '"summary"：不超过 100 字的两三句话，概括你们主要聊什么话题、相处模式是什么样。'
-    '用「你们」称呼双方，不要出现具体人名。\n'
-    '"anomaly_note"：如果附了近期变化列表，基于聊天内容用一句话（不超过 50 字）推测'
-    "变化最可能的原因；没有附变化列表则为 null。\n"
-    '"tags"：2 到 4 个标签，每个 2–6 个字，概括你们的主要话题与相处方式'
-    "（例如 游戏、深夜谈心、工作吐槽）；给不出就空数组。"
-)
-
-
-@dataclass(frozen=True, slots=True)
-class LLMReply:
-    """一次 LLM 深度打分回复解析出的四件套：分数 + 关系画像 + 异动解释 + 话题标签。"""
-
-    score: int
-    summary: str
-    anomaly_note: str | None
-    tags: list[str] | None
-
-
-def _parse_llm_reply(reply: str) -> LLMReply | None:
-    """截取回复里的第一个 JSON 块，解析 score/summary/anomaly_note/tags。
-
-    score 缺失或解析不出 → 整体返回 None（不落缓存）；summary 与
-    anomaly_note 解析失败只是降级成空，不影响分数落库。tags 非 list（含
-    缺失）归一成 None——「老缓存行没有 tags」与「模型给了空数组」是两回事：
-    None 会触发下一轮重评补齐，[] 则不会。其余字段都是模型输出，长度硬
-    截断防毒，且不把回复内容写进日志：日志里出现任何聊天相关文本都违背
-    「原文不出容器」的原则。
-    """
-
-    start = reply.find("{")
-    end = reply.rfind("}")
-    if start < 0 or end <= start:
-        LOG.warning("LLM 深度分回复里没有 JSON 块")
-        return None
-    try:
-        data = json.loads(reply[start : end + 1])
-        score = int(data["score"])
-    except (ValueError, KeyError, TypeError):
-        LOG.warning("LLM 深度分回复里解析不出 score")
-        return None
-    summary = data.get("summary")
-    if not isinstance(summary, str):
-        summary = ""
-    else:
-        summary = summary.strip()[:200]
-    note = data.get("anomaly_note")
-    if not isinstance(note, str):
-        note = None
-    else:
-        note = note.strip()[:100] or None
-    tags = data.get("tags")
-    if not isinstance(tags, list):
-        tags = None
-    else:
-        cleaned: list[str] = []
-        for item in tags:
-            if not isinstance(item, str):
-                continue
-            tag = item.strip()[:8]
-            if tag:
-                cleaned.append(tag)
-            if len(cleaned) >= 4:
-                break
-        tags = cleaned
-    return LLMReply(max(0, min(100, score)), summary, note, tags)
-
-
-def _day_moment(day: str) -> int:
-    """日键 → 当天本地 0 点的时间戳（回放网格点的时间坐标）。
-
-    用日期解析而不是「现在 − n 天 × 86400」：跨夏令时的日子后者会差一小时、
-    日键偶尔差一天，回放点必须精确落在网格日上。
-    """
-
-    return int(datetime.fromisoformat(day).timestamp())
-
-
-def refine_limit_day(moment: int) -> str:
-    """逐日细化的网格终点：今天的前一天。
-
-    今天那个点归今日打分路径（_recompute）所有——它注入 LLM 深度分、沉默
-    天数按真实时刻算，回放口径算不出同一个值。细化网格必须停在昨天，否则
-    每轮分析都会用回放口径覆盖当天的真实分，曲线末点系统性偏低。
-    """
-
-    return (date.fromisoformat(day_key(moment)) - timedelta(days=1)).isoformat()
 
 
 class Analyzer:
@@ -403,13 +181,21 @@ class Analyzer:
                 if read:
                     result.messages_read += read
                     result.per_session[session.display_name] = read
-            # LLM 深度打分要在 reader 关闭前做（它还要从快照里读采样文本）。
-            # 它是可选的加分项：出任何意外都不能拖垮整轮打分，隔离处理。
+            # LLM 深度打分与关系分类要在 reader 关闭前做（它们还要从快照里
+            # 读采样文本）。它们是可选的加分项：出任何意外都不能拖垮整轮
+            # 打分，隔离处理。
             if self.strategy.name == "llm":
                 try:
-                    result.llm_scored = self._refresh_llm_depth(reader, moment)
+                    result.llm_scored = refresh_portraits(
+                        self.store,
+                        reader,
+                        self.strategy,
+                        self.gap_seconds,
+                        moment,
+                        self._report,
+                    )
                 except Exception:
-                    LOG.exception("LLM 深度打分失败，本轮跳过")
+                    LOG.exception("关系画像刷新失败，本轮跳过")
                 # 关系类型分类同样要用 reader 读全时段样本；分类失败只影响
                 # 本轮判定，下一轮再试，不拖垮打分。
                 try:
@@ -424,13 +210,17 @@ class Analyzer:
         self._report(phase="score", done=0, total=0, detail="")
         result.scored = self._recompute(moment)
         # 一次性迁移：清掉旧口径在相识之前铺下的前导 0 段（回放现在从第一条
-        # 消息起画），meta 标记已写就不再跑，详见方法 docstring。
-        self._prune_pre_acquaintance_history(moment)
+        # 消息起画），meta 标记已写就不再跑，详见函数 docstring。
+        prune_pre_acquaintance(self.store, moment)
         # 关系温度全史回放：今日打分之后补上部署日之前的历史，与今日共用
         # 同一个打分内核（_scores_asof），没有第二份真相。
-        result.history_points = self._backfill_history(moment)
+        result.history_points = backfill_history(
+            self.store, self._scores_asof, moment, self._report
+        )
         # 每日粒度的联系人从相识日逐日补点：进度每天落库，断点续跑。
-        result.refined_points = self._refine_daily_history(moment)
+        result.refined_points = refine_daily_history(
+            self.store, self._scores_asof, moment, self._report
+        )
         result.duration_seconds = time.monotonic() - started
 
         if result.messages_read:
@@ -549,155 +339,6 @@ class Analyzer:
             moment - (TREND_RECENT_DAYS + TREND_BASELINE_DAYS) * 86400
         )
         return today, recent_start, baseline_end, baseline_start
-
-    def _refresh_llm_depth(self, reader: HistoryReader, moment: int) -> int:
-        """给候选联系人补上/刷新 LLM 深度分、关系画像与异动解释。
-
-        只在深度策略是 llm 时被调用。所有调用都是出站流量：聊天样本与异动
-        列表拼成一个 user 字符串后，整体过 masking.mask() 再交给 llm.chat
-        ——这是聊天原文离开容器的唯一出口。
-
-        候选 = 采样窗口内有消息，且（从未评过 / 分数过了保鲜期 / 打分后
-        新增消息数达标 / 近期异动指纹变了）的联系人；从未评过的排最前，
-        其余按最陈旧在前，截断到单轮调用上限，剩下的下一轮再评。异动指纹
-        与 _recompute 里的同一套计算重复一次（每轮多算几次 raw_metrics +
-        detect_anomalies，增量一轮 16 秒可接受），换来 prompt 里的异动列表
-        与缓存指纹自洽。
-        """
-
-        sample_start = moment - LLM_SAMPLE_DAYS * 86400
-        today, recent_start, baseline_end, baseline_start = self._window_bounds(moment)
-        recent_windows = self.store.load_window(recent_start, today)
-        baseline_windows = self.store.load_window(baseline_start, baseline_end)
-        empty = Metrics()
-        recent_span = day_span(recent_start, today)
-        baseline_span = day_span(baseline_start, baseline_end)
-        pending: list[
-            tuple[int, int, str, ContactRow, list[dict[str, object]], str]
-        ] = []
-        for contact in self.store.all_contacts():
-            if contact.last_message_at is None or contact.last_message_at < sample_start:
-                continue
-            cached = self.store.get_llm_depth(contact.session_id)
-            anomalies = detect_anomalies(
-                raw_metrics(
-                    recent_windows.get(contact.session_id, empty),
-                    self.strategy,
-                    recent_span,
-                ),
-                raw_metrics(
-                    baseline_windows.get(contact.session_id, empty),
-                    self.strategy,
-                    baseline_span,
-                ),
-                recent_windows.get(contact.session_id, empty),
-                baseline_windows.get(contact.session_id, empty),
-            )
-            key = anomalies_key(anomalies)
-            if not (
-                cached is None
-                or moment - cached.scored_at >= LLM_REFRESH_DAYS * 86400
-                or contact.total_messages - cached.total_messages
-                >= LLM_REFRESH_MESSAGES
-                or cached.anomalies_key != key
-                # 老缓存行没有 tags：还没经历过带 tags 字段的 prompt，重评一次
-                # 补齐。单轮 40 次的上限兜底成本，多数部署两天内收敛。
-                or cached.tags is None
-            ):
-                continue
-            pending.append(
-                (
-                    0 if cached is None else 1,
-                    cached.scored_at if cached is not None else 0,
-                    contact.session_id,
-                    contact,
-                    anomalies,
-                    key,
-                )
-            )
-
-        selected = sorted(pending)[:LLM_MAX_CALLS_PER_RUN]
-        self._report(phase="llm", done=0, total=len(selected), detail="")
-        scored = skipped = failed = 0
-        for done, (_, _, _, contact, anomalies, key) in enumerate(selected, start=1):
-            self._report(
-                phase="llm",
-                done=done,
-                total=len(selected),
-                detail=contact.display_name,
-            )
-            sample = self._llm_sample(
-                reader, contact.session_id, contact.display_name, sample_start
-            )
-            if sample is None:
-                skipped += 1
-                continue
-            user = sample
-            if anomalies:
-                user += "\n\n近期变化：\n" + "\n".join(
-                    f"- {item['label']}：{item['before']} → {item['after']}"
-                    for item in anomalies
-                )
-            reply = llm.chat(_LLM_SYSTEM_PROMPT, mask(user))
-            parsed = _parse_llm_reply(reply) if reply is not None else None
-            if parsed is None:
-                failed += 1
-                continue
-            self.store.set_llm_depth(
-                contact.session_id,
-                parsed.score,
-                moment,
-                contact.total_messages,
-                parsed.summary,
-                parsed.anomaly_note,
-                key,
-                parsed.tags,
-            )
-            scored += 1
-        LOG.info(
-            "LLM 深度打分：评分 %d 个，跳过 %d 个，失败 %d 个", scored, skipped, failed
-        )
-        return scored
-
-    def _llm_sample(
-        self,
-        reader: HistoryReader,
-        session_id: str,
-        display_name: str,
-        sample_start: int,
-    ) -> str | None:
-        """从采样窗口读一批消息，从最晚往前拼最近几段对话；没有 text 返回 None。
-
-        只取 text 类消息，每行「我: 内容 / TA: 内容」，段与段之间空行分隔，
-        总字数达到 LLM_SAMPLE_MAX_CHARS 就停。窗口内消息超过一个批次时只
-        覆盖最旧的那一批（读接口只支持从游标向前读），采样质量足够。
-        """
-
-        batch = read_messages_after(
-            reader,
-            session_id,
-            display_name,
-            {},
-            Cursor(sample_start, "", -1),
-            BACKFILL_BATCH,
-        )
-        blocks: list[str] = []
-        total = 0
-        for conversation in reversed(
-            split_conversations(batch.messages, self.gap_seconds)
-        ):
-            lines = [
-                f"{'我' if message.direction == ME else 'TA'}: {message.text}"
-                for message in conversation
-                if message.kind == "text" and message.text
-            ]
-            if not lines:
-                continue
-            blocks.append("\n".join(lines))
-            total += sum(len(line) for line in lines)
-            if total >= LLM_SAMPLE_MAX_CHARS:
-                break
-        return None if not blocks else "\n\n".join(blocks)
 
     def _weight_of(self, today: str, day: str) -> float:
         """打分窗口内一个天桶的衰减权重：天龄 = 距今天数（今天为 0）。"""
@@ -1091,198 +732,3 @@ class Analyzer:
         LOG.info("完成打分：%d/%d 个联系人样本达标", len(eligible), len(payloads))
         return len(scores)
 
-    def _prune_pre_acquaintance_history(self, moment: int) -> int:
-        """一次性迁移：清掉旧口径在相识之前铺下的前导 0 段。
-
-        旧回放从全局最早统计日给所有人铺点，晚认识的人相识前被记成一长段 0；
-        新口径从第一条消息起画，这里清掉历史库里的前导 0 段，靠 meta 标记
-        score_history_pruned_v1 只跑一次。first_message_at 为 None 的联系人
-        跳过——无从确定起点，且这类行里混着今日路径记的每日点，不能盲删。
-        """
-
-        if self.store.get_meta("score_history_pruned_v1"):
-            return 0
-        cutoffs = {
-            contact.session_id: day_key(contact.first_message_at)
-            for contact in self.store.all_contacts()
-            if contact.first_message_at is not None
-        }
-        pruned = self.store.prune_score_history_before(cutoffs)
-        self.store.set_meta("score_history_pruned_v1", str(moment))
-        LOG.info("清理相识前的温度采样点：删除 %d 行", pruned)
-        return pruned
-
-    def _history_rows(
-        self, asof: ScoresAsOf, day: str, only: set[str] | None = None
-    ) -> list[tuple[str, float, str]]:
-        """把一个 asof 快照换算成当天要写的温度采样行。
-
-        only 为 None 时处理快照里的全部联系人（全史回放用），否则只处理
-        集合里的 session_id（逐日细化用）。规则与每日记点一致：相识日
-        之前不存在关系（既不打分也不算归零，曲线从第一条消息那天起）；
-        达标打分记当天综合分与七维；窗口零消息的普通联系人记 0、事务
-        往来与零消息家人跳过；有消息但样本不够不记。
-        """
-
-        rows: list[tuple[str, float, str]] = []
-        for session_id, contact in asof.contacts.items():
-            if only is not None and session_id not in only:
-                continue
-            if (
-                contact.first_message_at is None
-                or day_key(contact.first_message_at) > day
-            ):
-                # 相识之前不存在关系：既不打分也不算「归零」，曲线从第一条
-                # 消息那天起；没有任何消息的联系人无从确定起点，不回放。
-                continue
-            kind = contact.relation_kind()
-            dims = asof.scores.get(session_id)
-            if dims is not None:
-                # 达标打分：记当天的综合分与七维（与每日记点同一格式）。
-                rows.append(
-                    (
-                        session_id,
-                        round(dims["overall"], 1),
-                        json.dumps(
-                            {
-                                name: round(dims[name], 1)
-                                for name in DIMENSION_NAMES
-                            },
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                        ),
-                    )
-                )
-                continue
-            window = asof.stats.get(session_id)
-            if window is None or window.raw.messages_total() <= 0:
-                if kind in ("transactional", "family"):
-                    # 事务往来永不记温度；家人零消息不归零、不记 0 分——
-                    # 两者都与每日规则一致。
-                    continue
-                # 归零也是曲线的一部分：记 0。
-                rows.append(
-                    (
-                        session_id,
-                        0.0,
-                        json.dumps(
-                            {name: 0.0 for name in DIMENSION_NAMES},
-                            ensure_ascii=False,
-                            separators=(",", ":"),
-                        ),
-                    )
-                )
-            # 有消息但样本不够：数据不足，不记（与每日规则一致）。
-        return rows
-
-    def _backfill_history(self, moment: int) -> int:
-        """把关系温度回放到全史：从最早统计日起每 7 天一个采样点，直到今天。
-
-        网格是全局的（所有联系人里最早的统计日起），但每位联系人只从自己
-        第一条消息那天起才记点：相识之前不打分也不归零，曲线没有前导 0 段。
-        与今日打分共用 _scores_asof 内核，历史回放没有第二份真相；周点与部署
-        日起的每日点重叠时 UPSERT 覆盖，无害。完成后记 meta 标记
-        score_history_backfilled（值 = moment），之后每轮跳过；设
-        INSIGHTS_FORCE_HISTORY_BACKFILL=true 强制重跑（打分口径升级后重放历史
-        用）。回放与今日口径的差异见 _scores_asof 的注释。
-        """
-
-        if not INSIGHTS_FORCE_HISTORY_BACKFILL and self.store.get_meta(
-            "score_history_backfilled"
-        ):
-            return 0
-
-        earliest = self.store.earliest_stats_day()
-        if earliest is None:
-            return 0  # 一条天桶都没有（首轮同步还没落地），无史可回放。
-        today = day_key(moment)
-        grid: list[str] = []
-        cursor = earliest
-        while cursor <= today:
-            grid.append(cursor)
-            cursor = (date.fromisoformat(cursor) + timedelta(days=7)).isoformat()
-        if not grid:
-            return 0
-
-        started = time.monotonic()
-        points = 0
-        self._report(phase="history", done=0, total=len(grid), detail="")
-        for done, day in enumerate(grid, start=1):
-            self._report(phase="history", done=done, total=len(grid), detail=day)
-            asof = self._scores_asof(_day_moment(day))
-            rows = self._history_rows(asof, day)
-            # 每点一个事务：单个点失败不连坐整段历史。
-            self.store.record_score_history(day, rows)
-            points += len(rows)
-        self.store.set_meta("score_history_backfilled", str(moment))
-        LOG.info(
-            "全史回放：%d 天网格 %d 个采样点，写入 %d 行，用时 %.1f 秒",
-            day_span(earliest, today),
-            len(grid),
-            points,
-            time.monotonic() - started,
-        )
-        return points
-
-    def _refine_daily_history(self, moment: int) -> int:
-        """把切到每日粒度的联系人从相识日起逐日补点，直到昨天（今天那个点
-        归今日打分路径）。
-
-        同一天的 _scores_asof 快照服务所有待细化联系人：重算成本只与网格
-        天数有关，与人数无关。每完成一天就把进度写进 history_daily_until
-        （每天都写，不攒批），容器重启后从断点续跑，不重头再来。逐日点会
-        覆盖同一天已有的周点（同一主键 UPSERT），打分内核一致所以值相同，
-        无害。
-        """
-
-        limit = refine_limit_day(moment)
-        pending = self.store.contacts_needing_daily_refine(limit)
-        if not pending:
-            return 0
-
-        def start_of(contact: ContactRow) -> str:
-            # 起点 = 相识日与「上次进度的次日」取晚；进度为空表示还没开始。
-            acquaintance = day_key(contact.first_message_at)
-            if not contact.history_daily_until:
-                return acquaintance
-            resumed = (
-                date.fromisoformat(contact.history_daily_until)
-                + timedelta(days=1)
-            ).isoformat()
-            return max(acquaintance, resumed)
-
-        starts = {contact.session_id: start_of(contact) for contact in pending}
-        grid: list[str] = []
-        cursor = min(starts.values())
-        while cursor <= limit:
-            grid.append(cursor)
-            cursor = (date.fromisoformat(cursor) + timedelta(days=1)).isoformat()
-        if not grid:
-            return 0
-
-        started = time.monotonic()
-        points = 0
-        self._report(phase="refine", done=0, total=len(grid), detail="")
-        for done, day in enumerate(grid, start=1):
-            self._report(phase="refine", done=done, total=len(grid), detail=day)
-            asof = self._scores_asof(_day_moment(day))
-            # 这一天只服务已经到达自己起点的联系人：起点更晚的人相识日
-            # 之前没有历史可细化，进度也不能先于实际计算推进。
-            active = {
-                session_id
-                for session_id, start in starts.items()
-                if start <= day
-            }
-            rows = self._history_rows(asof, day, only=active)
-            self.store.record_score_history(day, rows)
-            # 每天都写进度：崩溃/重启后只重算断点之后的天数。
-            self.store.mark_daily_refined(list(active), day)
-            points += len(rows)
-        LOG.info(
-            "逐日细化：%d 个联系人，%d 天网格，写入 %d 行，用时 %.1f 秒",
-            len(pending),
-            len(grid),
-            points,
-            time.monotonic() - started,
-        )
-        return points

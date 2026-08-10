@@ -9,7 +9,8 @@ from unittest.mock import patch
 
 from aiohttp.test_utils import AioHTTPTestCase
 
-from wechat_insights.analyzer import AnalysisResult, refine_limit_day
+from wechat_insights.analyzer import AnalysisResult
+from wechat_insights.history import refine_limit_day
 from wechat_insights.metrics import Metrics, day_key
 from wechat_insights.server import (
     InsightsRuntime,

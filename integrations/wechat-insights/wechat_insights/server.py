@@ -19,8 +19,9 @@ from urllib.parse import urlencode
 
 from aiohttp import web
 
-from .analyzer import Analyzer, refine_limit_day
+from .analyzer import Analyzer
 from .classify import KIND_VALUES
+from .history import refine_limit_day
 from .constants import (
     ANALYZE_TIME,
     AUTH_COOKIE,
@@ -68,7 +69,7 @@ def _history_sampling(row: ContactRow) -> dict:
 
     pending 表示「粒度是每日且还有历史没细化完」：逐日细化要跑几小时，
     前端据此显示进行中状态，而不是拿一条残缺的曲线当最终结果。细化网格
-    的终点与细化任务共用 analyzer.refine_limit_day——网格停在昨天，今天
+    的终点与细化任务共用 history.refine_limit_day——网格停在昨天，今天
     那个点由今日打分路径记，两处不许各算一遍；没有相识日的联系人细化
     任务的 SQL 永远不会处理（first_message_at IS NOT NULL），一律不算
     pending，否则前端会永远显示细化中。
