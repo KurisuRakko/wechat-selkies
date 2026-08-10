@@ -1,15 +1,16 @@
 from __future__ import annotations
 
 import tempfile
-from datetime import datetime
+import time
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from aiohttp.test_utils import AioHTTPTestCase
 
-from wechat_insights.analyzer import AnalysisResult
-from wechat_insights.metrics import Metrics
+from wechat_insights.analyzer import AnalysisResult, refine_limit_day
+from wechat_insights.metrics import Metrics, day_key
 from wechat_insights.server import (
     InsightsRuntime,
     create_app,
@@ -105,6 +106,11 @@ class ApiTests(AioHTTPTestCase):
         self.addCleanup(self.store.close)
         self.store.set_meta("last_analyzed_at", "1700000000")
         self.store.ensure_contact(SESSION_ID, "Alice")
+        # 相识日按真实分析过的联系人补上：没有相识日的联系人细化任务永远
+        # 不会处理（见 test_detail_pending_false_without_a_first_message）。
+        contact = self.store.get_contact(SESSION_ID)
+        contact.first_message_at = 1_700_000_000
+        self.store.save_contact(contact)
         self.store.save_scores([(SESSION_ID, payload())])
         self.store.set_json("medians", {"responsiveness": 50.0})
         bucket = Metrics()
@@ -268,6 +274,115 @@ class ApiTests(AioHTTPTestCase):
             (await self.client.post("/api/contact/nope/kind", json={"kind": "family"})).status,
             404,
         )
+
+    async def test_contact_history_switches_granularity(self) -> None:
+        response = await self.client.post(
+            f"/api/contact/{HASH}/history", json={"granularity": "day"}
+        )
+        self.assertEqual(response.status, 200)
+        body = await response.json()
+        self.assertTrue(body["ok"])
+        self.assertEqual(
+            body["history_sampling"],
+            {"granularity": "day", "daily_until": None, "pending": True},
+        )
+        self.assertEqual(self.store.get_contact(SESSION_ID).history_granularity, "day")
+
+        # 切回每周：粒度写回空串；已细化的日点不删（库侧没有删除逻辑）。
+        response = await self.client.post(
+            f"/api/contact/{HASH}/history", json={"granularity": "week"}
+        )
+        self.assertEqual(response.status, 200)
+        body = await response.json()
+        self.assertEqual(body["history_sampling"]["granularity"], "week")
+        self.assertFalse(body["history_sampling"]["pending"])
+        self.assertEqual(self.store.get_contact(SESSION_ID).history_granularity, "")
+
+    async def test_contact_history_rejects_invalid_values(self) -> None:
+        for bad in ("daily", "DAY", "", 42, None):
+            response = await self.client.post(
+                f"/api/contact/{HASH}/history", json={"granularity": bad}
+            )
+            self.assertEqual(response.status, 400)
+            body = await response.json()
+            self.assertEqual(body["error"]["code"], "BAD_REQUEST")
+            self.assertEqual(body["error"]["message"], "granularity 取值非法")
+        # 只接受 JSON body。
+        self.assertEqual(
+            (await self.client.post(f"/api/contact/{HASH}/history")).status, 400
+        )
+
+    async def test_contact_history_requires_an_existing_contact(self) -> None:
+        response = await self.client.post(
+            f"/api/contact/{'0' * 24}/history", json={"granularity": "day"}
+        )
+        self.assertEqual(response.status, 404)
+        body = await response.json()
+        self.assertEqual(body["error"]["code"], "CONTACT_NOT_FOUND")
+        self.assertEqual(
+            (
+                await self.client.post(
+                    "/api/contact/nope/history", json={"granularity": "day"}
+                )
+            ).status,
+            404,
+        )
+
+    async def test_detail_reports_history_sampling_from_the_store(self) -> None:
+        body = await (await self.client.get(f"/api/contact/{HASH}")).json()
+        self.assertEqual(
+            body["history_sampling"],
+            {"granularity": "week", "daily_until": None, "pending": False},
+        )
+
+        # 切到每日但还没开始细化：pending 为真。
+        self.store.set_history_granularity(SESSION_ID, "day")
+        body = await (await self.client.get(f"/api/contact/{HASH}")).json()
+        self.assertEqual(body["history_sampling"]["granularity"], "day")
+        self.assertTrue(body["history_sampling"]["pending"])
+
+        # 细化已推进到今天：pending 为假，daily_until 是今天的日键。
+        today = day_key(int(time.time()))
+        self.store.mark_daily_refined([SESSION_ID], today)
+        body = await (await self.client.get(f"/api/contact/{HASH}")).json()
+        self.assertEqual(
+            body["history_sampling"],
+            {"granularity": "day", "daily_until": today, "pending": False},
+        )
+
+        # 细化推进到昨天（真实终态，边界与细化任务共用 refine_limit_day）：
+        # 依旧不 pending。
+        yesterday = refine_limit_day(int(time.time()))
+        self.store.mark_daily_refined([SESSION_ID], yesterday)
+        body = await (await self.client.get(f"/api/contact/{HASH}")).json()
+        self.assertEqual(
+            body["history_sampling"],
+            {"granularity": "day", "daily_until": yesterday, "pending": False},
+        )
+
+        # 进度停在更早（前天）：还有历史没细化完，pending 为真。
+        before = (date.fromisoformat(yesterday) - timedelta(days=1)).isoformat()
+        self.store.mark_daily_refined([SESSION_ID], before)
+        body = await (await self.client.get(f"/api/contact/{HASH}")).json()
+        self.assertEqual(
+            body["history_sampling"],
+            {"granularity": "day", "daily_until": before, "pending": True},
+        )
+
+    async def test_detail_pending_false_without_a_first_message(self) -> None:
+        # 另建一个空联系人（ensure_contact 不写 first_message_at，永远是
+        # None）。细化任务的 SQL 要求相识日非空，永远不会处理这样的联系人，
+        # 切到每日也不能显示「细化中」，否则前端永远转圈。
+        empty_session = "stranger"
+        empty_hash = contact_hash(empty_session)
+        self.store.ensure_contact(empty_session, "Stranger")
+        empty_payload = payload()
+        empty_payload["hash"] = empty_hash
+        self.store.update_score_payload(empty_session, empty_payload)
+        self.store.set_history_granularity(empty_session, "day")
+        body = await (await self.client.get(f"/api/contact/{empty_hash}")).json()
+        self.assertEqual(body["history_sampling"]["granularity"], "day")
+        self.assertFalse(body["history_sampling"]["pending"])
 
     async def test_progress_reports_idle_state_by_default(self) -> None:
         body = await (await self.client.get("/api/progress")).json()

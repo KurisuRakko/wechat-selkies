@@ -87,6 +87,8 @@ class AnalysisResult:
     classified: int = 0
     # 本轮全史回放写入的采样点行数（关系温度曲线补上部署日之前的历史）。
     history_points: int = 0
+    # 本轮逐日细化写入的采样点行数（每日粒度联系人从相识日逐日补点）。
+    refined_points: int = 0
     per_session: dict[str, int] = field(default_factory=dict)
 
 
@@ -329,6 +331,17 @@ def _day_moment(day: str) -> int:
     return int(datetime.fromisoformat(day).timestamp())
 
 
+def refine_limit_day(moment: int) -> str:
+    """逐日细化的网格终点：今天的前一天。
+
+    今天那个点归今日打分路径（_recompute）所有——它注入 LLM 深度分、沉默
+    天数按真实时刻算，回放口径算不出同一个值。细化网格必须停在昨天，否则
+    每轮分析都会用回放口径覆盖当天的真实分，曲线末点系统性偏低。
+    """
+
+    return (date.fromisoformat(day_key(moment)) - timedelta(days=1)).isoformat()
+
+
 class Analyzer:
     """一轮完整分析：拉新消息 → 聚合落库 → 重算全部看板数据。"""
 
@@ -410,9 +423,14 @@ class Analyzer:
 
         self._report(phase="score", done=0, total=0, detail="")
         result.scored = self._recompute(moment)
+        # 一次性迁移：清掉旧口径在相识之前铺下的前导 0 段（回放现在从第一条
+        # 消息起画），meta 标记已写就不再跑，详见方法 docstring。
+        self._prune_pre_acquaintance_history(moment)
         # 关系温度全史回放：今日打分之后补上部署日之前的历史，与今日共用
         # 同一个打分内核（_scores_asof），没有第二份真相。
         result.history_points = self._backfill_history(moment)
+        # 每日粒度的联系人从相识日逐日补点：进度每天落库，断点续跑。
+        result.refined_points = self._refine_daily_history(moment)
         result.duration_seconds = time.monotonic() - started
 
         if result.messages_read:
@@ -1073,9 +1091,95 @@ class Analyzer:
         LOG.info("完成打分：%d/%d 个联系人样本达标", len(eligible), len(payloads))
         return len(scores)
 
+    def _prune_pre_acquaintance_history(self, moment: int) -> int:
+        """一次性迁移：清掉旧口径在相识之前铺下的前导 0 段。
+
+        旧回放从全局最早统计日给所有人铺点，晚认识的人相识前被记成一长段 0；
+        新口径从第一条消息起画，这里清掉历史库里的前导 0 段，靠 meta 标记
+        score_history_pruned_v1 只跑一次。first_message_at 为 None 的联系人
+        跳过——无从确定起点，且这类行里混着今日路径记的每日点，不能盲删。
+        """
+
+        if self.store.get_meta("score_history_pruned_v1"):
+            return 0
+        cutoffs = {
+            contact.session_id: day_key(contact.first_message_at)
+            for contact in self.store.all_contacts()
+            if contact.first_message_at is not None
+        }
+        pruned = self.store.prune_score_history_before(cutoffs)
+        self.store.set_meta("score_history_pruned_v1", str(moment))
+        LOG.info("清理相识前的温度采样点：删除 %d 行", pruned)
+        return pruned
+
+    def _history_rows(
+        self, asof: ScoresAsOf, day: str, only: set[str] | None = None
+    ) -> list[tuple[str, float, str]]:
+        """把一个 asof 快照换算成当天要写的温度采样行。
+
+        only 为 None 时处理快照里的全部联系人（全史回放用），否则只处理
+        集合里的 session_id（逐日细化用）。规则与每日记点一致：相识日
+        之前不存在关系（既不打分也不算归零，曲线从第一条消息那天起）；
+        达标打分记当天综合分与七维；窗口零消息的普通联系人记 0、事务
+        往来与零消息家人跳过；有消息但样本不够不记。
+        """
+
+        rows: list[tuple[str, float, str]] = []
+        for session_id, contact in asof.contacts.items():
+            if only is not None and session_id not in only:
+                continue
+            if (
+                contact.first_message_at is None
+                or day_key(contact.first_message_at) > day
+            ):
+                # 相识之前不存在关系：既不打分也不算「归零」，曲线从第一条
+                # 消息那天起；没有任何消息的联系人无从确定起点，不回放。
+                continue
+            kind = contact.relation_kind()
+            dims = asof.scores.get(session_id)
+            if dims is not None:
+                # 达标打分：记当天的综合分与七维（与每日记点同一格式）。
+                rows.append(
+                    (
+                        session_id,
+                        round(dims["overall"], 1),
+                        json.dumps(
+                            {
+                                name: round(dims[name], 1)
+                                for name in DIMENSION_NAMES
+                            },
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                    )
+                )
+                continue
+            window = asof.stats.get(session_id)
+            if window is None or window.raw.messages_total() <= 0:
+                if kind in ("transactional", "family"):
+                    # 事务往来永不记温度；家人零消息不归零、不记 0 分——
+                    # 两者都与每日规则一致。
+                    continue
+                # 归零也是曲线的一部分：记 0。
+                rows.append(
+                    (
+                        session_id,
+                        0.0,
+                        json.dumps(
+                            {name: 0.0 for name in DIMENSION_NAMES},
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                    )
+                )
+            # 有消息但样本不够：数据不足，不记（与每日规则一致）。
+        return rows
+
     def _backfill_history(self, moment: int) -> int:
         """把关系温度回放到全史：从最早统计日起每 7 天一个采样点，直到今天。
 
+        网格是全局的（所有联系人里最早的统计日起），但每位联系人只从自己
+        第一条消息那天起才记点：相识之前不打分也不归零，曲线没有前导 0 段。
         与今日打分共用 _scores_asof 内核，历史回放没有第二份真相；周点与部署
         日起的每日点重叠时 UPSERT 覆盖，无害。完成后记 meta 标记
         score_history_backfilled（值 = moment），之后每轮跳过；设
@@ -1106,46 +1210,7 @@ class Analyzer:
         for done, day in enumerate(grid, start=1):
             self._report(phase="history", done=done, total=len(grid), detail=day)
             asof = self._scores_asof(_day_moment(day))
-            rows: list[tuple[str, float, str]] = []
-            for session_id, contact in asof.contacts.items():
-                kind = contact.relation_kind()
-                dims = asof.scores.get(session_id)
-                if dims is not None:
-                    # 达标打分：记当天的综合分与七维（与每日记点同一格式）。
-                    rows.append(
-                        (
-                            session_id,
-                            round(dims["overall"], 1),
-                            json.dumps(
-                                {
-                                    name: round(dims[name], 1)
-                                    for name in DIMENSION_NAMES
-                                },
-                                ensure_ascii=False,
-                                separators=(",", ":"),
-                            ),
-                        )
-                    )
-                    continue
-                window = asof.stats.get(session_id)
-                if window is None or window.raw.messages_total() <= 0:
-                    if kind in ("transactional", "family"):
-                        # 事务往来永不记温度；家人零消息不归零、不记 0 分——
-                        # 两者都与每日规则一致。
-                        continue
-                    # 归零也是曲线的一部分：记 0。
-                    rows.append(
-                        (
-                            session_id,
-                            0.0,
-                            json.dumps(
-                                {name: 0.0 for name in DIMENSION_NAMES},
-                                ensure_ascii=False,
-                                separators=(",", ":"),
-                            ),
-                        )
-                    )
-                # 有消息但样本不够：数据不足，不记（与每日规则一致）。
+            rows = self._history_rows(asof, day)
             # 每点一个事务：单个点失败不连坐整段历史。
             self.store.record_score_history(day, rows)
             points += len(rows)
@@ -1153,6 +1218,69 @@ class Analyzer:
         LOG.info(
             "全史回放：%d 天网格 %d 个采样点，写入 %d 行，用时 %.1f 秒",
             day_span(earliest, today),
+            len(grid),
+            points,
+            time.monotonic() - started,
+        )
+        return points
+
+    def _refine_daily_history(self, moment: int) -> int:
+        """把切到每日粒度的联系人从相识日起逐日补点，直到昨天（今天那个点
+        归今日打分路径）。
+
+        同一天的 _scores_asof 快照服务所有待细化联系人：重算成本只与网格
+        天数有关，与人数无关。每完成一天就把进度写进 history_daily_until
+        （每天都写，不攒批），容器重启后从断点续跑，不重头再来。逐日点会
+        覆盖同一天已有的周点（同一主键 UPSERT），打分内核一致所以值相同，
+        无害。
+        """
+
+        limit = refine_limit_day(moment)
+        pending = self.store.contacts_needing_daily_refine(limit)
+        if not pending:
+            return 0
+
+        def start_of(contact: ContactRow) -> str:
+            # 起点 = 相识日与「上次进度的次日」取晚；进度为空表示还没开始。
+            acquaintance = day_key(contact.first_message_at)
+            if not contact.history_daily_until:
+                return acquaintance
+            resumed = (
+                date.fromisoformat(contact.history_daily_until)
+                + timedelta(days=1)
+            ).isoformat()
+            return max(acquaintance, resumed)
+
+        starts = {contact.session_id: start_of(contact) for contact in pending}
+        grid: list[str] = []
+        cursor = min(starts.values())
+        while cursor <= limit:
+            grid.append(cursor)
+            cursor = (date.fromisoformat(cursor) + timedelta(days=1)).isoformat()
+        if not grid:
+            return 0
+
+        started = time.monotonic()
+        points = 0
+        self._report(phase="refine", done=0, total=len(grid), detail="")
+        for done, day in enumerate(grid, start=1):
+            self._report(phase="refine", done=done, total=len(grid), detail=day)
+            asof = self._scores_asof(_day_moment(day))
+            # 这一天只服务已经到达自己起点的联系人：起点更晚的人相识日
+            # 之前没有历史可细化，进度也不能先于实际计算推进。
+            active = {
+                session_id
+                for session_id, start in starts.items()
+                if start <= day
+            }
+            rows = self._history_rows(asof, day, only=active)
+            self.store.record_score_history(day, rows)
+            # 每天都写进度：崩溃/重启后只重算断点之后的天数。
+            self.store.mark_daily_refined(list(active), day)
+            points += len(rows)
+        LOG.info(
+            "逐日细化：%d 个联系人，%d 天网格，写入 %d 行，用时 %.1f 秒",
+            len(pending),
             len(grid),
             points,
             time.monotonic() - started,

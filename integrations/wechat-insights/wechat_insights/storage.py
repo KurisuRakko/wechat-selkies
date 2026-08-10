@@ -41,7 +41,12 @@ _LLM_DEPTH_EXTRA_COLUMNS = ("summary", "anomaly_note", "anomalies_key", "tags")
 
 #: contacts 在 CREATE TABLE 之外的幂等补列清单（见 _initialize）。
 #: contacts 里存着游标与里程碑，生产库上补列只能 ALTER，绝不能重建回填。
-_CONTACT_KIND_EXTRA_COLUMNS = ("kind_auto", "kind_manual")
+_CONTACT_EXTRA_COLUMNS = (
+    "kind_auto",
+    "kind_manual",
+    "history_granularity",
+    "history_daily_until",
+)
 
 #: get_llm_depth / all_llm_depth 的共享列清单，两处查询保持一致。
 _LLM_DEPTH_COLUMNS = (
@@ -76,7 +81,11 @@ CREATE TABLE IF NOT EXISTS contacts (
     -- 分类是稳定属性，写过就不再重评；手动改判随时可以覆盖它。
     kind_auto                TEXT NOT NULL DEFAULT '',
     -- 用户手动改判的关系类型：'' = 未设置（沿用自动判定或默认 friend）。
-    kind_manual              TEXT NOT NULL DEFAULT ''
+    kind_manual              TEXT NOT NULL DEFAULT '',
+    -- 关系温度采样粒度：'' = 每周一个采样点（默认），'day' = 从相识日起逐日细化。
+    history_granularity      TEXT NOT NULL DEFAULT '',
+    -- 逐日细化已推进到（含）的日键；'' = 还没开始。断点续跑的进度点。
+    history_daily_until      TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS stats_daily (
@@ -148,6 +157,8 @@ class ContactRow:
     max_laugh_run: int
     kind_auto: str
     kind_manual: str
+    history_granularity: str = ""
+    history_daily_until: str = ""
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> ContactRow:
@@ -265,8 +276,9 @@ class MetricsStore:
                 except sqlite3.OperationalError:
                     pass  # 列已存在（新形状的库）
             # contacts 存着游标与里程碑，同样不能重建：幂等补列，旧行直接
-            # 读回两个空串，未判定的联系人按默认 friend 处理，升级后一切照旧。
-            for column in _CONTACT_KIND_EXTRA_COLUMNS:
+            # 读回空串（未判定的联系人按默认 friend、采样粒度按每周处理），
+            # 升级后一切照旧。
+            for column in _CONTACT_EXTRA_COLUMNS:
                 try:
                     setup.execute(
                         f"ALTER TABLE contacts ADD COLUMN {column} "
@@ -384,7 +396,8 @@ class MetricsStore:
                 first_message_at = ?, last_message_at = ?, total_messages = ?,
                 longest_silence_seconds = ?, longest_silence_ended_at = ?,
                 latest_night_at = ?, latest_night_offset = ?, max_laugh_run = ?,
-                kind_auto = ?, kind_manual = ?
+                kind_auto = ?, kind_manual = ?,
+                history_granularity = ?, history_daily_until = ?
             WHERE session_id = ?
             """,
             (
@@ -402,6 +415,8 @@ class MetricsStore:
                 contact.max_laugh_run,
                 contact.kind_auto,
                 contact.kind_manual,
+                contact.history_granularity,
+                contact.history_daily_until,
                 contact.session_id,
             ),
         )
@@ -425,6 +440,50 @@ class MetricsStore:
             connection.execute(
                 "UPDATE contacts SET kind_auto = ? WHERE session_id = ?",
                 (kind, session_id),
+            )
+
+    def set_history_granularity(self, session_id: str, granularity: str) -> None:
+        """设置联系人的关系温度采样粒度：'day' = 逐日细化，'' = 每周（默认）。
+
+        只改这一列；切回每周不重置 history_daily_until，已细化的日点保留。
+        """
+
+        with self.connection as connection:
+            connection.execute(
+                "UPDATE contacts SET history_granularity = ? WHERE session_id = ?",
+                (granularity, session_id),
+            )
+
+    def contacts_needing_daily_refine(self, limit_day: str) -> list[ContactRow]:
+        """待逐日细化的联系人：粒度是每日、进度还没到 limit_day、且知道相识日。
+
+        history_daily_until 是断点续跑的进度：空串（还没开始）和小于
+        limit_day 的日键都算未完成，容器重启后从这里继续，不重头再来。
+        limit_day 由 analyzer.refine_limit_day 给出——两个调用方共用同一个
+        网格终点，不许各算一遍。
+        """
+
+        return [
+            ContactRow.from_row(row)
+            for row in self.connection.execute(
+                "SELECT * FROM contacts "
+                "WHERE history_granularity = 'day' AND history_daily_until < ? "
+                "AND first_message_at IS NOT NULL",
+                (limit_day,),
+            )
+        ]
+
+    def mark_daily_refined(self, session_ids: list[str], day: str) -> None:
+        """批量把一批联系人的逐日细化进度推进到 day（断点续跑的进度点）。
+
+        每完成一天调一次：即使这天一个采样点都没写入（如零消息的家人），
+        只要重算跑过了，进度就推进。
+        """
+
+        with self.connection as connection:
+            connection.executemany(
+                "UPDATE contacts SET history_daily_until = ? WHERE session_id = ?",
+                [(day, session_id) for session_id in session_ids],
             )
 
     # —— llm_depth ——
@@ -731,3 +790,20 @@ class MetricsStore:
                 (session_id,),
             )
         ]
+
+    def prune_score_history_before(self, cutoffs: dict[str, str]) -> int:
+        """一次性迁移：删掉相识日之前的温度采样点，返回删除的总行数。
+
+        cutoffs = {session_id: 相识日键}；对每个联系人删除 day < 相识日的
+        score_history 行。所有删除在同一个事务里完成。
+        """
+
+        deleted = 0
+        with self.connection as connection:
+            for session_id, cutoff_day in cutoffs.items():
+                cursor = connection.execute(
+                    "DELETE FROM score_history WHERE session_id = ? AND day < ?",
+                    (session_id, cutoff_day),
+                )
+                deleted += cursor.rowcount
+        return deleted

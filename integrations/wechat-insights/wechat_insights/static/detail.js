@@ -177,6 +177,48 @@
     );
   }
 
+  /**
+   * 「关系温度」卡内的采样粒度选择器：select + 说明文字，DOM 结构与
+   * kindCard 的改判控件一致。说明文案按当前粒度与细化进度区分，
+   * 动态内容（日期等）一律 escapeHtml。
+   */
+  function tempPickerHtml(sampling) {
+    var current = sampling.granularity === "day" ? "day" : "week";
+    var caption;
+    if (current === "day") {
+      // pending 只表示「还有历史没细化完」——网格停在昨天，跨过零点后到
+      // 当晚分析之前必然为真，并不代表此刻在跑（细化只在分析轮里执行）。
+      // 三种状态：待开始 / 已推进到某天 / 已到最近。
+      if (sampling.pending) {
+        caption = sampling.daily_until
+          ? "已逐日细化到 " + I.escapeHtml(sampling.daily_until) +
+            "，其余的下一轮分析继续补。"
+          : "下一轮分析开始从相识那天起逐日细化，全史可能要一两个小时，完成前曲线保持现状。";
+      } else {
+        caption = "已逐日细化到最近。切回每周不会删掉已经算出来的细节。";
+      }
+    } else {
+      caption =
+        "切到每日会把这位联系人从相识那天起逐日重算，采样点上千、耗时可能" +
+        "一两个小时，下一轮分析开始，完成前曲线保持现状。";
+    }
+    return (
+      '<span class="select">' +
+      '<select class="history-picker__select" aria-label="采样粒度">' +
+      '<option value="week"' +
+      (current === "week" ? " selected" : "") +
+      ">每周采样</option>" +
+      '<option value="day"' +
+      (current === "day" ? " selected" : "") +
+      ">每日采样</option>" +
+      "</select>" +
+      "</span>" +
+      '<p class="md-caption">' +
+      caption +
+      "</p>"
+    );
+  }
+
   /** 手动改判关系类型：POST 后重载页面（服务端已改写该联系人的 payload）。 */
   async function changeKind(kind) {
     var result;
@@ -196,6 +238,32 @@
       return;
     }
     I.snackbar("已更新关系类型");
+    global.location.reload();
+  }
+
+  /** 切换采样粒度：POST 后重载页面（服务端按粒度重算历史）。 */
+  async function changeGranularity(granularity) {
+    var result;
+    try {
+      result = await I.apiPost(
+        "/api/contact/" + encodeURIComponent(readHash()) + "/history",
+        { granularity: granularity }
+      );
+    } catch (err) {
+      I.snackbar(err.message || "切换失败");
+      return;
+    }
+    var data = result.data || {};
+    if (result.status !== 200 || !data.ok) {
+      var info = data.error || {};
+      I.snackbar(info.message || "切换失败");
+      return;
+    }
+    I.snackbar(
+      granularity === "day"
+        ? "已切到每日采样，下一轮分析开始细化"
+        : "已切回每周采样"
+    );
     global.location.reload();
   }
 
@@ -244,10 +312,22 @@
     var typesBody = types.length
       ? '<div class="chart" id="types-chart"></div>'
       : emptyCardBody("暂无消息类型数据");
-    // 少于两个采样点的曲线没有形状，部署首日整卡不渲染。
+    // 少于两个采样点的曲线没有形状，部署首日整卡不渲染
+    // （粒度控件也随之不渲染——还没有曲线可细化）。
     var tempBody = history.length >= 2
-      ? '<div class="chart" id="temp-chart"></div>'
+      ? '<div class="chart" id="temp-chart"></div>' +
+        tempPickerHtml(payload.history_sampling || {})
       : "";
+    // 副标题优先显示相识日（first_message_at）；没有相识日的联系人退回曲线
+    // 首点的日期。tempBody 为空时整卡不渲染，不必算副标题——history 也可能
+    // 是空数组。
+    var tempSubtitle = "";
+    if (tempBody) {
+      var firstMessageAt = (payload.milestones || {}).first_message_at;
+      tempSubtitle = I.isNumber(firstMessageAt)
+        ? "每周/每日采样 · 自相识 " + I.formatDate(firstMessageAt) + " 起"
+        : "每周/每日采样 · 自 " + history[0].day + " 起";
+    }
 
     // 卡片顺序：七维画像 → 关系温度 → 关系画像 → 回复延迟 → 月度消息量 →
     // 消息类型构成 → 里程碑 → 近期异动；「关系类型」是改判控件，放最后。
@@ -255,11 +335,7 @@
       '<div class="stack">' +
       card("七维画像", radarBody, contact.scored ? "与全联系人中位数对比" : "") +
       (tempBody
-        ? card(
-            "关系温度",
-            tempBody,
-            "每周/每日采样 · 自 " + history[0].day + " 起"
-          )
+        ? card("关系温度", tempBody, tempSubtitle)
         : "") +
       // 画像与标签由大模型生成，文本不可信，必须整体 escapeHtml。
       portraitCard(contact) +
@@ -278,6 +354,13 @@
     if (picker) {
       picker.addEventListener("change", function () {
         changeKind(picker.value);
+      });
+    }
+
+    var historyPicker = els.content.querySelector(".history-picker__select");
+    if (historyPicker) {
+      historyPicker.addEventListener("change", function () {
+        changeGranularity(historyPicker.value);
       });
     }
 
@@ -300,7 +383,7 @@
   }
 
   /* ------------------------------------------------------------------ *
-   * 0. 关系温度：历史综合分折线（全史每周回放 + 部署日起每日采样）
+   * 0. 关系温度：历史综合分折线（相识起每周回放 + 部署日起每日采样）
    * ------------------------------------------------------------------ */
 
   /** 日键（YYYY-MM-DD）→ 本地时区当天 0 点的毫秒时间戳。
@@ -335,7 +418,29 @@
     return function (theme) {
       return {
         backgroundColor: "transparent",
-        grid: { left: 48, right: 24, top: 24, bottom: 40 },
+        // bottom 从 40 加大：要给 x 轴标签和滑块各留一段，两者不重叠。
+        grid: { left: 48, right: 24, top: 24, bottom: 56 },
+        // 只用 slider，故意不加 inside：inside 型 dataZoom 的 RoamController
+        // 无论配置如何都会先吞掉滚轮与触屏单指事件（先 preventDefault+
+        // stopPropagation 再按配置决定缩放），320px 高的图会把详情页这一段
+        // 的滚动吃掉，比开着更糟；slider 拖拽没有这个问题。
+        dataZoom: [
+          {
+            type: "slider",
+            start: 0,
+            end: 100,
+            // Material 的克制尺寸，避免整条图表被滑块占掉太多高度。
+            height: 20,
+            bottom: 8,
+            // 悬浮不弹大号数值气泡，太吵。
+            showDetail: false,
+            borderColor: theme.splitColor,
+            // 主题变量是 6 位 hex，拼 8 位 alpha 后缀做主色 25% 透明填充。
+            fillerColor: theme.primary + "40",
+            handleStyle: { color: theme.primary },
+            textStyle: { color: theme.subTextColor, fontSize: 12 }
+          }
+        ],
         tooltip: Object.assign(
           {
             trigger: "axis",

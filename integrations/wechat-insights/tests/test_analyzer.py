@@ -12,7 +12,12 @@ from unittest.mock import patch
 
 from wechat_history.formatting import message_kind
 
-from wechat_insights.analyzer import Analyzer, Cursor, read_messages_after
+from wechat_insights.analyzer import (
+    Analyzer,
+    Cursor,
+    read_messages_after,
+    refine_limit_day,
+)
 from wechat_insights.depth import DepthStrategy, LexicalDepth, LLMDepth
 from wechat_insights.metrics import Metrics, day_key
 from wechat_insights.scoring import DIMENSION_NAMES
@@ -1283,6 +1288,9 @@ class RelationKindScoreTests(AnalyzerTestCase):
                 {BASE + offset * 86400: count for offset in range(25)},
             )
             contact = self.store.get_contact(session_id)
+            # 回放按 first_message_at 判相识起点，seed 不写里程碑，补上；
+            # BASE 晚于打分窗口起点（NOW−730 天），不影响前导空档判定。
+            contact.first_message_at = BASE
             contact.last_message_at = NOW - 30 * 86400
             self.store.save_contact(contact)
         self.store.set_contact_kind_manual("mom", "family")
@@ -1339,10 +1347,16 @@ class ScoreHistoryTests(AnalyzerTestCase):
     def test_history_records_scored_and_zeroed_but_not_thin(self) -> None:
         # Alice 达标被打分；Ghost 两年无往来归零；Thin 有消息但数据不足。
         # 全史回放（部署日之前的周网格）走同一套规则：scored 记综合分、
-        # 归零记 0、数据不足不记。
+        # 归零记 0、数据不足不记。seed_messages 绕过同步循环不写里程碑，
+        # 补上 first_message_at 让回放照常铺点。
         self.seed_messages("friend2", "Bob", {BASE + 5 * 86400: 15})
         self.seed_messages(SESSION_ID, DISPLAY_NAME, {BASE + 5 * 86400: 20})
         self.seed_messages("thin", "Thin", {BASE + 5 * 86400: 2})
+        for session_id in ("friend2", SESSION_ID, "thin"):
+            contact = self.store.get_contact(session_id)
+            contact.first_message_at = BASE + 5 * 86400
+            self.store.save_contact(contact)
+        # Ghost 一条消息都没有：没有相识日 → 回放不铺点，只剩今日的点。
         self.store.ensure_contact("ghost", "Ghost")
 
         with patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10):
@@ -1361,9 +1375,11 @@ class ScoreHistoryTests(AnalyzerTestCase):
         self.assertEqual(json.loads(alice[-1][2]), payload["dimensions"])
 
         ghost = self.store.load_score_history("ghost")
-        # Ghost 每个采样点都是 0（归零也是曲线的一部分），最后一点是今天。
-        self.assertEqual(ghost[-1][0], today)
-        self.assertTrue(all(row[1] == 0.0 for row in ghost))
+        # Ghost 只有今日路径记的那一个 0 点（归零也是曲线的一部分）：
+        # 没有相识日，回放不写任何历史行。
+        self.assertEqual(len(ghost), 1)
+        self.assertEqual(ghost[0][0], today)
+        self.assertEqual(ghost[0][1], 0.0)
         self.assertEqual(set(json.loads(ghost[0][2]).values()), {0.0})
 
         self.assertEqual(self.store.load_score_history("thin"), [])
@@ -1384,6 +1400,46 @@ class ScoreHistoryTests(AnalyzerTestCase):
         days = [row[0] for row in rows_after_second]
         self.assertEqual(len(days), len(set(days)))
         self.assertEqual(days[-1], day_key(NOW))
+
+
+class PrunePreAcquaintanceTests(AnalyzerTestCase):
+    """一次性迁移：清掉旧口径在相识日之前铺下的温度采样点，只跑一次。"""
+
+    def test_prune_removes_pre_acquaintance_points_only_once(self) -> None:
+        # 旧回放从全局最早统计日给所有人铺点，晚认识的人相识前被记成一长段
+        # 0：迁移要删掉这些行并写 meta 标记。第二轮再预置同样的行，标记已
+        # 在、迁移不再触发，行保留（回放也已跑过，不会用新口径重铺）。
+        self.seed_messages("friend2", "Bob", {BASE + 5 * 86400: 15})
+        self.seed_messages(SESSION_ID, DISPLAY_NAME, {BASE + 5 * 86400: 20})
+        contact = self.store.get_contact(SESSION_ID)
+        contact.first_message_at = BASE + 5 * 86400
+        self.store.save_contact(contact)
+
+        acquaintance = day_key(BASE + 5 * 86400)
+        stale_day = day_key(BASE)  # 早于相识日的网格首日
+        stale_dims = json.dumps(
+            {name: 0.0 for name in DIMENSION_NAMES},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        self.store.record_score_history(stale_day, [(SESSION_ID, 0.0, stale_dims)])
+
+        with patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10):
+            self.run_analysis(now=NOW)
+
+        history = self.store.load_score_history(SESSION_ID)
+        self.assertTrue(history)
+        # 相识前的行已删，剩下的点都从相识日之后开始。
+        self.assertTrue(all(row[0] >= acquaintance for row in history))
+        self.assertEqual(self.store.get_meta("score_history_pruned_v1"), str(NOW))
+
+        # 第二轮：再预置一条相识前的行，迁移不再触发，行保留。
+        self.store.record_score_history(stale_day, [(SESSION_ID, 0.0, stale_dims)])
+        with patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10):
+            self.run_analysis(now=NOW)
+        self.assertIn(
+            (stale_day, 0.0, stale_dims), self.store.load_score_history(SESSION_ID)
+        )
 
 
 class HistoryReplayTests(AnalyzerTestCase):
@@ -1448,6 +1504,16 @@ class HistoryReplayGridTests(AnalyzerTestCase):
         self.seed_messages("agent", "机票代理", {BASE + 5 * 86400: 500})
         self.store.set_contact_kind_manual("mom", "family")
         self.store.set_contact_kind_manual("agent", "transactional")
+        # seed_messages 绕过同步循环不写里程碑，而回放按 first_message_at
+        # 判相识起点：给 BASE 起就有消息的三个联系人补上，让它们能参与回放。
+        for session_id, first_at in (
+            ("friend2", BASE),
+            ("mom", BASE),
+            ("agent", BASE + 5 * 86400),
+        ):
+            contact = self.store.get_contact(session_id)
+            contact.first_message_at = first_at
+            self.store.save_contact(contact)
 
     def run_with_progress(self, now: int):
         """无同步会话跑一轮（数据全在 stats_daily 里），同时收进度事件。"""
@@ -1501,6 +1567,27 @@ class HistoryReplayGridTests(AnalyzerTestCase):
         )
         self.assertEqual(history[-1]["detail"], grid[-1])
 
+    def test_replay_skips_grid_points_before_acquaintance(self) -> None:
+        # late 只在 BASE+800 天之后才有消息：相识日之前的网格点既不打分也不
+        # 记 0（不是「归零」，是根本不存在），曲线从相识日之后第一个网格点
+        # 才开始；friend2 相识于网格首日，第一点仍是网格首日、行数不变。
+        self.seed_messages("late", "Late", self.late)
+        contact = self.store.get_contact("late")
+        contact.first_message_at = BASE + 800 * 86400
+        self.store.save_contact(contact)
+
+        today = day_key(self.NOW_LATE)
+        grid = backfill_grid(day_key(BASE), today)
+        self.run_with_progress(self.NOW_LATE)
+
+        acquaintance = day_key(BASE + 800 * 86400)
+        late = self.store.load_score_history("late")
+        self.assertTrue(late)
+        self.assertGreaterEqual(late[0][0], acquaintance)
+        self.assertTrue(all(row[0] >= acquaintance for row in late))
+        friend = self.store.load_score_history("friend2")
+        self.assertEqual([row[0] for row in friend], grid + [today])
+
     def test_marker_makes_reruns_noop_until_force(self) -> None:
         first, _ = self.run_with_progress(self.NOW_LATE)
         rows_after_first = self.store.load_score_history("friend2")
@@ -1521,6 +1608,155 @@ class HistoryReplayGridTests(AnalyzerTestCase):
         self.assertEqual(self.store.load_score_history("friend2"), rows_after_first)
         self.assertEqual(
             self.store.get_meta("score_history_backfilled"), str(self.NOW_LATE)
+        )
+
+
+class DailyRefineTests(AnalyzerTestCase):
+    """每日粒度细化：逐日补点、断点续跑、幂等、切回周粒度不删点、进度上报。
+
+    两个联系人都从 BASE 起每天有消息：day 切到每日粒度，week 保持每周作
+    对照。seed_messages 绕过同步循环不写里程碑，手工补 first_message_at。
+    """
+
+    NOW_REFINE = BASE + 60 * 86400
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.seed_messages(
+            "day", "Day", {BASE + offset * 86400: 15 for offset in range(30)}
+        )
+        self.seed_messages(
+            "week", "Week", {BASE + offset * 86400: 15 for offset in range(30)}
+        )
+        for session_id in ("day", "week"):
+            contact = self.store.get_contact(session_id)
+            contact.first_message_at = BASE
+            self.store.save_contact(contact)
+        self.store.set_history_granularity("day", "day")
+
+    def run_refine(self, now: int):
+        """无同步会话跑一轮（数据全在 stats_daily 里），同时收进度事件。"""
+
+        events: list[dict] = []
+        with patch(
+            "wechat_insights.analyzer.scan_direct_rows", return_value={}
+        ), patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10):
+            result = self.analyzer(
+                progress_cb=lambda fields: events.append(dict(fields))
+            ).run(now=now)
+        return result, events
+
+    def test_daily_refine_fills_every_day_while_weekly_contact_stays_sparse(self) -> None:
+        today = day_key(self.NOW_REFINE)
+        expected = daily_grid(day_key(BASE), today)
+
+        result, _ = self.run_refine(self.NOW_REFINE)
+
+        # 每日粒度：相识日到今天每一天都有点（连续日期序列）；今天那个点
+        # 由今日打分路径记，所以整条曲线依旧逐日连续。
+        day_days = [row[0] for row in self.store.load_score_history("day")]
+        self.assertEqual(day_days, expected)
+        self.assertTrue(any(row[1] != 0.0 for row in self.store.load_score_history("day")))
+        # 差的这一点就是今天——细化网格停在昨天，今天归今日打分路径。
+        self.assertEqual(result.refined_points, len(expected) - 1)
+        # 对照联系人保持每周：周网格点 + 今天的每日点，中间大量缺天。
+        week_days = [row[0] for row in self.store.load_score_history("week")]
+        self.assertEqual(week_days, backfill_grid(day_key(BASE), today) + [today])
+
+    def test_resume_continues_from_the_saved_progress(self) -> None:
+        self.run_refine(self.NOW_REFINE)
+        snapshot = self.store.load_score_history("day")
+
+        # 模拟容器在中间某天挂掉：进度停在 X，X 之后的点还没写。
+        mid = daily_grid(day_key(BASE), day_key(self.NOW_REFINE))[30]
+        with self.store.connection as connection:
+            connection.execute(
+                "UPDATE contacts SET history_daily_until = ? WHERE session_id = ?",
+                (mid, "day"),
+            )
+            connection.execute(
+                "DELETE FROM score_history WHERE session_id = ? AND day > ?",
+                ("day", mid),
+            )
+        truncated = self.store.load_score_history("day")
+        self.assertEqual(truncated, snapshot[: len(truncated)])
+        self.assertLess(len(truncated), len(snapshot))
+
+        result, _ = self.run_refine(self.NOW_REFINE)
+
+        # 只补了断点之后的天：断点及之前一行没动，之后逐日补回（同一打分
+        # 内核、同一份数据，补回来的值与原来逐位一致），进度推进到昨天。
+        history = self.store.load_score_history("day")
+        self.assertEqual(history, snapshot)
+        self.assertEqual(history[: len(truncated)], snapshot[: len(truncated)])
+        self.assertGreater(result.refined_points, 0)
+        self.assertEqual(
+            self.store.get_contact("day").history_daily_until,
+            refine_limit_day(self.NOW_REFINE),
+        )
+
+    def test_completed_refine_is_idempotent(self) -> None:
+        first, _ = self.run_refine(self.NOW_REFINE)
+        self.assertGreater(first.refined_points, 0)
+        rows_after_first = self.store.load_score_history("day")
+
+        second, _ = self.run_refine(self.NOW_REFINE)
+        self.assertEqual(second.refined_points, 0)
+        self.assertEqual(self.store.load_score_history("day"), rows_after_first)
+        self.assertEqual(
+            self.store.get_contact("day").history_daily_until,
+            refine_limit_day(self.NOW_REFINE),
+        )
+
+    def test_switching_back_to_weekly_keeps_the_daily_points(self) -> None:
+        self.run_refine(self.NOW_REFINE)
+        rows_before = self.store.load_score_history("day")
+
+        self.store.set_history_granularity("day", "")
+        result, _ = self.run_refine(self.NOW_REFINE)
+
+        # 切回每周：不再细化，已算出来的日点全部保留（删了再切回来要重算）。
+        self.assertEqual(result.refined_points, 0)
+        self.assertEqual(self.store.load_score_history("day"), rows_before)
+        self.assertEqual(self.store.get_contact("day").history_granularity, "")
+
+    def test_refine_reports_progress_day_by_day(self) -> None:
+        today = day_key(self.NOW_REFINE)
+        yesterday = refine_limit_day(self.NOW_REFINE)
+        grid = daily_grid(day_key(BASE), yesterday)
+
+        result, events = self.run_refine(self.NOW_REFINE)
+
+        refine = [event for event in events if event["phase"] == "refine"]
+        self.assertEqual(
+            refine[0],
+            {"phase": "refine", "done": 0, "total": len(grid), "detail": ""},
+        )
+        self.assertEqual(
+            [event["done"] for event in refine], list(range(len(grid) + 1))
+        )
+        details = [event["detail"] for event in refine[1:]]
+        self.assertEqual(details, grid)
+        # R1 回归闸门：网格停在昨天，今天那个点归今日打分路径，不能出现在
+        # 细化进度里。
+        self.assertEqual(details[-1], yesterday)
+        self.assertNotIn(today, details)
+        self.assertEqual(result.refined_points, len(grid))
+
+    def test_next_day_refines_exactly_one_more_day(self) -> None:
+        """完成后每轮只补新的一天，不重算全史。
+
+        第一轮把网格细化到昨天；隔天再跑，pending 只剩新露出的这一天，
+        第二轮只写它一天。
+        """
+
+        self.run_refine(self.NOW_REFINE)
+        second, _ = self.run_refine(self.NOW_REFINE + 86400)
+
+        self.assertEqual(second.refined_points, 1)
+        self.assertEqual(
+            self.store.get_contact("day").history_daily_until,
+            day_key(self.NOW_REFINE),
         )
 
 
@@ -1609,6 +1845,18 @@ def backfill_grid(earliest: str, today: str) -> list[str]:
     while cursor <= end:
         days.append(cursor.isoformat())
         cursor += timedelta(days=7)
+    return days
+
+
+def daily_grid(start: str, today: str) -> list[str]:
+    """逐日细化的网格（与 analyzer._refine_daily_history 同一语义）。"""
+
+    days = []
+    cursor = date.fromisoformat(start)
+    end = date.fromisoformat(today)
+    while cursor <= end:
+        days.append(cursor.isoformat())
+        cursor += timedelta(days=1)
     return days
 
 

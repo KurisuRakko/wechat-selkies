@@ -19,7 +19,7 @@ from urllib.parse import urlencode
 
 from aiohttp import web
 
-from .analyzer import Analyzer
+from .analyzer import Analyzer, refine_limit_day
 from .classify import KIND_VALUES
 from .constants import (
     ANALYZE_TIME,
@@ -39,7 +39,7 @@ from .reporting import (
     yearly_report,
 )
 from .scoring import DIMENSION_NAMES
-from .storage import MetricsStore
+from .storage import ContactRow, MetricsStore
 
 
 LOG = logging.getLogger("wechat-insights")
@@ -61,6 +61,30 @@ def _report_year(value: str | None) -> int:
         if 2000 <= year <= 2100:
             return year
     return datetime.now().year
+
+
+def _history_sampling(row: ContactRow) -> dict:
+    """联系人的温度采样设置快照，详情接口与改粒度接口共用这一份组装。
+
+    pending 表示「粒度是每日且还有历史没细化完」：逐日细化要跑几小时，
+    前端据此显示进行中状态，而不是拿一条残缺的曲线当最终结果。细化网格
+    的终点与细化任务共用 analyzer.refine_limit_day——网格停在昨天，今天
+    那个点由今日打分路径记，两处不许各算一遍；没有相识日的联系人细化
+    任务的 SQL 永远不会处理（first_message_at IS NOT NULL），一律不算
+    pending，否则前端会永远显示细化中。
+    """
+
+    granularity = "day" if row.history_granularity == "day" else "week"
+    until = row.history_daily_until or None
+    return {
+        "granularity": granularity,
+        "daily_until": until,
+        "pending": (
+            granularity == "day"
+            and row.first_message_at is not None
+            and (until is None or until < refine_limit_day(int(time.time())))
+        ),
+    }
 
 
 def parse_analyze_time(value: str) -> tuple[int, int]:
@@ -437,6 +461,7 @@ def create_app(runtime: InsightsRuntime) -> web.Application:
                 "milestones": row.milestones(),
                 "anomalies": anomalies,
                 "history": history,
+                "history_sampling": _history_sampling(row),
             }
         )
 
@@ -504,6 +529,64 @@ def create_app(runtime: InsightsRuntime) -> web.Application:
             {"ok": True, "relation_kind": effective, "kind_source": source}
         )
 
+    async def contact_history(request: web.Request) -> web.Response:
+        """切换联系人的温度采样粒度：'day' = 逐日细化，'week' = 每周（默认）。
+
+        切到 day 后，下一轮分析从相识日起逐日补点（全史约两小时，断点
+        续跑）；切回 week 不删除任何已细化的日点——细节已经算出来了，
+        删了再切回来又要重算，留着无害。
+        """
+
+        value = request.match_info["hash"]
+        if not _HASH_PATTERN.fullmatch(value):
+            raise web.HTTPNotFound(text="not found")
+        row = store.get_contact_by_hash(value)
+        if row is None:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "CONTACT_NOT_FOUND",
+                        "message": "找不到该联系人，可能还没跑过分析",
+                    },
+                },
+                status=404,
+                headers={"Cache-Control": "no-store"},
+            )
+        try:
+            body = json.loads(await request.text())
+        except ValueError:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": {"code": "BAD_REQUEST", "message": "请求体不是合法 JSON"},
+                },
+                status=400,
+                headers={"Cache-Control": "no-store"},
+            )
+        granularity = (
+            body.get("granularity") if isinstance(body, dict) else None
+        )
+        if granularity not in ("week", "day"):
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "BAD_REQUEST",
+                        "message": "granularity 取值非法",
+                    },
+                },
+                status=400,
+                headers={"Cache-Control": "no-store"},
+            )
+        store.set_history_granularity(
+            row.session_id, "day" if granularity == "day" else ""
+        )
+        updated = store.get_contact_by_hash(value)
+        return no_store(
+            {"ok": True, "history_sampling": _history_sampling(updated)}
+        )
+
     async def progress(_: web.Request) -> web.Response:
         # 快照是整体替换的，事件循环里直接读不需要拷贝。
         return no_store({"ok": True, "progress": runtime.progress})
@@ -534,6 +617,7 @@ def create_app(runtime: InsightsRuntime) -> web.Application:
     app.router.add_get("/api/contacts", contacts)
     app.router.add_get("/api/contact/{hash}", contact_detail)
     app.router.add_post("/api/contact/{hash}/kind", contact_kind)
+    app.router.add_post("/api/contact/{hash}/history", contact_history)
     app.router.add_get("/api/report", report)
     app.router.add_get("/api/progress", progress)
     app.router.add_post("/api/refresh", refresh)
