@@ -29,7 +29,12 @@ from .constants import (
 )
 from .conversation import Message, split_conversations
 from .depth import DepthStrategy, get_depth_strategy
-from .history import backfill_history, prune_pre_acquaintance, refine_daily_history
+from .history import (
+    apply_formula_reset,
+    backfill_history,
+    prune_pre_acquaintance,
+    refine_daily_history,
+)
 from .metrics import (
     Aggregation,
     Metrics,
@@ -239,6 +244,9 @@ class Analyzer:
         # 一次性迁移：清掉旧口径在相识之前铺下的前导 0 段（回放现在从第一条
         # 消息起画），meta 标记已写就不再跑，详见函数 docstring。
         prune_pre_acquaintance(self.store, moment)
+        # 打分口径版本变了就清历史标记与逐日进度，让下面这行自动重放全史
+        # （重置是一次性的，见 apply_formula_reset）。
+        apply_formula_reset(self.store)
         # 关系温度全史回放：今日打分之后补上部署日之前的历史，与今日共用
         # 同一个打分内核（_scores_asof），没有第二份真相。
         result.history_points = backfill_history(

@@ -13,7 +13,8 @@ from tests.support import (
     backfill_grid,
     daily_grid,
 )
-from wechat_insights.history import refine_limit_day
+from wechat_insights.constants import SCORE_FORMULA_VERSION
+from wechat_insights.history import apply_formula_reset, refine_limit_day
 from wechat_insights.metrics import day_key
 from wechat_insights.scoring import DIMENSION_NAMES
 
@@ -435,6 +436,104 @@ class DailyRefineTests(AnalyzerTestCase):
             self.store.get_contact("day").history_daily_until,
             day_key(self.NOW_REFINE),
         )
+
+
+class FormulaResetTests(AnalyzerTestCase):
+    """打分口径版本重置：清历史标记、清逐日进度、强制开关语义。"""
+
+    NOW_RESET = BASE + 60 * 86400
+
+    def setUp(self) -> None:
+        super().setUp()
+        # 两个达标的联系人：一个人没有参照系（score_cohort 返回空表），
+        # 历史点一行都写不出来。
+        self.seed_messages(
+            "day", "Day", {BASE + offset * 86400: 15 for offset in range(30)}
+        )
+        self.seed_messages(
+            "week", "Week", {BASE + offset * 86400: 15 for offset in range(30)}
+        )
+        for session_id in ("day", "week"):
+            contact = self.store.get_contact(session_id)
+            contact.first_message_at = BASE
+            self.store.save_contact(contact)
+        self.store.set_history_granularity("day", "day")
+
+    def run_round(self, now: int):
+        """无同步会话跑一轮（数据全在 stats_daily 里）。
+
+        MIN_SCORE_MESSAGES 压到 10：每日 15 条从相识第一天起就达标，否则
+        前三天累计 15/30/45 条不足 50，数据不足不记点、网格头部缺 3 天。
+        """
+
+        with patch("wechat_insights.analyzer.scan_direct_rows", return_value={}), patch(
+            "wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10
+        ):
+            return self.analyzer().run(now=now)
+
+    def test_formula_version_change_clears_marker_and_daily_progress(self) -> None:
+        # 口径升级场景：历史早已回放（旧标记）、逐日进度停在 2026-01-01、
+        # 版本号还是旧的。新代码跑一轮 → 标记重写为新时刻、进度清空后
+        # 从相识日重新细化到昨天。
+        self.store.set_meta("score_history_backfilled", "1700000000")
+        self.store.set_meta("score_formula_version", "1")
+        with self.store.connection as connection:
+            connection.execute(
+                "UPDATE contacts SET history_daily_until = '2026-01-01' "
+                "WHERE session_id = 'day'"
+            )
+
+        result = self.run_round(self.NOW_RESET)
+
+        self.assertGreater(result.history_points, 0)
+        self.assertEqual(
+            self.store.get_meta("score_history_backfilled"), str(self.NOW_RESET)
+        )
+        self.assertEqual(
+            self.store.get_meta("score_formula_version"), str(SCORE_FORMULA_VERSION)
+        )
+        # 2026-01-01 的旧进度被清掉（否则细化看到「已到 2026」就什么都不
+        # 做），重新细化到昨天，逐日点连成完整的一天一条。
+        self.assertEqual(
+            self.store.get_contact("day").history_daily_until,
+            refine_limit_day(self.NOW_RESET),
+        )
+        days = [row[0] for row in self.store.load_score_history("day")]
+        self.assertEqual(days, daily_grid(day_key(BASE), day_key(self.NOW_RESET)))
+
+    def test_formula_reset_runs_only_once(self) -> None:
+        first = self.run_round(self.NOW_RESET)
+        self.assertGreater(first.history_points, 0)
+        self.assertEqual(
+            self.store.get_meta("score_formula_version"), str(SCORE_FORMULA_VERSION)
+        )
+        # 版本一致：重置不再执行，标记在 → 回放也不再触发。
+        second = self.run_round(self.NOW_RESET)
+        self.assertEqual(second.history_points, 0)
+        self.assertFalse(apply_formula_reset(self.store))
+
+    def test_forced_backfill_also_resets_daily_progress(self) -> None:
+        # 先正常跑完一轮：回放标记与逐日进度都写到位。
+        self.run_round(self.NOW_RESET)
+        # 强制重放 = 旧口径算出来的都不算：逐日进度也要先清掉再重算。
+        with patch(
+            "wechat_insights.history.INSIGHTS_FORCE_HISTORY_BACKFILL", True
+        ), patch.object(
+            self.store,
+            "reset_daily_refine_progress",
+            wraps=self.store.reset_daily_refine_progress,
+        ) as reset:
+            forced = self.run_round(self.NOW_RESET)
+        reset.assert_called_once()
+        self.assertGreater(forced.history_points, 0)
+        self.assertEqual(
+            self.store.get_contact("day").history_daily_until,
+            refine_limit_day(self.NOW_RESET),
+        )
+        # 标记挡不住强制开关：第二轮照常重放。
+        with patch("wechat_insights.history.INSIGHTS_FORCE_HISTORY_BACKFILL", True):
+            again = self.run_round(self.NOW_RESET)
+        self.assertGreater(again.history_points, 0)
 
 
 if __name__ == "__main__":

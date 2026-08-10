@@ -13,7 +13,7 @@ from collections.abc import Callable
 from datetime import date, timedelta
 from typing import TYPE_CHECKING
 
-from .constants import INSIGHTS_FORCE_HISTORY_BACKFILL
+from .constants import INSIGHTS_FORCE_HISTORY_BACKFILL, SCORE_FORMULA_VERSION
 from .metrics import day_key, day_moment, day_span
 from .scoring import DIMENSION_NAMES
 from .storage import ContactRow, MetricsStore
@@ -124,6 +124,30 @@ def prune_pre_acquaintance(store: MetricsStore, moment: int) -> int:
     return pruned
 
 
+def apply_formula_reset(store: MetricsStore) -> bool:
+    """打分口径版本变了就把历史标记与逐日进度清零，让本轮自动重放全史。
+
+    meta.score_formula_version 记的是「哪个口径版本的重置已经执行过」。
+    版本不一致（含从未写过）时：删掉 score_history_backfilled 标记、把所有
+    每日粒度联系人的 history_daily_until 清空，然后立刻写下新版本号——
+    重置本身是一次性的，真正的重算由 backfill_history 与 refine_daily_history
+    各自的续跑机制驱动，中途崩溃不会丢进度。返回是否执行了重置。
+    """
+
+    current = store.get_meta("score_formula_version")
+    if current == str(SCORE_FORMULA_VERSION):
+        return False
+    store.delete_meta("score_history_backfilled")
+    store.reset_daily_refine_progress()
+    store.set_meta("score_formula_version", str(SCORE_FORMULA_VERSION))
+    LOG.info(
+        "打分口径版本 %s → %s：清空历史回放标记与逐日细化进度",
+        current,
+        SCORE_FORMULA_VERSION,
+    )
+    return True
+
+
 def backfill_history(
     store: MetricsStore,
     scores_asof: ScoresAsOfFn,
@@ -141,6 +165,11 @@ def backfill_history(
     用）。回放与今日口径的差异见 _scores_asof 的注释。
     """
 
+    if INSIGHTS_FORCE_HISTORY_BACKFILL:
+        # 强制重放的语义是「旧口径算出来的都不算」：只重放周网格却留着
+        # 旧口径的逐日点，会让每日粒度联系人的曲线在周点与日点之间出现
+        # 锯齿，所以逐日进度也要一起清。
+        store.reset_daily_refine_progress()
     if not INSIGHTS_FORCE_HISTORY_BACKFILL and store.get_meta(
         "score_history_backfilled"
     ):
