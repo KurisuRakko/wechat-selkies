@@ -277,6 +277,9 @@
         showUnauthorized();
         return;
       }
+      // 渲染异常与请求异常共用这个「加载失败」出口：不打控制台就彻底
+      // 没有堆栈，排查时无从下手。
+      console.error("[insights] 联系人列表渲染失败", err);
       els.fadingSlot.innerHTML = "";
       els.content.innerHTML = I.errorStateHtml(err);
       els.summaryLine.textContent = "";
@@ -671,8 +674,12 @@
     items.forEach(function (item) {
       var card = buildCard(item);
       grid.appendChild(card);
-      if (item.scored) {
-        radarJobs.push([card.querySelector(".contact-card__radar"), item.dimensions]);
+      // 以 buildCard 实际渲染出的容器为准登记雷达图任务：事务往来 / 已归零 /
+      // 数据不足等分支不渲染容器时自然不登记。条件只保留 buildCard 里这一份，
+      // 不在此处再抄一遍，避免两处判断将来再次失配。
+      var radarSlot = card.querySelector(".contact-card__radar");
+      if (radarSlot) {
+        radarJobs.push([radarSlot, item.dimensions]);
       }
     });
 
