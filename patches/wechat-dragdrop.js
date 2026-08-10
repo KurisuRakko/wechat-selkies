@@ -12,11 +12,11 @@
  *        focus again before touching the clipboard. This page can only fire a
  *        blind Ctrl+V at the stream, which is kept solely as a fallback.
  *
- *   OUT  Drag a row out of the sidebar's file list onto the host desktop and it
- *        downloads, using Chromium's DownloadURL DataTransfer format. nginx
- *        already serves /config/Desktop at /files with Content-Disposition:
- *        attachment, so no server-side work is needed. Chromium only — Firefox
- *        has no equivalent.
+ *   OUT  Dragging a row out of the sidebar's file list onto the host desktop
+ *        now belongs to patches/wechat-file-manager.js, which draws that panel
+ *        itself (the old iframe listing was blank — see files-json-index.py).
+ *        This file only keeps IN (drag-in upload + server-side paste) and
+ *        opening URLs in the viewer's browser.
  *
  * History, because it constrains what this file may do: images used to be
  * base64-encoded here and pushed as ONE `cb,image/png,…` message. In
@@ -302,63 +302,6 @@
     }
   }
 
-  /* -------------------------------------------------------------- drag out */
-
-  function decorateLink(a, doc) {
-    if (a.dataset.wechatDragdrop) return;
-    // fancyindex emits the real name in title= and a urlencoded href.
-    var name = a.getAttribute("title") ||
-               decodeURIComponent(a.getAttribute("href") || "");
-    if (!name || name === "../" || /\/$/.test(name)) return;
-
-    a.dataset.wechatDragdrop = "1";
-    a.setAttribute("draggable", "true");
-    a.addEventListener("dragstart", function (ev) {
-      try {
-        var abs = new URL(a.getAttribute("href"), doc.baseURI || location.href).href;
-        // Chromium's format: mime:filename:absolute-url
-        ev.dataTransfer.setData("DownloadURL", mimeFor(name) + ":" + name + ":" + abs);
-        ev.dataTransfer.effectAllowed = "copy";
-      } catch (e) {
-        console.warn(TAG, "dragstart failed for", name, e);
-      }
-    });
-  }
-
-  function decorateIframe(iframe) {
-    var doc;
-    try {
-      doc = iframe.contentDocument;
-    } catch (e) {
-      return; // cross-origin; nothing we can do
-    }
-    if (!doc || !doc.body) return;
-    var links = doc.querySelectorAll("a[href]");
-    for (var i = 0; i < links.length; i++) decorateLink(links[i], doc);
-    if (links.length) console.log(TAG, "made", links.length, "file link(s) draggable");
-  }
-
-  function watchFileIframes() {
-    function scan() {
-      var frames = document.querySelectorAll('iframe[src*="files"]');
-      for (var i = 0; i < frames.length; i++) {
-        var f = frames[i];
-        if (!f.dataset.wechatDragdropWatched) {
-          f.dataset.wechatDragdropWatched = "1";
-          f.addEventListener("load", function (e) { decorateIframe(e.target); });
-        }
-        decorateIframe(f);
-      }
-    }
-    scan();
-    // The modal is created on demand, and fancyindex navigation replaces the
-    // document, so keep looking rather than binding once.
-    new MutationObserver(scan).observe(document.documentElement, {
-      childList: true, subtree: true
-    });
-    setInterval(scan, 2000);
-  }
-
   /* ------------------------------------------------------ drop-in attachment */
 
   function attach() {
@@ -489,7 +432,6 @@
       var ready = attach() && window.webrtcInput;
       if (ready) {
         clearInterval(t);
-        watchFileIframes();
         watchUrlQueue();
         setInterval(sweepPending, PENDING_SWEEP_MS);
         console.log(TAG, "ready (paste delay " + PASTE_DELAY_MS + "ms, upload dir " + UPLOAD_DIR +

@@ -141,6 +141,18 @@ COPY patches/wechat-dragdrop.js /usr/share/selkies/selkies-dashboard/src/wechat-
 COPY patches/inject-dragdrop-script.sh /tmp/inject-dragdrop-script.sh
 RUN sh /tmp/inject-dragdrop-script.sh && rm -f /tmp/inject-dragdrop-script.sh
 
+# 侧边栏「文件」面板自绘成资源管理器风格的文件浏览器。旧版是 iframe 套
+# nginx 目录页：/files 块没有 index 指令，内建默认 index index.html 生效，
+# 下载目录里只要有一个 index.html，/files/ 的清单请求就返回那个 HTML 而
+# 不是目录清单，再叠上本块的 Content-Disposition: attachment，附件不渲染，
+# 面板整块空白。这里把模板的 /files 块改成 autoindex JSON 清单，dashboard
+# 端由 wechat-file-manager.js 直接 fetch JSON 自绘（面包屑/排序/双击/拖出）。
+COPY patches/files-json-index.py /tmp/files-json-index.py
+RUN /lsiopy/bin/python3 /tmp/files-json-index.py && rm -f /tmp/files-json-index.py
+COPY patches/wechat-file-manager.js /usr/share/selkies/selkies-dashboard/src/wechat-file-manager.js
+COPY patches/inject-file-manager-script.sh /tmp/inject-file-manager-script.sh
+RUN sh /tmp/inject-file-manager-script.sh && rm -f /tmp/inject-file-manager-script.sh
+
 # 修复浏览器端滚轮时快时慢：上游用最近 4 个 |deltaY| 猜设备类型，macOS 滚轮
 # 的系统加速会让真实滚轮被当成触控板；触控板路径按 100ms 限流丢事件，
 # _smallestDeltaY 又会把一格滚轮放大成 magnitude=10。这里在 capture 阶段
