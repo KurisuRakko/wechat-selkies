@@ -75,6 +75,15 @@ services:
       # 少量会话，本容器要扫全部会话，必须调大；同时必须 ≤ 上面 tmpfs 的 size=，
       # 否则缓存写满前先撞 tmpfs 内存上限，得到的是 ENOSPC 而不是干净的 CACHE_LIMIT。
       - WECHAT_HISTORY_MAX_CACHE_BYTES=${WECHAT_HISTORY_MAX_CACHE_BYTES:-1006632960}
+      # 时段化 LLM 评分（仅 INSIGHTS_DEPTH_STRATEGY=llm 时生效，见 README）。
+      # 前两个是时段评分的门槛与当月重评间隔，后两个是「近期维护」与「历史回填」
+      # 两笔独立预算。首次上线把历史预算临时调到 2000 让全量回填一夜跑完
+      # （约 1265 次调用），跑完调回默认值——留着 2000 会让某天新增大量历史时
+      # 突然打满预算。
+      # - INSIGHTS_LLM_PERIOD_MIN_TEXTS=${INSIGHTS_LLM_PERIOD_MIN_TEXTS:-30}
+      # - INSIGHTS_LLM_PERIOD_REFRESH_DAYS=${INSIGHTS_LLM_PERIOD_REFRESH_DAYS:-7}
+      # - INSIGHTS_LLM_PERIOD_MAX_CALLS_PER_RUN=${INSIGHTS_LLM_PERIOD_MAX_CALLS_PER_RUN:-40}
+      # - INSIGHTS_LLM_HISTORY_MAX_CALLS_PER_RUN=${INSIGHTS_LLM_HISTORY_MAX_CALLS_PER_RUN:-120}
     healthcheck:
       test:
         - CMD-SHELL
