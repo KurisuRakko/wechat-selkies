@@ -763,10 +763,16 @@ class ProgressTests(AnalyzerTestCase):
         self.assertEqual(fake.call_count, 2)
         phases = [event["phase"] for event in events]
         # 阶段顺序：sync（起点 + 3 个会话）→ llm（起点 + 2 个候选）→
-        # score → history（全史回放网格）。
+        # period（时段评分，本数据无候选，只发起点 0/0）→ score →
+        # history（全史回放网格）。
         grid = backfill_grid(day_key(BASE), day_key(NOW))
         self.assertEqual(
-            phases, ["sync"] * 4 + ["llm"] * 3 + ["score"] + ["history"] * (len(grid) + 1)
+            phases,
+            ["sync"] * 4
+            + ["llm"] * 3
+            + ["period"]
+            + ["score"]
+            + ["history"] * (len(grid) + 1),
         )
         llm = [event for event in events if event["phase"] == "llm"]
         self.assertEqual(llm[0], {"phase": "llm", "done": 0, "total": 2, "detail": ""})

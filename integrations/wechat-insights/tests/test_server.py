@@ -410,7 +410,7 @@ class ApiTests(AioHTTPTestCase):
         self.assertIsNotNone(progress["finished_at"])
         self.assertEqual(
             progress["last_result"],
-            {"messages_read": 12, "scored": 7, "llm_scored": 3},
+            {"messages_read": 12, "scored": 7, "llm_scored": 3, "llm_periods": 0},
         )
 
     async def test_refresh_is_debounced(self) -> None:

@@ -293,8 +293,11 @@ class PortraitRefreshTests(AnalyzerTestCase):
 
         with patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10), patch(
             # 70 条消息会让 SESSION_ID 成为关系分类候选（≥30 且未判定），
-            # 分类会再调一次 chat、把 call_count 弄乱；本测试只关心深度打分。
+            # 分类会再调一次 chat、把 call_count 弄乱；时段评分同理（-40 天
+            # 的月份有 60 条文字）。本测试只关心深度打分。
             "wechat_insights.analyzer.classify_contacts", return_value=0
+        ), patch(
+            "wechat_insights.analyzer.refresh_periods", return_value=0
         ):
             first, fake = self.run_llm_analysis(chat=chat)
         self.assertEqual(first.llm_scored, 1)
@@ -307,6 +310,8 @@ class PortraitRefreshTests(AnalyzerTestCase):
         self.seed_messages("friend", "Alice", {BASE + 6 * 86400: 60})
         with patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10), patch(
             "wechat_insights.analyzer.classify_contacts", return_value=0
+        ), patch(
+            "wechat_insights.analyzer.refresh_periods", return_value=0
         ):
             second, fake = self.run_llm_analysis(chat=chat)
         self.assertEqual(second.llm_scored, 1)

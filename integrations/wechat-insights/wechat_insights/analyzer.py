@@ -40,6 +40,7 @@ from .metrics import (
     decayed_weight,
     late_night_offset,
 )
+from .periods import PeriodIndex, refresh_periods
 from .portrait import refresh_portraits
 from .reading import Cursor, read_messages_after
 from .scoring import (
@@ -65,6 +66,8 @@ class AnalysisResult:
     scored: int = 0
     llm_scored: int = 0
     classified: int = 0
+    # 本轮写入的时段化 LLM 分行数。
+    llm_periods: int = 0
     # 本轮全史回放写入的采样点行数（关系温度曲线补上部署日之前的历史）。
     history_points: int = 0
     # 本轮逐日细化写入的采样点行数（每日粒度联系人从相识日逐日补点）。
@@ -134,6 +137,8 @@ class Analyzer:
         batch_size: int = BACKFILL_BATCH,
         # 进度上报回调：每完成一个步骤收一次 {phase, detail, done, total}。
         progress_cb: Callable[[dict], None] | None = None,
+        # 时段分索引注入口：脚本与测试塞入内存索引用；None 时按需整表读。
+        period_index: PeriodIndex | None = None,
     ):
         self.store = store
         self.reader_factory = reader_factory
@@ -141,6 +146,18 @@ class Analyzer:
         self.gap_seconds = gap_seconds
         self.batch_size = batch_size
         self._progress_cb = progress_cb
+        self._period_override = period_index
+        self._period_index: PeriodIndex | None = None
+
+    @property
+    def period_index(self) -> PeriodIndex:
+        """时段分索引：显式注入的永远优先；否则整表读一次、缓存到本轮结束。"""
+
+        if self._period_override is not None:
+            return self._period_override
+        if self._period_index is None:
+            self._period_index = PeriodIndex.load(self.store)
+        return self._period_index
 
     def _report(self, **fields: object) -> None:
         """进度上报：cb 缺省时零开销；cb 抛异常只记调试日志，绝不能弄挂分析。"""
@@ -204,9 +221,19 @@ class Analyzer:
                     )
                 except Exception:
                     LOG.exception("关系类型分类失败，本轮跳过")
+                # 时段化 LLM 评分排在分类之后：本轮刚判成事务往来的联系人
+                # 立刻被 _pending 排除，不浪费调用。可选项，出意外不拖垮打分。
+                try:
+                    result.llm_periods = refresh_periods(
+                        self.store, reader, self.gap_seconds, moment, self._report
+                    )
+                except Exception:
+                    LOG.exception("时段化 LLM 评分失败，本轮跳过")
         finally:
             reader.close()
 
+        # 本轮刚写入的时段行必须被看见：缓存失效，下一处使用会整表重读。
+        self._period_index = None
         self._report(phase="score", done=0, total=0, detail="")
         result.scored = self._recompute(moment)
         # 一次性迁移：清掉旧口径在相识之前铺下的前导 0 段（回放现在从第一条
@@ -432,6 +459,9 @@ class Analyzer:
         - current_gap_days 按「窗口内最后活跃日到 asof_day 的天数」推算——
           不能拿 contact.last_message_at 这种「现在」的知识穿越回过去；
           今日路径用 gap_override 传回 contact.last_message_at 口径。
+        - 时段化 LLM 分按 period_end ≤ asof_day 可见、每个时段只取最新一张
+          快照：回放永远不会看到未来（未收口当月的快照 period_end 记的是
+          评分当天），重放出来的点与当初实时写下的值逐字一致。
         """
 
         asof_day = day_key(moment)
@@ -485,6 +515,10 @@ class Analyzer:
                     window, contact, score_start, score_start_ts
                 ),
             }
+            # 时段化 LLM 分：今日打分与全史回放走同一条路径，只有「这一刻能
+            # 看见哪些时段」不同。没有可见时段时三个值都是 None，缺值权重按
+            # score_cohort 的既有机制回流给同维度其余项，不需要任何特判。
+            extras.update(self.period_index.asof(session_id, asof_day))
             raw_score[session_id] = raw_metrics(
                 window.weighted, self.strategy, equivalent_days, extras
             )

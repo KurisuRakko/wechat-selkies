@@ -215,6 +215,7 @@ class InsightsRuntime:
                     "messages_read": result.messages_read,
                     "scored": result.scored,
                     "llm_scored": result.llm_scored,
+                    "llm_periods": result.llm_periods,
                 },
             }
             LOG.info("分析完成，用时 %.1f 秒", result.duration_seconds)
