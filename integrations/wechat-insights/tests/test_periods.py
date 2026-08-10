@@ -11,9 +11,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from wechat_insights.analyzer import Analyzer
-from wechat_insights.constants import DECAY_HALF_LIFE_DAYS
+from wechat_insights.constants import DECAY_HALF_LIFE_DAYS, SESSION_GAP_SECONDS
 from wechat_insights.depth import LLMDepth, LexicalDepth
-from wechat_insights.metrics import day_key, day_moment, day_span
+from wechat_insights.metrics import Metrics, day_key, day_moment, day_span
 from wechat_insights.periods import (
     CHAT_OPEN,
     CHAT_CLOSE,
@@ -21,6 +21,7 @@ from wechat_insights.periods import (
     month_first_day,
     month_last_day,
     month_of,
+    refresh_periods,
 )
 from wechat_insights.storage import PeriodRow
 
@@ -289,6 +290,51 @@ class PeriodRefreshTests(AnalyzerTestCase):
             _, fake = self.run_period_analysis(chat=chat)
             self.assertEqual(fake.call_count, 1)
         self.assertEqual(len(self.store.all_llm_periods()), 1)
+
+    def seed_period_state(self, period: str, texts: int = 60) -> None:
+        """把 period 月铺进消息库与天桶：采样读消息库、候选门槛读天桶。
+
+        天桶按分析器同一口径记 kind_text（文字消息），联系人累计消息数与
+        相识时间一并补齐——直接调 refresh_periods 不经过同步循环，这部分
+        状态要自己铺。
+        """
+
+        self.month_messages(period, texts=texts)
+        contact = self.store.ensure_contact(SESSION_ID, DISPLAY_NAME)
+        buckets: dict[str, Metrics] = {}
+        for index in range(texts):
+            day_ts = BASE + days_after_base(f"{period}-{2 + index % 3:02d}") * 86400
+            metrics = buckets.setdefault(day_key(day_ts), Metrics())
+            metrics.add("kind_text_them" if index % 2 else "kind_text_me")
+        self.store.commit_batch(SESSION_ID, buckets, contact)
+        contact.total_messages = texts
+        contact.first_message_at = BASE
+        self.store.save_contact(contact)
+
+    def test_closed_month_refresh_reports_the_earliest_past_end(self) -> None:
+        # 不经 analyzer 直接调 refresh_periods：两个已收口月份各写一行，
+        # 返回最早被改写的历史月末——它是重放回退位置的唯一事实来源。
+        older = self.closed_period(back_days=100)
+        newer = self.closed_period(back_days=40)
+        self.assertNotEqual(older, newer)
+        self.seed_period_state(older)
+        self.seed_period_state(newer)
+        with patch("wechat_insights.llm.chat", side_effect=[REPLY, REPLY]) as fake:
+            result = refresh_periods(self.store, self.reader, SESSION_GAP_SECONDS, NOW)
+        self.assertEqual(fake.call_count, 2)
+        self.assertEqual(result.written, 2)
+        self.assertEqual(result.earliest_past_end, month_last_day(older))
+
+    def test_open_month_refresh_reports_no_past_end(self) -> None:
+        # 未收口当月：period_end = 评分当天，不改写历史 → 不触发重放
+        # （稳态每晚不白重放，靠的就是这个 None）。
+        period = month_of(day_key(NOW))
+        self.seed_period_state(period)
+        with patch("wechat_insights.llm.chat", side_effect=[REPLY]) as fake:
+            result = refresh_periods(self.store, self.reader, SESSION_GAP_SECONDS, NOW)
+        self.assertEqual(fake.call_count, 1)
+        self.assertEqual(result.written, 1)
+        self.assertIsNone(result.earliest_past_end)
 
 
 class PeriodIndexTests(unittest.TestCase):

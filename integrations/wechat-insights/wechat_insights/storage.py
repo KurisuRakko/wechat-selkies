@@ -494,17 +494,20 @@ class MetricsStore:
                 [(day, session_id) for session_id in session_ids],
             )
 
-    def reset_daily_refine_progress(self) -> int:
-        """把所有每日粒度联系人的逐日细化进度清空，返回受影响行数。
+    def rewind_daily_refine_progress(self, day: str = "") -> int:
+        """把跑过 day 的逐日细化进度退回到 day，返回受影响行数。
 
         打分口径变了以后，旧口径算出来的日点必须整段重算，否则同一条曲线上
-        周网格点是新口径、日点是旧口径，出现锯齿。
+        周网格点是新口径、日点是旧口径，出现锯齿。day=""（默认）等于退回
+        相识日、即旧的「清零」语义；进度本来就没到 day 的联系人不动——它们
+        还要正常往前跑到那儿。
         """
 
         with self.connection as connection:
             cursor = connection.execute(
-                "UPDATE contacts SET history_daily_until = '' "
-                "WHERE history_granularity = 'day'"
+                "UPDATE contacts SET history_daily_until = ? "
+                "WHERE history_granularity = 'day' AND history_daily_until > ?",
+                (day, day),
             )
             return cursor.rowcount
 

@@ -125,16 +125,40 @@ def prune_pre_acquaintance(store: MetricsStore, moment: int) -> int:
     return pruned
 
 
+def request_replay(
+    store: MetricsStore, reason: str, since: str | None = None
+) -> None:
+    """请求重放关系温度曲线：删掉全史回放标记，并把逐日细化进度退回 since 之前。
+
+    三个调用方（打分口径升级、INSIGHTS_FORCE_HISTORY_BACKFILL、本轮落地了改写
+    过去时点的 LLM 时段分）要做的是同一件事，收敛在这里。reason 只进日志，
+    运维能看出今晚为什么多花了 50 秒。
+
+    周网格整段重放（标记是布尔的，418 点约 50 秒，不值得为它引入区间进度）；
+    逐日细化只退回到「第一个被改写的时点的前一天」——相识日很早的每日粒度
+    联系人有上千个日点，每次触发都从头算是真实的月度成本。since 为 None
+    表示全史都不可信（口径升级 / 强制重放），进度整体退回相识日。
+    """
+
+    store.delete_meta("score_history_backfilled")
+    store.rewind_daily_refine_progress(
+        ""
+        if since is None
+        else (date.fromisoformat(since) - timedelta(days=1)).isoformat()
+    )
+    LOG.info("请求关系温度重放（%s）：逐日进度退回 %s", reason, since or "相识日")
+
+
 def apply_formula_reset(store: MetricsStore) -> bool:
-    """打分口径版本变了就把历史标记与逐日进度清零，让本轮自动重放全史。
+    """打分口径版本变了就请求重放全史，让本轮自动重放。
 
     meta.score_formula_version 记的是「哪个口径版本的重置已经执行过」。
     版本不一致（含从未写过）时：先 VACUUM INTO 一份整库备份——备份拿不到
     就不重置、也不写版本号，下一轮自动重试（曲线暂时停在旧口径，没有数据
-    被破坏）；备份到手后删掉 score_history_backfilled 标记、把所有每日粒度
-    联系人的 history_daily_until 清空，然后立刻写下新版本号——重置本身是
-    一次性的，真正的重算由 backfill_history 与 refine_daily_history 各自的
-    续跑机制驱动，中途崩溃不会丢进度。返回是否执行了重置。
+    被破坏）；备份到手后经 request_replay 删掉回放标记、退回逐日细化进度，
+    然后立刻写下新版本号——重置本身是一次性的，真正的重算由 backfill_history
+    与 refine_daily_history 各自的续跑机制驱动，中途崩溃不会丢进度。
+    返回是否执行了重置。
     """
 
     current = store.get_meta("score_formula_version")
@@ -144,11 +168,10 @@ def apply_formula_reset(store: MetricsStore) -> bool:
         # 关键：此时不写 score_formula_version，所以下一轮还会再试。
         LOG.error("打分口径重置前的备份失败，本轮不重置，下一轮自动重试")
         return False
-    store.delete_meta("score_history_backfilled")
-    store.reset_daily_refine_progress()
+    request_replay(store, f"打分口径版本 {current} → {SCORE_FORMULA_VERSION}")
     store.set_meta("score_formula_version", str(SCORE_FORMULA_VERSION))
     LOG.info(
-        "打分口径版本 %s → %s：清空历史回放标记与逐日细化进度",
+        "打分口径版本 %s → %s：已请求重放关系温度曲线",
         current,
         SCORE_FORMULA_VERSION,
     )
@@ -176,7 +199,7 @@ def backfill_history(
         # 强制重放的语义是「旧口径算出来的都不算」：只重放周网格却留着
         # 旧口径的逐日点，会让每日粒度联系人的曲线在周点与日点之间出现
         # 锯齿，所以逐日进度也要一起清。
-        store.reset_daily_refine_progress()
+        request_replay(store, "INSIGHTS_FORCE_HISTORY_BACKFILL")
     if not INSIGHTS_FORCE_HISTORY_BACKFILL and store.get_meta(
         "score_history_backfilled"
     ):

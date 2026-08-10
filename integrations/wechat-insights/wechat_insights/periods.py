@@ -228,26 +228,49 @@ class Pending:
     target_day: str
 
 
+@dataclass(frozen=True, slots=True)
+class PeriodRefresh:
+    """一轮时段评分的产出。
+
+    written：写入的快照行数（进 AnalysisResult.llm_periods）。
+    earliest_past_end：本轮写入的行里，period_end 早于今天的那些当中最早的一个；
+        None = 本轮只动了今天那个点。可见性规则决定一行快照只改变
+        [period_end, 今天] 这一段曲线，所以这个日期既是「要不要重放」的开关，
+        也是逐日细化要回退到的位置——同一个事实不拆成两个字段。
+    """
+
+    written: int
+    earliest_past_end: str | None
+
+
 def refresh_periods(
     store: MetricsStore,
     reader,
     gap_seconds: int,
     moment: int,
     report_cb=None,
-) -> int:
-    """给候选时段补上/刷新 LLM 分，返回本轮写入的行数。progress phase = "period"。
+) -> PeriodRefresh:
+    """给候选时段补上/刷新 LLM 分，返回本轮写入的行数与最早改写的历史起点。
+
+    progress phase = "period"。
 
     候选与预算规则见 _pending。llm_period 表本身就是进度：covered is None
     的时段就是还没做的，每写一行就是推进一格，每行一个事务，容器随时可以
     被杀（与 contacts.history_daily_until 的逐日细化同一种「进度落库、可
     中断」模式）。解析失败或 LLM 无回复不写任何行，该时段下一轮自然重新
     入选，不需要失败计数器。
+
+    period_end < 今天的行会改写已经写下的历史采样点，调用方据此触发本轮
+    重放；period_end == 今天的当月刷新只影响今天那个点，它由今日打分路径
+    重写，不需要重放——这就是稳态每晚不会白重放的原因。
     """
 
     recent, history = _pending(store, moment)
     selected = recent + history
     if report_cb is not None:
         report_cb(phase="period", done=0, total=len(selected), detail="")
+    today = day_key(moment)
+    earliest: str | None = None
     written = 0
     for done, pending in enumerate(selected, start=1):
         if report_cb is not None:
@@ -286,8 +309,16 @@ def refresh_periods(
             INSIGHTS_LLM_MODEL,
         )
         written += 1
-    LOG.info("时段化 LLM 评分：本轮写入 %d 行", written)
-    return written
+        if pending.target_day < today and (
+            earliest is None or pending.target_day < earliest
+        ):
+            earliest = pending.target_day
+    LOG.info(
+        "时段化 LLM 评分：本轮写入 %d 行，改写 %s 起的历史",
+        written,
+        earliest if earliest is not None else "无",
+    )
+    return PeriodRefresh(written, earliest)
 
 
 def _pending(store: MetricsStore, moment: int) -> tuple[list[Pending], list[Pending]]:

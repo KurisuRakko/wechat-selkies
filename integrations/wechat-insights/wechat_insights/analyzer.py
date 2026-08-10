@@ -34,6 +34,7 @@ from .history import (
     backfill_history,
     prune_pre_acquaintance,
     refine_daily_history,
+    request_replay,
 )
 from .metrics import (
     Aggregation,
@@ -179,6 +180,8 @@ class Analyzer:
         started = time.monotonic()
         result = AnalysisResult(started_at=moment, duration_seconds=0.0)
 
+        # 本轮时段评分最早改写的历史起点；None = 只动了今天那个点，不重放。
+        replay_since: str | None = None
         reader = self.reader_factory()
         try:
             sessions = scan_direct_rows(reader)
@@ -229,9 +232,11 @@ class Analyzer:
                 # 时段化 LLM 评分排在分类之后：本轮刚判成事务往来的联系人
                 # 立刻被 _pending 排除，不浪费调用。可选项，出意外不拖垮打分。
                 try:
-                    result.llm_periods = refresh_periods(
+                    refresh = refresh_periods(
                         self.store, reader, self.gap_seconds, moment, self._report
                     )
+                    result.llm_periods = refresh.written
+                    replay_since = refresh.earliest_past_end
                 except Exception:
                     LOG.exception("时段化 LLM 评分失败，本轮跳过")
         finally:
@@ -247,6 +252,11 @@ class Analyzer:
         # 打分口径版本变了就清历史标记与逐日进度，让下面这行自动重放全史
         # （重置是一次性的，见 apply_formula_reset）。
         apply_formula_reset(self.store)
+        # 本轮落地了改写过去时点的 LLM 时段分：旧值已经画进了曲线，必须把
+        # 逐日细化进度退回到最早被改写时点的前一天，让全史回放重画这一段
+        # （周网格整段重放，见 request_replay）。只动了今天那个点则不重放。
+        if replay_since is not None:
+            request_replay(self.store, "历史时段的 LLM 分本轮落地", since=replay_since)
         # 关系温度全史回放：今日打分之后补上部署日之前的历史，与今日共用
         # 同一个打分内核（_scores_asof），没有第二份真相。
         result.history_points = backfill_history(

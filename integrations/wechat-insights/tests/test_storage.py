@@ -525,19 +525,44 @@ class MetaMaintenanceTests(StoreTestCase):
         self.store.delete_meta("never_written")
         self.assertIsNone(self.store.get_meta("never_written"))
 
-    def test_reset_daily_refine_progress_clears_only_daily_contacts(self) -> None:
+    def test_rewind_to_the_beginning_clears_only_daily_contacts(self) -> None:
         daily = self.store.ensure_contact("daily_friend", "Daily")
         weekly = self.store.ensure_contact("weekly_friend", "Weekly")
         self.store.set_history_granularity("daily_friend", "day")
         self.store.mark_daily_refined(["daily_friend"], "2026-03-10")
         self.store.mark_daily_refined(["weekly_friend"], "2026-03-10")
 
-        cleared = self.store.reset_daily_refine_progress()
+        cleared = self.store.rewind_daily_refine_progress()
         self.assertEqual(cleared, 1)
         self.assertEqual(self.store.get_contact("daily_friend").history_daily_until, "")
         # 每周粒度的联系人进度原样保留（重置只针对每日细化的联系人）。
         self.assertEqual(
             self.store.get_contact("weekly_friend").history_daily_until, "2026-03-10"
+        )
+
+    def test_rewind_moves_the_daily_cursor_back_to_a_day(self) -> None:
+        # 回退目标日之前的进度都退回目标日：逐日细化从「进度次日」续跑，
+        # 落到这天等于把 [目标日, 原进度] 整段重算。
+        self.store.ensure_contact("daily_friend", "Daily")
+        self.store.set_history_granularity("daily_friend", "day")
+        self.store.mark_daily_refined(["daily_friend"], "2026-03-10")
+
+        cleared = self.store.rewind_daily_refine_progress("2026-02-01")
+        self.assertEqual(cleared, 1)
+        self.assertEqual(
+            self.store.get_contact("daily_friend").history_daily_until, "2026-02-01"
+        )
+
+    def test_rewind_leaves_contacts_behind_the_target_untouched(self) -> None:
+        # 进度早于回退目标的联系人不在重放区间内，原样保留（白噪声闸门）。
+        self.store.ensure_contact("daily_friend", "Daily")
+        self.store.set_history_granularity("daily_friend", "day")
+        self.store.mark_daily_refined(["daily_friend"], "2026-01-05")
+
+        cleared = self.store.rewind_daily_refine_progress("2026-02-01")
+        self.assertEqual(cleared, 0)
+        self.assertEqual(
+            self.store.get_contact("daily_friend").history_daily_until, "2026-01-05"
         )
 
 

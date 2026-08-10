@@ -16,6 +16,7 @@ from tests.support import (
     them,
 )
 from wechat_insights.depth import LexicalDepth, LLMDepth
+from wechat_insights.periods import PeriodRefresh
 
 
 class PortraitRefreshTests(AnalyzerTestCase):
@@ -297,7 +298,8 @@ class PortraitRefreshTests(AnalyzerTestCase):
             # 的月份有 60 条文字）。本测试只关心深度打分。
             "wechat_insights.analyzer.classify_contacts", return_value=0
         ), patch(
-            "wechat_insights.analyzer.refresh_periods", return_value=0
+            "wechat_insights.analyzer.refresh_periods",
+            return_value=PeriodRefresh(0, None),
         ):
             first, fake = self.run_llm_analysis(chat=chat)
         self.assertEqual(first.llm_scored, 1)
@@ -311,7 +313,8 @@ class PortraitRefreshTests(AnalyzerTestCase):
         with patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10), patch(
             "wechat_insights.analyzer.classify_contacts", return_value=0
         ), patch(
-            "wechat_insights.analyzer.refresh_periods", return_value=0
+            "wechat_insights.analyzer.refresh_periods",
+            return_value=PeriodRefresh(0, None),
         ):
             second, fake = self.run_llm_analysis(chat=chat)
         self.assertEqual(second.llm_scored, 1)

@@ -75,6 +75,12 @@ v1 只做纯统计分析，不接任何 LLM；深度维度用词法代理。v2 �
 与逐日细化进度、从相识日起重放一遍全史——meta 表里的 `score_formula_version` 保证
 重置只做一次，之后按各自的续跑机制推进。
 
+时段化 LLM 分是分晚落地的（历史回填每晚有上限）：某一轮只要写下了 `period_end` 早于
+今天的时段分，就说明过去某个时点的可见集合变了，这一轮会自动重放曲线，不需要人工开
+`INSIGHTS_FORCE_HISTORY_BACKFILL`。周网格整段重算（约 50 秒）；每日粒度联系人的逐日
+进度只退回到被改写的第一天，不会从相识日重算上千个点。稳态下每晚只刷新未收口的当月
+（只影响今天那个点），不会触发重放，一般每月收口那一夜各一次。
+
 回放与今日打分共用同一个打分内核，没有第二份真相：时段化 LLM 分在回放里同样注入，
 但只认 `period_end ≤ 采样日` 的时段——未收口当月的快照 period_end 记的是评分当天，
 重放历史时绝看不到未来，重放出来的点与当初实时写下的值逐字一致。唯一的口径差异是
@@ -194,6 +200,22 @@ llm 策略下还会有一段大模型写的年度总结，文案缓存在 `metri
 `INSIGHTS_LLM_HISTORY_MAX_CALLS_PER_RUN`（默认 120）——首次上线可临时把
 历史预算调到 2000 让回填一夜跑完，之后调回默认值。
 
+**换模型**：`llm_period.model` 记着算每一行时用的 `INSIGHTS_LLM_MODEL`。不同模型的
+绝对锚点对不齐，新旧混用会让曲线出现口径断层，所以换模型后要清掉旧模型算出来的
+行、让它们重评：
+
+```sql
+-- 容器内：sqlite3 /data/metrics.db
+DELETE FROM llm_period WHERE model = '旧模型名';
+-- 补列之前（v3 加固之前）写下的行 model 是空串，一起清掉：
+DELETE FROM llm_period WHERE model = '';
+```
+
+删完下一轮分析会按历史预算重新回填（约 1265 次调用），并在有历史行落地的那一轮
+自动重放曲线。要一夜跑完就临时把 `INSIGHTS_LLM_HISTORY_MAX_CALLS_PER_RUN` 调到
+2000。`DELETE FROM llm_period` 之后不需要手动清 `score_history_backfilled`——重新
+回填的行会自己触发重放。
+
 刷新与成本控制旋钮：
 
 - `INSIGHTS_LLM_SAMPLE_DAYS`：画像采样回看天数，默认 60。
@@ -265,6 +287,22 @@ docker compose -f docker-compose.yml -f compose.local.yml up -d --build wechat-i
 也写不进缓存目录。`/data` 命名卷首次创建时会继承镜像里该目录的属主，因此非 root
 进程也能写。
 
+### 自动备份
+
+两个不可逆时刻会先自动备份整个 `metrics.db`（`VACUUM INTO`，单文件、无 WAL 附属
+文件），备份落在 `INSIGHTS_DB_PATH` 同目录（默认卷内 `/data`），文件名形如
+`metrics-backup-formula-reset-2026-08-11.db`：
+
+- `formula-reset`：打分口径版本变化触发全史重放之前（要重写全部 `score_history`）；
+- `llm-depth-rebuild`：`llm_depth` 去掉 `score` 列的表重建之前（这一步之后旧版本镜像
+  读不了这个库，是回滚的分水岭）。
+
+备份拿不到（磁盘满、权限）时**不会执行那一步破坏性操作**，也不会阻断容器启动：口径
+重置会在下一轮自动重试；去列重建跳过后只有关系画像暂时写不进去（日志里每轮一条
+异常），打分、曲线、时段评分照常。默认保留最近 5 份（`INSIGHTS_BACKUP_KEEP`），按
+修改时间删最旧的；生产库约 15 MiB，5 份约 75 MiB。同一天同一原因重复触发会复用当天
+那份备份，不覆盖。
+
 ### 端口发布
 
 看板展示的是**极其私密的聊天统计**，只允许通过回环地址或你自己的 Tailscale 地址
@@ -289,6 +327,7 @@ tmpfs 的大小直接决定明文缓存的写满点：缓存数据量达到 `siz
 | `INSIGHTS_ANALYZE_TIME` | `04:30` | 每天跑一轮分析的时刻（HH:MM，容器本地时区） |
 | `INSIGHTS_AUTH_TOKEN` | 空 | 访问令牌，见下方「安全」。留空只打印一条启动警告 |
 | `INSIGHTS_DB_PATH` | `/data/metrics.db` | 分析结果数据库 |
+| `INSIGHTS_BACKUP_KEEP` | `5` | 破坏性操作前自动备份的保留份数（1–100），按修改时间删最旧的 |
 | `INSIGHTS_BIND_HOST` | `0.0.0.0` | 容器内监听地址 |
 | `INSIGHTS_BIND_PORT` | `8300` | 容器内监听端口 |
 | `INSIGHTS_RUN_ON_START` | `true` | 从未成功分析过时，启动后立即回填 |

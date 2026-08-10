@@ -14,8 +14,14 @@ from tests.support import (
     daily_grid,
 )
 from wechat_insights.constants import SCORE_FORMULA_VERSION
-from wechat_insights.history import apply_formula_reset, refine_limit_day
+from wechat_insights.depth import LLMDepth
+from wechat_insights.history import (
+    apply_formula_reset,
+    refine_limit_day,
+    request_replay,
+)
 from wechat_insights.metrics import day_key
+from wechat_insights.periods import PeriodRefresh
 from wechat_insights.scoring import DIMENSION_NAMES
 
 
@@ -520,8 +526,8 @@ class FormulaResetTests(AnalyzerTestCase):
             "wechat_insights.history.INSIGHTS_FORCE_HISTORY_BACKFILL", True
         ), patch.object(
             self.store,
-            "reset_daily_refine_progress",
-            wraps=self.store.reset_daily_refine_progress,
+            "rewind_daily_refine_progress",
+            wraps=self.store.rewind_daily_refine_progress,
         ) as reset:
             forced = self.run_round(self.NOW_RESET)
         reset.assert_called_once()
@@ -534,6 +540,81 @@ class FormulaResetTests(AnalyzerTestCase):
         with patch("wechat_insights.history.INSIGHTS_FORCE_HISTORY_BACKFILL", True):
             again = self.run_round(self.NOW_RESET)
         self.assertGreater(again.history_points, 0)
+
+    def run_round_llm(self, now: int):
+        """LLM 策略跑一轮：refresh_periods 只在 llm 策略下被调用。
+
+        画像与分类屏蔽成 0 次调用（与 test_periods 的 run_period_analysis
+        同一套隔离手法），本组测试只关心历史重放闸门。
+        """
+
+        with patch("wechat_insights.analyzer.scan_direct_rows", return_value={}), patch(
+            "wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10
+        ), patch("wechat_insights.analyzer.refresh_portraits", return_value=0), patch(
+            "wechat_insights.analyzer.classify_contacts", return_value=0
+        ):
+            return self.analyzer(strategy=LLMDepth()).run(now=now)
+
+    def test_request_replay_clears_the_marker_and_rewinds_to_the_given_day(self) -> None:
+        self.store.set_meta("score_history_backfilled", "1700000000")
+        with self.store.connection as connection:
+            connection.execute(
+                "UPDATE contacts SET history_daily_until = '2026-03-10' "
+                "WHERE session_id = 'day'"
+            )
+
+        request_replay(self.store, "t", since="2026-02-10")
+
+        self.assertIsNone(self.store.get_meta("score_history_backfilled"))
+        # 回退目标是 since 的前一天：refine_daily_history 从「进度次日」续跑，
+        # 落到这一天等于把 [since, 原进度] 整段重算。
+        self.assertEqual(
+            self.store.get_contact("day").history_daily_until, "2026-02-09"
+        )
+
+    def test_request_replay_without_a_day_rewinds_to_acquaintance(self) -> None:
+        # since=None = 全史都不可信（口径升级/强制重放）：进度整体退回相识日。
+        with self.store.connection as connection:
+            connection.execute(
+                "UPDATE contacts SET history_daily_until = '2026-03-10' "
+                "WHERE session_id = 'day'"
+            )
+
+        request_replay(self.store, "t")
+
+        self.assertEqual(self.store.get_contact("day").history_daily_until, "")
+
+    def test_history_period_rows_trigger_a_replay_in_the_same_round(self) -> None:
+        # 第一轮正常跑完：标记已写，第二轮回放必然被标记挡住（0 点）。
+        first = self.run_round_llm(self.NOW_RESET)
+        self.assertGreater(first.history_points, 0)
+        second = self.run_round_llm(self.NOW_RESET)
+        self.assertEqual(second.history_points, 0)
+
+        # 第二轮落地了改写历史时点的时段行：请求重放 → 标记被清、逐日进度
+        # 退回改写点前一天并重新细化到昨天（曲线在该日之后被重写）。
+        since = day_key(self.NOW_RESET - 5 * 86400)
+        with patch(
+            "wechat_insights.analyzer.refresh_periods",
+            return_value=PeriodRefresh(1, since),
+        ):
+            replayed = self.run_round_llm(self.NOW_RESET)
+        self.assertGreater(replayed.history_points, 0)
+        self.assertEqual(
+            self.store.get_contact("day").history_daily_until,
+            refine_limit_day(self.NOW_RESET),
+        )
+
+    def test_open_month_rows_do_not_trigger_a_replay(self) -> None:
+        # 只动了今天那个点（earliest_past_end=None）：不重放，回放标记原样
+        # 挡着，history_points == 0（白噪声闸门）。
+        self.run_round_llm(self.NOW_RESET)
+        with patch(
+            "wechat_insights.analyzer.refresh_periods",
+            return_value=PeriodRefresh(1, None),
+        ):
+            result = self.run_round_llm(self.NOW_RESET)
+        self.assertEqual(result.history_points, 0)
 
     def test_formula_reset_is_skipped_when_the_backup_fails(self) -> None:
         # 备份拿不到就不动数据：版本号不写（下一轮会重试）、回放标记与
