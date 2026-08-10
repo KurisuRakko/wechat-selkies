@@ -1,4 +1,4 @@
-"""关系画像刷新：给候选联系人补上/刷新 LLM 深度分、关系画像与异动解释。
+"""关系画像刷新：给候选联系人补上/刷新关系画像、异动解释与话题标签。
 
 只在深度策略是 llm 时被调用。所有调用都是出站流量：聊天样本与异动列表
 拼成一个 user 字符串后，整体过 masking.mask() 再交给 llm.chat——这是聊天
@@ -37,9 +37,6 @@ SYSTEM_PROMPT = (
     "你是一个亲密关系分析助手。用户会给你他和一位朋友最近的聊天记录（已做隐私脱敏，"
     "部分词被替换成星号），可能还附有一份检测到的近期变化列表。只回复 JSON，不要任何"
     "其他文字，字段如下：\n"
-    '"score"：0 到 100 的整数。从话题实质性、情感袒露程度、相互追问与回应的质量三个'
-    "方面评估对话深度：日常寒暄、斗图、纯事务性沟通在 30 以下；有实质话题讨论在 "
-    "30–60；有情感袒露、深度交流在 60 以上。\n"
     '"summary"：不超过 100 字的两三句话，概括你们主要聊什么话题、相处模式是什么样。'
     '用「你们」称呼双方，不要出现具体人名。\n'
     '"anomaly_note"：如果附了近期变化列表，基于聊天内容用一句话（不超过 50 字）推测'
@@ -50,42 +47,40 @@ SYSTEM_PROMPT = (
 
 
 @dataclass(frozen=True, slots=True)
-class LLMReply:
-    """一次 LLM 深度打分回复解析出的四件套：分数 + 关系画像 + 异动解释 + 话题标签。"""
+class PortraitReply:
+    """一次画像调用解析出的三件套：关系画像 + 异动解释 + 话题标签。"""
 
-    score: int
     summary: str
     anomaly_note: str | None
     tags: list[str] | None
 
 
-def _parse_llm_reply(reply: str) -> LLMReply | None:
-    """截取回复里的第一个 JSON 块，解析 score/summary/anomaly_note/tags。
+def parse_reply(reply: str) -> PortraitReply | None:
+    """截第一个 JSON 块解析。summary 缺失或为空 → 返回 None（不落库，下轮重评）。
 
-    score 缺失或解析不出 → 整体返回 None（不落缓存）；summary 与
-    anomaly_note 解析失败只是降级成空，不影响分数落库。tags 非 list（含
-    缺失）归一成 None——「老缓存行没有 tags」与「模型给了空数组」是两回事：
-    None 会触发下一轮重评补齐，[] 则不会。其余字段都是模型输出，长度硬
-    截断防毒，且不把回复内容写进日志：日志里出现任何聊天相关文本都违背
-    「原文不出容器」的原则。
+    画像行的唯一必需产物就是 summary；没有它这行没有任何展示价值。
+    anomaly_note / tags 解析失败只降级成 None，不影响落库。tags 非 list
+    （含缺失）归一成 None——「老缓存行没有 tags」与「模型给了空数组」是
+    两回事：None 会触发下一轮重评补齐，[] 则不会。其余字段都是模型输出，
+    长度硬截断防毒，且不把回复内容写进日志：日志里出现任何聊天相关文本
+    都违背「原文不出容器」的原则。
     """
 
     start = reply.find("{")
     end = reply.rfind("}")
     if start < 0 or end <= start:
-        LOG.warning("LLM 深度分回复里没有 JSON 块")
+        LOG.warning("关系画像回复里没有 JSON 块")
         return None
     try:
         data = json.loads(reply[start : end + 1])
-        score = int(data["score"])
-    except (ValueError, KeyError, TypeError):
-        LOG.warning("LLM 深度分回复里解析不出 score")
+    except (ValueError, TypeError):
+        LOG.warning("关系画像回复里解析不出 JSON")
         return None
     summary = data.get("summary")
-    if not isinstance(summary, str):
-        summary = ""
-    else:
-        summary = summary.strip()[:200]
+    if not isinstance(summary, str) or not summary.strip():
+        LOG.warning("关系画像回复里没有可用的 summary")
+        return None
+    summary = summary.strip()[:200]
     note = data.get("anomaly_note")
     if not isinstance(note, str):
         note = None
@@ -105,7 +100,7 @@ def _parse_llm_reply(reply: str) -> LLMReply | None:
             if len(cleaned) >= 4:
                 break
         tags = cleaned
-    return LLMReply(max(0, min(100, score)), summary, note, tags)
+    return PortraitReply(summary, note, tags)
 
 
 def _window_bounds(moment: int) -> tuple[str, str, str, str]:
@@ -131,14 +126,13 @@ def refresh_portraits(
     moment: int,
     report_cb=None,
 ) -> int:
-    """给候选联系人补上/刷新 LLM 深度分、关系画像与异动解释，返回本轮写入个数。
+    """给候选联系人补上/刷新关系画像、异动解释与话题标签，返回本轮写入个数。
 
-    候选 = 采样窗口内有消息，且（从未评过 / 分数过了保鲜期 / 打分后新增
-    消息数达标 / 近期异动指纹变了）的联系人；从未评过的排最前，其余按最
-    陈旧在前，截断到单轮调用上限，剩下的下一轮再评。异动指纹与
-    _recompute 里的同一套计算重复一次（每轮多算几次 raw_metrics +
-    detect_anomalies，增量一轮 16 秒可接受），换来 prompt 里的异动列表与
-    缓存指纹自洽。
+    候选 = 采样窗口内有消息，且（从未评过 / 过了保鲜期 / 评过后新增消息
+    数达标 / 近期异动指纹变了）的联系人；从未评过的排最前，其余按最陈旧
+    在前，截断到单轮调用上限，剩下的下一轮再评。异动指纹与 _recompute
+    里的同一套计算重复一次（每轮多算几次 raw_metrics + detect_anomalies，
+    增量一轮 16 秒可接受），换来 prompt 里的异动列表与缓存指纹自洽。
     """
 
     sample_start = moment - LLM_SAMPLE_DAYS * 86400
@@ -217,13 +211,12 @@ def refresh_portraits(
                 for item in anomalies
             )
         reply = llm.chat(SYSTEM_PROMPT, mask(user))
-        parsed = _parse_llm_reply(reply) if reply is not None else None
+        parsed = parse_reply(reply) if reply is not None else None
         if parsed is None:
             failed += 1
             continue
         store.set_llm_depth(
             contact.session_id,
-            parsed.score,
             moment,
             contact.total_messages,
             parsed.summary,
@@ -233,7 +226,7 @@ def refresh_portraits(
         )
         scored += 1
     LOG.info(
-        "LLM 深度打分：评分 %d 个，跳过 %d 个，失败 %d 个", scored, skipped, failed
+        "LLM 关系画像：写入 %d 个，跳过 %d 个，失败 %d 个", scored, skipped, failed
     )
     return scored
 

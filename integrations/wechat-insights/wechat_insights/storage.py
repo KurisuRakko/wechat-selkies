@@ -1,12 +1,13 @@
 """metrics.db：只存统计结果，不存任何消息原文。
 
-五张表：
+六张表：
 - contacts   每个私聊联系人的游标与里程碑
 - stats_daily 按天分桶的可加指标（数值列由 constants.METRIC_COLUMNS 生成）
 - scores     分析结束时预计算好的看板数据，HTTP 处理器直接吐 JSON
 - score_history 关系温度历史：每个联系人每天一个综合分采样点
-- llm_depth  可选的大模型深度分缓存（session_id → 分数 + 画像摘要 +
-             异动解释 + 话题标签 + 打分时刻 + 打分时累计消息数 + 异动指纹）
+- llm_depth  可选的大模型画像缓存（session_id → 画像摘要 + 异动解释 +
+             话题标签 + 打分时刻 + 打分时累计消息数 + 异动指纹）
+- llm_period 时段化大模型评分快照（一个联系人 × 一个自然月 × 一次评分一行）
 
 按天而不是按自然月分桶，是为了让「近 30 天 / 近 90 天 / 近两年」这类滚动窗口是
 精确的；自然月视图由 SQL 之外的 Python 聚合从同一批天桶合成，没有第二份真相。
@@ -50,7 +51,7 @@ _CONTACT_EXTRA_COLUMNS = (
 
 #: get_llm_depth / all_llm_depth 的共享列清单，两处查询保持一致。
 _LLM_DEPTH_COLUMNS = (
-    "score, scored_at, total_messages, summary, anomaly_note, anomalies_key, tags"
+    "scored_at, total_messages, summary, anomaly_note, anomalies_key, tags"
 )
 
 _SCHEMA = f"""
@@ -115,14 +116,14 @@ CREATE TABLE IF NOT EXISTS score_history (
     PRIMARY KEY (session_id, day)
 );
 
--- LLM 深度分缓存；total_messages 是打分时联系人的累计消息数，
+-- LLM 画像缓存；total_messages 是打分时联系人的累计消息数，
 -- 与 contacts.total_messages 的差值做「新增多少条就重评」的基准。
--- summary/anomaly_note 是同一批调用顺带生成的关系画像与异动解释，
+-- summary/anomaly_note 是同一批调用生成的关系画像与异动解释，
 -- anomalies_key 是打分时异动清单的指纹，指纹变了才需要重评重写解释。
 -- tags 是同一批调用顺带生成的话题标签（紧凑 JSON；'' 表示没有，[] 合法）。
+-- 数值信号（深度/温暖/对等）已由 llm_period 表接管，这里不再有分数列。
 CREATE TABLE IF NOT EXISTS llm_depth (
     session_id     TEXT PRIMARY KEY,
-    score          REAL NOT NULL,
     scored_at      INTEGER NOT NULL,
     total_messages INTEGER NOT NULL,
     summary        TEXT NOT NULL DEFAULT '',
@@ -130,6 +131,24 @@ CREATE TABLE IF NOT EXISTS llm_depth (
     anomalies_key  TEXT NOT NULL DEFAULT '',
     tags           TEXT NOT NULL DEFAULT ''
 );
+
+-- 时段化 LLM 分：一个联系人 × 一个自然月 × 一次评分快照一行。
+-- period_end = 这次评分覆盖到（含）的日键：当月未收口时是评分当天，收口后是月末。
+-- 主键带 period_end，所以同一个月可以有多张快照；回放到某个时刻时每个月只取
+-- period_end ≤ 该时刻的最新一张，历史因此既看不到未来、也能被逐字重放出来。
+-- 旧快照永不清理：它们就是「那一刻我们知道什么」的唯一记录。
+CREATE TABLE IF NOT EXISTS llm_period (
+    session_id TEXT NOT NULL,
+    period     TEXT NOT NULL,          -- 'YYYY-MM'
+    period_end TEXT NOT NULL,          -- 'YYYY-MM-DD'
+    depth      REAL NOT NULL,
+    warmth     REAL NOT NULL,
+    mutuality  REAL NOT NULL,
+    scored_at  INTEGER NOT NULL,       -- 运维审计用：这一行是哪一轮算出来的
+    PRIMARY KEY (session_id, period, period_end)
+);
+
+CREATE INDEX IF NOT EXISTS llm_period_session ON llm_period (session_id, period);
 """
 
 
@@ -198,15 +217,25 @@ class ContactRow:
 
 @dataclass(frozen=True, slots=True)
 class LLMDepthRow:
-    """一条 LLM 深度分缓存：分数 + 关系画像 + 异动解释 + 话题标签 + 指纹。"""
+    """一条 LLM 画像缓存：画像摘要 + 异动解释 + 话题标签 + 指纹。"""
 
-    score: float
     scored_at: int
     total_messages: int
     summary: str
     anomaly_note: str | None
     anomalies_key: str
     tags: list[str] | None
+
+
+@dataclass(frozen=True, slots=True)
+class PeriodRow:
+    """一条时段化 LLM 分快照。"""
+
+    period: str
+    period_end: str
+    depth: float
+    warmth: float
+    mutuality: float
 
 
 @dataclass(slots=True)
@@ -286,6 +315,37 @@ class MetricsStore:
                     )
                 except sqlite3.OperationalError:
                     pass  # 列已存在（新形状的库）
+            # score 列已被 llm_period 表取代（时段分接管全部数值信号）。它是
+            # NOT NULL 且没有默认值，只停止写入会让 INSERT 违反约束，所以必须
+            # 真的去掉。SQLite 的 DROP COLUMN 有版本门槛，这里用「建新表 →
+            # 搬数据 → 换名」的经典重建法，任何版本都成立；靠 PRAGMA 判断
+            # 保证只跑一次。
+            columns = {
+                row[1]
+                for row in setup.execute("PRAGMA table_info(llm_depth)")
+            }
+            if "score" in columns:
+                setup.executescript(
+                    """
+                    CREATE TABLE llm_depth_new (
+                        session_id     TEXT PRIMARY KEY,
+                        scored_at      INTEGER NOT NULL,
+                        total_messages INTEGER NOT NULL,
+                        summary        TEXT NOT NULL DEFAULT '',
+                        anomaly_note   TEXT NOT NULL DEFAULT '',
+                        anomalies_key  TEXT NOT NULL DEFAULT '',
+                        tags           TEXT NOT NULL DEFAULT ''
+                    );
+                    INSERT INTO llm_depth_new
+                        (session_id, scored_at, total_messages, summary,
+                         anomaly_note, anomalies_key, tags)
+                        SELECT session_id, scored_at, total_messages, summary,
+                               anomaly_note, anomalies_key, tags
+                        FROM llm_depth;
+                    DROP TABLE llm_depth;
+                    ALTER TABLE llm_depth_new RENAME TO llm_depth;
+                    """
+                )
             setup.execute(
                 "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
@@ -352,6 +412,12 @@ class MetricsStore:
 
     def set_json(self, key: str, value: object) -> None:
         self.set_meta(key, json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+
+    def delete_meta(self, key: str) -> None:
+        """删掉一个 meta 键（口径版本重置要清 score_history_backfilled 标记）。"""
+
+        with self.connection as connection:
+            connection.execute("DELETE FROM meta WHERE key = ?", (key,))
 
     # —— contacts ——
 
@@ -486,6 +552,20 @@ class MetricsStore:
                 [(day, session_id) for session_id in session_ids],
             )
 
+    def reset_daily_refine_progress(self) -> int:
+        """把所有每日粒度联系人的逐日细化进度清空，返回受影响行数。
+
+        打分口径变了以后，旧口径算出来的日点必须整段重算，否则同一条曲线上
+        周网格点是新口径、日点是旧口径，出现锯齿。
+        """
+
+        with self.connection as connection:
+            cursor = connection.execute(
+                "UPDATE contacts SET history_daily_until = '' "
+                "WHERE history_granularity = 'day'"
+            )
+            return cursor.rowcount
+
     # —— llm_depth ——
 
     @staticmethod
@@ -509,7 +589,6 @@ class MetricsStore:
             ):
                 tags = parsed
         return LLMDepthRow(
-            score=row["score"],
             scored_at=row["scored_at"],
             total_messages=row["total_messages"],
             summary=row["summary"] or "",
@@ -528,7 +607,6 @@ class MetricsStore:
     def set_llm_depth(
         self,
         session_id: str,
-        score: float,
         scored_at: int,
         total_messages: int,
         summary: str = "",
@@ -536,7 +614,7 @@ class MetricsStore:
         anomalies_key: str = "",
         tags: list[str] | None = None,
     ) -> None:
-        """写入或覆盖一条 LLM 深度分缓存（UPSERT）。
+        """写入或覆盖一条 LLM 画像缓存（UPSERT）。
 
         tags 为 None 存 ''（读回是 None，触发重评补齐），list 存紧凑
         JSON——空数组 [] 也是合法值，照存。
@@ -550,16 +628,15 @@ class MetricsStore:
         with self.connection as connection:
             connection.execute(
                 "INSERT INTO llm_depth "
-                "(session_id, score, scored_at, total_messages, summary, "
-                "anomaly_note, anomalies_key, tags) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                "(session_id, scored_at, total_messages, summary, "
+                "anomaly_note, anomalies_key, tags) VALUES (?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(session_id) DO UPDATE SET "
-                "score = excluded.score, scored_at = excluded.scored_at, "
+                "scored_at = excluded.scored_at, "
                 "total_messages = excluded.total_messages, "
                 "summary = excluded.summary, anomaly_note = excluded.anomaly_note, "
                 "anomalies_key = excluded.anomalies_key, tags = excluded.tags",
                 (
                     session_id,
-                    score,
                     scored_at,
                     total_messages,
                     summary,
@@ -570,7 +647,7 @@ class MetricsStore:
             )
 
     def all_llm_depth(self) -> dict[str, LLMDepthRow]:
-        """全部联系人的 LLM 深度缓存行，供打分注入与画像/异动解释用。"""
+        """全部联系人的 LLM 画像缓存行，供打分注入与画像/异动解释用。"""
 
         return {
             str(row["session_id"]): self._llm_depth_row(row)
@@ -578,6 +655,78 @@ class MetricsStore:
                 f"SELECT session_id, {_LLM_DEPTH_COLUMNS} FROM llm_depth"
             )
         }
+
+    # —— llm_period ——
+
+    def monthly_text_counts(self) -> dict[str, dict[str, int]]:
+        """{session_id: {'YYYY-MM': 该月双方文字消息条数}}，时段候选的门槛依据。
+
+        一次全表扫描（生产 18704 行，约几十毫秒），每轮只调一次。
+        """
+
+        counts: dict[str, dict[str, int]] = {}
+        for row in self.connection.execute(
+            "SELECT session_id, substr(day, 1, 7) AS period, "
+            "SUM(kind_text_them + kind_text_me) AS texts "
+            "FROM stats_daily GROUP BY session_id, period"
+        ):
+            counts.setdefault(str(row["session_id"]), {})[
+                str(row["period"])
+            ] = int(row["texts"] or 0)
+        return counts
+
+    def period_coverage(self) -> dict[tuple[str, str], str]:
+        """{(session_id, period): 该时段已评过的最大 period_end}，判定是否需要重评。"""
+
+        return {
+            (str(row["session_id"]), str(row["period"])): str(row["max_end"])
+            for row in self.connection.execute(
+                "SELECT session_id, period, MAX(period_end) AS max_end "
+                "FROM llm_period GROUP BY session_id, period"
+            )
+        }
+
+    def set_llm_period(
+        self,
+        session_id: str,
+        period: str,
+        period_end: str,
+        depth: float,
+        warmth: float,
+        mutuality: float,
+        scored_at: int,
+    ) -> None:
+        """写入一条时段分快照（UPSERT，同一 period_end 重跑就覆盖）。"""
+
+        with self.connection as connection:
+            connection.execute(
+                "INSERT INTO llm_period "
+                "(session_id, period, period_end, depth, warmth, mutuality, "
+                "scored_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(session_id, period, period_end) DO UPDATE SET "
+                "depth = excluded.depth, warmth = excluded.warmth, "
+                "mutuality = excluded.mutuality, scored_at = excluded.scored_at",
+                (session_id, period, period_end, depth, warmth, mutuality, scored_at),
+            )
+
+    def all_llm_periods(self) -> dict[str, list[PeriodRow]]:
+        """全部时段分，按 session_id 分组、组内按 (period, period_end) 升序。"""
+
+        grouped: dict[str, list[PeriodRow]] = {}
+        for row in self.connection.execute(
+            "SELECT session_id, period, period_end, depth, warmth, mutuality "
+            "FROM llm_period ORDER BY session_id, period, period_end"
+        ):
+            grouped.setdefault(str(row["session_id"]), []).append(
+                PeriodRow(
+                    period=str(row["period"]),
+                    period_end=str(row["period_end"]),
+                    depth=float(row["depth"]),
+                    warmth=float(row["warmth"]),
+                    mutuality=float(row["mutuality"]),
+                )
+            )
+        return grouped
 
     # —— stats_daily ——
 

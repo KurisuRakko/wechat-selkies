@@ -121,6 +121,29 @@ LLM_MAX_CALLS_PER_RUN = _int_env("INSIGHTS_LLM_MAX_CALLS_PER_RUN", 40, 1, 1000)
 # 一次采样最多送多少字的聊天文本（越长越贵；达到即停，不足就送全部）。
 LLM_SAMPLE_MAX_CHARS = _int_env("INSIGHTS_LLM_SAMPLE_MAX_CHARS", 4000, 500, 20000)
 
+# —— 时段化 LLM 评分（仅 llm 策略）——
+# 一个自然月至少要有这么多条双方文字消息才值得送评：更少的样本给不出可信判断，
+# 也不值得花一次调用。
+LLM_PERIOD_MIN_TEXTS = _int_env("INSIGHTS_LLM_PERIOD_MIN_TEXTS", 30, 5, 1000)
+# 尚未收口的当月每隔这么多天重评一次（新写一张快照，旧快照保留给旧时刻用）。
+LLM_PERIOD_REFRESH_DAYS = _int_env("INSIGHTS_LLM_PERIOD_REFRESH_DAYS", 7, 1, 90)
+# 单轮里「近期时段」的调用上限：当月刷新 + 刚收口月份的补评。
+LLM_PERIOD_MAX_CALLS_PER_RUN = _int_env("INSIGHTS_LLM_PERIOD_MAX_CALLS_PER_RUN", 40, 0, 2000)
+# 单轮里「历史回填」的调用上限，与上面那个预算互不挤占。首次上线临时调大
+# （例如 2000）可以一夜跑完全史，之后调回默认值。
+LLM_HISTORY_MAX_CALLS_PER_RUN = _int_env("INSIGHTS_LLM_HISTORY_MAX_CALLS_PER_RUN", 120, 0, 5000)
+# 近期 / 历史的分界：目标日在这么多天以内算近期。取 120 天 ≈ 半衰期 90 天再加
+# 一个月，正好覆盖「对当前分数还有实质权重」的那一段。
+LLM_PERIOD_FRESH_DAYS = 120
+# 一个时段最多切成这么多段样本，段落在时段内均匀铺开（单段字数上限 = 总上限 / 段数）。
+LLM_PERIOD_SAMPLE_BLOCKS = 6
+
+# —— 打分口径版本 ——
+# 改动维度组成、权重或 LLM 注入方式时 +1。版本与库里记录的不一致时，下一轮
+# 分析会自动清掉全史回放标记与逐日细化进度、重放一遍曲线，不需要人工开
+# INSIGHTS_FORCE_HISTORY_BACKFILL。
+SCORE_FORMULA_VERSION = 2
+
 # —— 关系类型分类（仅 llm 策略）——
 # 单轮分析最多给多少个新联系人做关系类型判定：候选按消息量降序（事务号
 # 往往消息多、污染最重，优先处理），超出部分下一轮再判。

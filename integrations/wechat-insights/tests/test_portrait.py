@@ -19,7 +19,7 @@ from wechat_insights.depth import LexicalDepth, LLMDepth
 
 
 class PortraitRefreshTests(AnalyzerTestCase):
-    """大模型深度打分的采样、屏蔽、缓存与刷新行为（假 reader + 假 llm.chat）。"""
+    """LLM 关系画像的采样、屏蔽、缓存与刷新行为（假 reader + 假 llm.chat）。"""
 
     def setUp(self) -> None:
         super().setUp()
@@ -36,7 +36,7 @@ class PortraitRefreshTests(AnalyzerTestCase):
             result = self.analyzer(strategy=LLMDepth()).run(now=now)
         return result, fake
 
-    def test_new_contact_is_scored_and_cached_on_first_round(self) -> None:
+    def test_new_contact_gets_a_portrait_on_first_round(self) -> None:
         build_database(
             self.database,
             [
@@ -45,12 +45,17 @@ class PortraitRefreshTests(AnalyzerTestCase):
                 them(3, 120, "最近看了本好书"),
             ],
         )
-        result, fake = self.run_llm_analysis(chat=lambda system, user: '{"score": 66}')
+        result, fake = self.run_llm_analysis(
+            chat=lambda system, user: '{"summary": "你们最近聊了日常与近况。"}'
+        )
         self.assertEqual(result.llm_scored, 1)
         self.assertEqual(fake.call_count, 1)
         row = self.store.get_llm_depth(SESSION_ID)
         self.assertIsNotNone(row)
-        self.assertEqual((row.score, row.scored_at, row.total_messages), (66.0, NOW, 3))
+        # 打分缓存列已整体移除：画像行里只有摘要、标签与解释。
+        self.assertFalse(hasattr(row, "score"))
+        self.assertEqual((row.scored_at, row.total_messages), (NOW, 3))
+        self.assertEqual(row.summary, "你们最近聊了日常与近况。")
 
     def test_sample_text_is_masked_before_being_sent(self) -> None:
         build_database(
@@ -62,7 +67,7 @@ class PortraitRefreshTests(AnalyzerTestCase):
             # 种子词必须以星号出现，原文绝不能出容器。
             self.assertNotIn("习近平", user)
             self.assertIn("***", user)
-            return '{"score": 55}'
+            return '{"summary": "你们聊了时事。"}'
 
         result, _ = self.run_llm_analysis(chat=chat)
         self.assertEqual(result.llm_scored, 1)
@@ -72,7 +77,7 @@ class PortraitRefreshTests(AnalyzerTestCase):
         # 合法地再调一次，就测不到「保鲜期内跳过」了。
         build_database(self.database, [them(1, 0), me(2, 60)])
         self.run_llm_analysis(
-            chat=lambda system, user: '{"score": 50, "tags": ["游戏"]}'
+            chat=lambda system, user: '{"summary": "你们聊了游戏。", "tags": ["游戏"]}'
         )
 
         def unexpected(system: str, user: str) -> str:
@@ -114,7 +119,8 @@ class PortraitRefreshTests(AnalyzerTestCase):
         with patch(
             "wechat_insights.analyzer.scan_direct_rows", return_value=sessions
         ), patch(
-            "wechat_insights.llm.chat", side_effect=lambda s, u: '{"score": 40}'
+            "wechat_insights.llm.chat",
+            side_effect=lambda s, u: '{"summary": "日常寒暄。"}',
         ) as fake, patch("wechat_insights.portrait.LLM_MAX_CALLS_PER_RUN", 2):
             result = self.analyzer(strategy=LLMDepth()).run(now=NOW)
         self.assertEqual(result.llm_scored, 2)
@@ -138,7 +144,7 @@ class PortraitRefreshTests(AnalyzerTestCase):
 
         def chat(system: str, user: str) -> str:
             return (
-                '{"score": 72, "summary": "你们最近聊工作与近况，相处轻松自然。", '
+                '{"summary": "你们最近聊工作与近况，相处轻松自然。", '
                 '"anomaly_note": "可能是最近见面变少了"}'
             )
 
@@ -148,7 +154,7 @@ class PortraitRefreshTests(AnalyzerTestCase):
         self.assertEqual(fake.call_count, 1)
         row = self.store.get_llm_depth(SESSION_ID)
         self.assertIsNotNone(row)
-        self.assertEqual(row.score, 72.0)
+        self.assertFalse(hasattr(row, "score"))
         self.assertEqual(row.summary, "你们最近聊工作与近况，相处轻松自然。")
         self.assertEqual(row.anomaly_note, "可能是最近见面变少了")
         payload = {
@@ -170,7 +176,7 @@ class PortraitRefreshTests(AnalyzerTestCase):
 
         def chat(system: str, user: str) -> str:
             return (
-                '{"score": 72, "summary": "你们最近聊工作与近况。",'
+                '{"summary": "你们最近聊工作与近况。",'
                 ' "tags": ["工作吐槽", "深夜谈心"]}'
             )
 
@@ -194,7 +200,7 @@ class PortraitRefreshTests(AnalyzerTestCase):
 
         with patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10):
             result, _ = self.run_llm_analysis(
-                chat=lambda s, u: '{"score": 55, "tags": []}'
+                chat=lambda s, u: '{"summary": "你们最近聊了日常。", "tags": []}'
             )
         self.assertEqual(result.llm_scored, 1)
         row = self.store.get_llm_depth(SESSION_ID)
@@ -214,7 +220,10 @@ class PortraitRefreshTests(AnalyzerTestCase):
 
         # 缺 tags 字段 / 给了字符串：都归一成 None。None 会触发下一轮重评
         # 补齐，所以每轮都真的调了 LLM（llm_scored 仍为 1，只是没有标签）。
-        for reply in ('{"score": 55}', '{"score": 55, "tags": "游戏"}'):
+        for reply in (
+            '{"summary": "你们最近聊了日常。"}',
+            '{"summary": "你们最近聊了日常。", "tags": "游戏"}',
+        ):
             with patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10):
                 result, _ = self.run_llm_analysis(chat=lambda s, u: reply)
             self.assertEqual(result.llm_scored, 1)
@@ -229,8 +238,8 @@ class PortraitRefreshTests(AnalyzerTestCase):
         self.seed_messages("friend2", "Bob", {BASE + 5 * 86400: 15})
 
         reply = (
-            '{"score": 55, "tags": ["超长标签超过八个字", "游戏", "深夜谈心",'
-            ' "工作吐槽", "电影", 42]}'
+            '{"summary": "你们最近聊了日常。", "tags": ["超长标签超过八个字",'
+            ' "游戏", "深夜谈心", "工作吐槽", "电影", 42]}'
         )
         with patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10):
             result, _ = self.run_llm_analysis(chat=lambda s, u: reply)
@@ -247,18 +256,20 @@ class PortraitRefreshTests(AnalyzerTestCase):
         build_database(self.database, [them(1, 0), me(2, 60)])
         self.seed_messages("friend2", "Bob", {BASE + 5 * 86400: 15})
 
-        first, _ = self.run_llm_analysis(chat=lambda s, u: '{"score": 50}')
+        first, _ = self.run_llm_analysis(
+            chat=lambda s, u: '{"summary": "你们最近聊了日常。"}'
+        )
         self.assertEqual(first.llm_scored, 1)
         self.assertIsNone(self.store.get_llm_depth(SESSION_ID).tags)
 
         second, fake = self.run_llm_analysis(
             now=NOW + 5 * 86400,
-            chat=lambda s, u: '{"score": 50, "tags": ["游戏"]}',
+            chat=lambda s, u: '{"summary": "你们最近聊了日常。", "tags": ["游戏"]}',
         )
         self.assertEqual(second.llm_scored, 1)
         self.assertEqual(fake.call_count, 1)
         row = self.store.get_llm_depth(SESSION_ID)
-        self.assertEqual((row.score, row.tags), (50.0, ["游戏"]))
+        self.assertEqual((row.summary, row.tags), ("你们最近聊了日常。", ["游戏"]))
 
     def test_anomaly_fingerprint_change_triggers_rescore(self) -> None:
         # 第一轮：基线窗口 60 条、近期窗口 10 条，日均消息量掉到一半以下，
@@ -315,7 +326,7 @@ class PortraitRefreshTests(AnalyzerTestCase):
         build_database(self.database, baseline + recent)
         self.seed_messages("friend2", "Bob", {BASE + 5 * 86400: 15})
         self.store.set_llm_depth(
-            SESSION_ID, 50.0, NOW, 70, "旧摘要", "旧解释", "msgs_them_per_day:better"
+            SESSION_ID, NOW, 70, "旧摘要", "旧解释", "msgs_them_per_day:better"
         )
 
         def unavailable(system: str, user: str) -> None:
@@ -331,27 +342,7 @@ class PortraitRefreshTests(AnalyzerTestCase):
         self.assertEqual(payload["llm_summary"], "旧摘要")
         self.assertIsNone(payload["anomaly_note"])
 
-    def test_missing_summary_keeps_the_score(self) -> None:
-        rows = []
-        for index in range(1, 21):
-            offset = index * 120
-            rows.append(them(index, offset) if index % 2 else me(index, offset))
-        build_database(self.database, rows)
-        self.seed_messages("friend2", "Bob", {BASE + 5 * 86400: 15})
-
-        with patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10):
-            result, _ = self.run_llm_analysis(chat=lambda s, u: '{"score": 55}')
-        self.assertEqual(result.llm_scored, 1)
-        row = self.store.get_llm_depth(SESSION_ID)
-        self.assertIsNotNone(row)
-        self.assertEqual((row.score, row.summary), (55.0, ""))
-        payload = {
-            p["display_name"]: p for p in self.store.all_scores()
-        }[DISPLAY_NAME]
-        self.assertIsNone(payload["llm_summary"])
-        self.assertIsNone(payload["llm_summary_at"])
-
-    def test_garbage_summary_and_empty_note_keep_the_score(self) -> None:
+    def test_reply_without_summary_writes_nothing(self) -> None:
         rows = []
         for index in range(1, 21):
             offset = index * 120
@@ -361,18 +352,27 @@ class PortraitRefreshTests(AnalyzerTestCase):
 
         with patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10):
             result, _ = self.run_llm_analysis(
-                chat=lambda s, u: '{"score": 55, "summary": 123, "anomaly_note": ""}'
+                chat=lambda s, u: '{"tags": ["游戏"], "anomaly_note": "最近联系少了"}'
             )
-        self.assertEqual(result.llm_scored, 1)
-        row = self.store.get_llm_depth(SESSION_ID)
-        self.assertIsNotNone(row)
-        self.assertEqual(row.score, 55.0)
-        self.assertEqual(row.summary, "")
-        self.assertIsNone(row.anomaly_note)
-        payload = {
-            p["display_name"]: p for p in self.store.all_scores()
-        }[DISPLAY_NAME]
-        self.assertIsNone(payload["llm_summary"])
+        # summary 是画像行的必需产物，缺失就整行不写，下一轮重评。
+        self.assertEqual(result.llm_scored, 0)
+        self.assertIsNone(self.store.get_llm_depth(SESSION_ID))
+
+    def test_non_string_summary_writes_nothing(self) -> None:
+        rows = []
+        for index in range(1, 21):
+            offset = index * 120
+            rows.append(them(index, offset) if index % 2 else me(index, offset))
+        build_database(self.database, rows)
+        self.seed_messages("friend2", "Bob", {BASE + 5 * 86400: 15})
+
+        with patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10):
+            result, _ = self.run_llm_analysis(
+                chat=lambda s, u: '{"summary": 123, "anomaly_note": "最近联系变少了"}'
+            )
+        # 非字符串的 summary 同样当缺失处理：不落库，下一轮重评。
+        self.assertEqual(result.llm_scored, 0)
+        self.assertIsNone(self.store.get_llm_depth(SESSION_ID))
 
     def test_anomaly_list_is_sent_in_the_user_text_and_masked(self) -> None:
         # 基线 60 条 vs 近期 10 条构成「日均消息量下降」异动；样本里埋种子
@@ -388,7 +388,7 @@ class PortraitRefreshTests(AnalyzerTestCase):
             self.assertIn("→", user)
             self.assertNotIn("习近平", user)
             self.assertIn("***", user)
-            return '{"score": 45, "anomaly_note": "最近联系变少了"}'
+            return '{"summary": "你们最近联系变少了。", "anomaly_note": "最近联系变少了"}'
 
         with patch("wechat_insights.analyzer.classify_contacts", return_value=0):
             # 同上：70 条消息会触发关系分类的第二次 chat 调用，这里关掉。
@@ -411,29 +411,6 @@ class PortraitRefreshTests(AnalyzerTestCase):
         ), patch("wechat_insights.llm.chat", side_effect=unexpected):
             result = self.analyzer(strategy=LexicalDepth()).run(now=NOW)
         self.assertEqual(result.llm_scored, 0)
-
-    def test_llm_scores_flow_into_the_scoring_extras(self) -> None:
-        # 两人窗口内只有纯消息计数、没有任何词法文本指标（三项全部缺值），
-        # llm 组件的 0.5 权重整份生效：深度维度完全由 LLM 分决定（75 vs 25）。
-        for session_id, name in (("a", "A"), ("b", "B")):
-            self.seed_messages(
-                session_id,
-                name,
-                {BASE + offset * 86400: 3 for offset in range(25)},
-            )
-        self.store.set_llm_depth("a", 90.0, NOW, 75)
-        self.store.set_llm_depth("b", 10.0, NOW, 75)
-
-        with patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 50):
-            result, fake = self.run_llm_analysis(chat=lambda s, u: '{"score": 1}')
-        # 两个联系人的 last_message_at 是 None（seed 走的不是同步循环），
-        # 不会进采样候选，chat 不应被调用。
-        self.assertEqual(fake.call_count, 0)
-        payloads = {p["display_name"]: p for p in self.store.all_scores()}
-        self.assertTrue(payloads["A"]["scored"])
-        self.assertAlmostEqual(payloads["A"]["dimensions"]["depth"], 75.0)
-        self.assertAlmostEqual(payloads["B"]["dimensions"]["depth"], 25.0)
-
 
 if __name__ == "__main__":
     unittest.main()

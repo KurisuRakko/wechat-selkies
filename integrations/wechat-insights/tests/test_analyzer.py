@@ -694,7 +694,10 @@ class ProgressTests(AnalyzerTestCase):
         sessions = {SESSION_ID: SimpleNamespace(display_name=DISPLAY_NAME)}
         with patch(
             "wechat_insights.analyzer.scan_direct_rows", return_value=sessions
-        ), patch("wechat_insights.llm.chat", side_effect=lambda s, u: '{"score": 60}'):
+        ), patch(
+            "wechat_insights.llm.chat",
+            side_effect=lambda s, u: '{"summary": "日常寒暄。"}',
+        ):
             result = self.analyzer(strategy=strategy, progress_cb=callback).run(**kwargs)
         return result, events
 
@@ -749,7 +752,9 @@ class ProgressTests(AnalyzerTestCase):
         events: list[dict] = []
         with patch(
             "wechat_insights.analyzer.scan_direct_rows", return_value=sessions
-        ), patch("wechat_insights.llm.chat", side_effect=lambda s, u: '{"score": 40}'
+        ), patch(
+            "wechat_insights.llm.chat",
+            side_effect=lambda s, u: '{"summary": "日常寒暄。"}',
         ) as fake, patch("wechat_insights.portrait.LLM_MAX_CALLS_PER_RUN", 2):
             result = self.analyzer(
                 strategy=LLMDepth(), progress_cb=lambda fields: events.append(dict(fields))

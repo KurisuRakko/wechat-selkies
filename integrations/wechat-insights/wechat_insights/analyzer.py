@@ -50,7 +50,7 @@ from .scoring import (
     raw_metrics,
     score_cohort,
 )
-from .storage import ContactRow, LLMDepthRow, MetricsStore, WindowStats
+from .storage import ContactRow, MetricsStore, WindowStats
 
 
 LOG = logging.getLogger("wechat-insights")
@@ -424,7 +424,6 @@ class Analyzer:
         moment: int,
         *,
         gap_override: dict[str, float | None] | None = None,
-        llm_scores: dict[str, LLMDepthRow] | None = None,
     ) -> ScoresAsOf:
         """打分内核：把「某一时刻」能看到的天桶换算成每个联系人的七维分与综合分。
 
@@ -432,10 +431,7 @@ class Analyzer:
         历史回放不许复制出第二份真相。与今日路径的差异集中注释在这里：
         - current_gap_days 按「窗口内最后活跃日到 asof_day 的天数」推算——
           不能拿 contact.last_message_at 这种「现在」的知识穿越回过去；
-          今日路径用 gap_override 传回 contact.last_message_at 口径；
-        - 不注入 llm_depth_score：llm_depth 缓存里只有「当前」的分数，历史
-          时刻不可知，深度维度按缺值机制自动退化成纯词法；今日路径传
-          llm_scores（LLM 行缺失时注入 None，与不注入等价）。
+          今日路径用 gap_override 传回 contact.last_message_at 口径。
         """
 
         asof_day = day_key(moment)
@@ -489,13 +485,6 @@ class Analyzer:
                     window, contact, score_start, score_start_ts
                 ),
             }
-            if llm_scores is not None:
-                # LLM 行可能还没有（None）：缺值权重回流给词法三项，
-                # 深度维度自动退化成纯词法，不需要特判。
-                llm_row = llm_scores.get(session_id)
-                extras["llm_depth_score"] = (
-                    llm_row.score if llm_row is not None else None
-                )
             raw_score[session_id] = raw_metrics(
                 window.weighted, self.strategy, equivalent_days, extras
             )
@@ -512,13 +501,12 @@ class Analyzer:
     def _recompute(self, moment: int) -> int:
         """重算所有联系人的七维分、趋势与异动，整体替换 scores 表。
 
-        分数本体由 _scores_asof 内核算出；这里叠加今日专属的部分：LLM 深度分
-        注入、趋势/异动窗口、payload 组装、温度历史每日记点与「正在淡出」。
+        分数本体由 _scores_asof 内核算出；这里叠加今日专属的部分：趋势/异动
+        窗口、payload 组装、温度历史每日记点与「正在淡出」。
         """
 
         today, recent_start, baseline_end, baseline_start = self._window_bounds(moment)
         contacts = {contact.session_id: contact for contact in self.store.all_contacts()}
-        llm_scores = self.store.all_llm_depth() if self.strategy.name == "llm" else {}
         asof = self._scores_asof(
             moment,
             gap_override={
@@ -529,7 +517,6 @@ class Analyzer:
                 )
                 for session_id, contact in contacts.items()
             },
-            llm_scores=llm_scores or None,
         )
         score_stats = asof.stats
         contacts_by_id = asof.contacts
@@ -563,6 +550,9 @@ class Analyzer:
         recent_scores = score_cohort(raw_recent, self.strategy)
         baseline_scores = score_cohort(raw_baseline, self.strategy)
 
+        # 画像字段只属于今日详情页 payload，在 _scores_asof 之外单独读：
+        # 打分内核不依赖「当前」时刻的缓存，历史回放才没有第二份真相。
+        llm_scores = self.store.all_llm_depth() if self.strategy.name == "llm" else {}
         payloads: list[tuple[str, dict[str, object]]] = []
         for contact in contacts_by_id.values():
             session_id = contact.session_id
