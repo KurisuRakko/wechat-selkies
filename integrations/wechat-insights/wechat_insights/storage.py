@@ -31,23 +31,12 @@ from .constants import (
     SCHEMA_VERSION,
 )
 from .metrics import Metrics, day_span, dump_histogram, parse_histogram
+from .migrations import apply_migrations
 
 
 LOG = logging.getLogger("wechat-insights")
 
 _ROW_COLUMNS = METRIC_COLUMNS + HISTOGRAM_COLUMNS
-
-#: llm_depth 在 CREATE TABLE 之外的幂等补列清单（见 _initialize）。
-_LLM_DEPTH_EXTRA_COLUMNS = ("summary", "anomaly_note", "anomalies_key", "tags")
-
-#: contacts 在 CREATE TABLE 之外的幂等补列清单（见 _initialize）。
-#: contacts 里存着游标与里程碑，生产库上补列只能 ALTER，绝不能重建回填。
-_CONTACT_EXTRA_COLUMNS = (
-    "kind_auto",
-    "kind_manual",
-    "history_granularity",
-    "history_daily_until",
-)
 
 #: get_llm_depth / all_llm_depth 的共享列清单，两处查询保持一致。
 _LLM_DEPTH_COLUMNS = (
@@ -293,63 +282,13 @@ class MetricsStore:
                 self.path.with_name(self.path.name + suffix).unlink(missing_ok=True)
         with closing(sqlite3.connect(self.path)) as setup, setup:
             setup.executescript(_SCHEMA)
-            # llm_depth 是 3a15872 新增、从未上过生产，这个幂等迁移只为本地
-            # 已建库的开发/测试环境兜底：逐个补列，列已存在就跳过。不值得为
-            # 它 bump SCHEMA_VERSION 触发全量重建回填。
-            for column in _LLM_DEPTH_EXTRA_COLUMNS:
-                try:
-                    setup.execute(
-                        f"ALTER TABLE llm_depth ADD COLUMN {column} "
-                        "TEXT NOT NULL DEFAULT ''"
-                    )
-                except sqlite3.OperationalError:
-                    pass  # 列已存在（新形状的库）
-            # contacts 存着游标与里程碑，同样不能重建：幂等补列，旧行直接
-            # 读回空串（未判定的联系人按默认 friend、采样粒度按每周处理），
-            # 升级后一切照旧。
-            for column in _CONTACT_EXTRA_COLUMNS:
-                try:
-                    setup.execute(
-                        f"ALTER TABLE contacts ADD COLUMN {column} "
-                        "TEXT NOT NULL DEFAULT ''"
-                    )
-                except sqlite3.OperationalError:
-                    pass  # 列已存在（新形状的库）
-            # score 列已被 llm_period 表取代（时段分接管全部数值信号）。它是
-            # NOT NULL 且没有默认值，只停止写入会让 INSERT 违反约束，所以必须
-            # 真的去掉。SQLite 的 DROP COLUMN 有版本门槛，这里用「建新表 →
-            # 搬数据 → 换名」的经典重建法，任何版本都成立；靠 PRAGMA 判断
-            # 保证只跑一次。
-            columns = {
-                row[1]
-                for row in setup.execute("PRAGMA table_info(llm_depth)")
-            }
-            if "score" in columns:
-                setup.executescript(
-                    """
-                    CREATE TABLE llm_depth_new (
-                        session_id     TEXT PRIMARY KEY,
-                        scored_at      INTEGER NOT NULL,
-                        total_messages INTEGER NOT NULL,
-                        summary        TEXT NOT NULL DEFAULT '',
-                        anomaly_note   TEXT NOT NULL DEFAULT '',
-                        anomalies_key  TEXT NOT NULL DEFAULT '',
-                        tags           TEXT NOT NULL DEFAULT ''
-                    );
-                    INSERT INTO llm_depth_new
-                        (session_id, scored_at, total_messages, summary,
-                         anomaly_note, anomalies_key, tags)
-                        SELECT session_id, scored_at, total_messages, summary,
-                               anomaly_note, anomalies_key, tags
-                        FROM llm_depth;
-                    DROP TABLE llm_depth;
-                    ALTER TABLE llm_depth_new RENAME TO llm_depth;
-                    """
-                )
             setup.execute(
                 "INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
             )
+        # 补列与去列在独立连接里做：去 score 列之前要 VACUUM INTO 备份，
+        # 而 VACUUM 不能在事务里跑。建表必须先完成，补列才有表可补。
+        apply_migrations(self.path)
 
     def _stale_schema(self) -> bool:
         """库文件已存在，但 schema 版本不是当前版本（含读不出版本的损坏库）。"""
