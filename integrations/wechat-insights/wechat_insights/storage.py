@@ -126,6 +126,8 @@ CREATE TABLE IF NOT EXISTS llm_depth (
 -- 主键带 period_end，所以同一个月可以有多张快照；回放到某个时刻时每个月只取
 -- period_end ≤ 该时刻的最新一张，历史因此既看不到未来、也能被逐字重放出来。
 -- 旧快照永不清理：它们就是「那一刻我们知道什么」的唯一记录。
+-- model 记着算这一行时用的模型名：换模型后按它精确清理旧模型算出来的行，
+-- 不必清空整表（'' = 补列前的老行，模型未知）。
 CREATE TABLE IF NOT EXISTS llm_period (
     session_id TEXT NOT NULL,
     period     TEXT NOT NULL,          -- 'YYYY-MM'
@@ -134,6 +136,7 @@ CREATE TABLE IF NOT EXISTS llm_period (
     warmth     REAL NOT NULL,
     mutuality  REAL NOT NULL,
     scored_at  INTEGER NOT NULL,       -- 运维审计用：这一行是哪一轮算出来的
+    model      TEXT NOT NULL DEFAULT '',  -- 算这一行时用的模型名；'' = 补列前的老行（未知）
     PRIMARY KEY (session_id, period, period_end)
 );
 
@@ -634,18 +637,33 @@ class MetricsStore:
         warmth: float,
         mutuality: float,
         scored_at: int,
+        model: str = "",
     ) -> None:
-        """写入一条时段分快照（UPSERT，同一 period_end 重跑就覆盖）。"""
+        """写入一条时段分快照（UPSERT，同一 period_end 重跑就覆盖）。
+
+        model 记着算这一行时用的 INSIGHTS_LLM_MODEL，换模型后按它精确清理；
+        '' 表示未记录（补列前写下的老行）。
+        """
 
         with self.connection as connection:
             connection.execute(
                 "INSERT INTO llm_period "
                 "(session_id, period, period_end, depth, warmth, mutuality, "
-                "scored_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "scored_at, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(session_id, period, period_end) DO UPDATE SET "
                 "depth = excluded.depth, warmth = excluded.warmth, "
-                "mutuality = excluded.mutuality, scored_at = excluded.scored_at",
-                (session_id, period, period_end, depth, warmth, mutuality, scored_at),
+                "mutuality = excluded.mutuality, scored_at = excluded.scored_at, "
+                "model = excluded.model",
+                (
+                    session_id,
+                    period,
+                    period_end,
+                    depth,
+                    warmth,
+                    mutuality,
+                    scored_at,
+                    model,
+                ),
             )
 
     def all_llm_periods(self) -> dict[str, list[PeriodRow]]:

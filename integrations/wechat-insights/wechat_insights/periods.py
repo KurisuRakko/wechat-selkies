@@ -19,6 +19,7 @@ from . import llm
 from .constants import (
     BACKFILL_BATCH,
     DECAY_HALF_LIFE_DAYS,
+    INSIGHTS_LLM_MODEL,
     LLM_HISTORY_MAX_CALLS_PER_RUN,
     LLM_PERIOD_FRESH_DAYS,
     LLM_PERIOD_MAX_CALLS_PER_RUN,
@@ -282,6 +283,7 @@ def refresh_periods(
             parsed.warmth,
             parsed.mutuality,
             moment,
+            INSIGHTS_LLM_MODEL,
         )
         written += 1
     LOG.info("时段化 LLM 评分：本轮写入 %d 行", written)

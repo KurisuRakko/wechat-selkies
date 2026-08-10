@@ -423,6 +423,16 @@ class PeriodTests(StoreTestCase):
             (row.period, row.period_end, row.depth, row.warmth, row.mutuality),
             ("2025-10", "2025-10-31", 55.0, 70.0, 62.0),
         )
+        # model 是写入侧审计字段：PeriodRow 不带这一列（打分内核不需要它）。
+        self.assertFalse(hasattr(row, "model"))
+        # 带 model 的写入：SQL 侧读回原值；同 period_end 重跑覆盖时跟着更新。
+        self.store.set_llm_period(
+            "friend", "2025-10", "2025-10-31", 55.0, 70.0, 62.0, 1_000, "deepseek-chat"
+        )
+        stored = self.store.connection.execute(
+            "SELECT model FROM llm_period WHERE session_id = 'friend'"
+        ).fetchone()[0]
+        self.assertEqual(stored, "deepseek-chat")
 
     def test_same_period_with_different_period_end_coexist(self) -> None:
         # 当月未收口时每轮重评都会新写一张快照（period_end = 评分当天），
@@ -471,6 +481,38 @@ class PeriodTests(StoreTestCase):
         rows = self.store.all_llm_periods()
         self.assertEqual(list(rows), ["a", "b"])
         self.assertEqual([row.period for row in rows["a"]], ["2025-09", "2025-10"])
+
+    def test_model_column_is_added_to_an_existing_llm_period_table(self) -> None:
+        # 模拟补列前的库：建库后手动删掉 model 列并写一行老数据 → 重开
+        # MetricsStore → model 列回来、老行读回 ''（D17 的空串语义）、
+        # 新行能正常写入。
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        path = Path(temporary.name) / "metrics.db"
+        seed = MetricsStore(path)
+        seed.set_llm_period("friend", "2025-10", "2025-10-31", 55.0, 70.0, 62.0, 1_000)
+        seed.close()
+        with sqlite3.connect(path) as connection:
+            connection.execute("ALTER TABLE llm_period DROP COLUMN model")
+
+        store = MetricsStore(path)
+        self.addCleanup(store.close)
+        columns = {
+            row[1] for row in store.connection.execute("PRAGMA table_info(llm_period)")
+        }
+        self.assertIn("model", columns)
+        old = store.connection.execute(
+            "SELECT model FROM llm_period WHERE session_id = 'friend'"
+        ).fetchone()
+        self.assertEqual(old[0], "")
+        store.set_llm_period(
+            "friend", "2025-11", "2025-11-30", 60.0, 70.0, 65.0, 2_000, "new-model"
+        )
+        written = store.connection.execute(
+            "SELECT model FROM llm_period "
+            "WHERE session_id = 'friend' AND period = '2025-11'"
+        ).fetchone()[0]
+        self.assertEqual(written, "new-model")
 
 
 class MetaMaintenanceTests(StoreTestCase):

@@ -239,6 +239,17 @@ class PeriodRefreshTests(AnalyzerTestCase):
         _, fake = self.run_period_analysis(now=first + 3 * 86400, chat=[REPLY])
         self.assertEqual(fake.call_count, 0)
 
+    def test_written_rows_record_the_configured_model(self) -> None:
+        # 写入的行带着当时的 INSIGHTS_LLM_MODEL：换模型后能按它精确清理。
+        self.month_messages(self.closed_period(), texts=60)
+        with patch("wechat_insights.periods.INSIGHTS_LLM_MODEL", "deepseek-chat"):
+            result, _ = self.run_period_analysis(chat=[REPLY])
+        self.assertEqual(result.llm_periods, 1)
+        model = self.store.connection.execute(
+            "SELECT model FROM llm_period"
+        ).fetchone()[0]
+        self.assertEqual(model, "deepseek-chat")
+
     def test_closed_month_gets_one_more_call_covering_the_full_month(self) -> None:
         period = month_of(day_key(NOW))
         self.month_messages(period, texts=60)

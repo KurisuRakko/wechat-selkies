@@ -17,7 +17,7 @@ from .backup import REASON_LLM_DEPTH_REBUILD, backup_database
 LOG = logging.getLogger("wechat-insights")
 
 #: CREATE TABLE 之外的幂等补列清单：(表名, 列名...)。全部 TEXT NOT NULL DEFAULT ''，
-#: 旧行读回空串 = 「这一项当年没记」。多张表共用一个循环，加表不加分支。
+#: 旧行读回空串 = 「这一项当年没记」。三张表共用一个循环，加表不加分支。
 _EXTRA_COLUMNS = (
     # llm_depth 是 3a15872 新增、从未上过生产，这个幂等迁移只为本地
     # 已建库的开发/测试环境兜底：逐个补列，列已存在就跳过。不值得为
@@ -35,6 +35,9 @@ _EXTRA_COLUMNS = (
             "history_daily_until",
         ),
     ),
+    # llm_period 补列之前写下的行没有模型名，读回空串 = 模型未知；换模型
+    # 后按 model 精确清理旧模型算出来的行，不必清空整表。
+    ("llm_period", ("model",)),
 )
 
 #: llm_depth 去 score 列的表重建脚本（原 storage._initialize 内的 executescript 原文）。
