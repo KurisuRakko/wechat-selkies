@@ -436,7 +436,9 @@
   var RING_RADIUS = 24;
   var RING_STROKE = 4;
 
-  /** 综合分环形：inline SVG，用 stroke-dasharray 表示 0–100 的占比。 */
+  /** 综合分环形：inline SVG。stroke-dasharray 固定为整周长，占比由
+   *  stroke-dashoffset（--ring-offset）表示：首屏时 CSS 动画从 0 描边
+   *  到目标分数，之后常驻静态偏移。 */
   function ringSvg(overall) {
     var circumference = 2 * Math.PI * RING_RADIUS;
     var pct = Math.max(0, Math.min(100, overall));
@@ -482,9 +484,11 @@
       '" stroke="' +
       color +
       '" stroke-dasharray="' +
-      filled.toFixed(2) +
-      " " +
       circumference.toFixed(2) +
+      '" style="--ring-circumference: ' +
+      circumference.toFixed(2) +
+      "; --ring-offset: " +
+      (circumference - filled).toFixed(2) +
       '"></circle>' +
       '<text class="ring__label" x="' +
       center +
