@@ -34,6 +34,16 @@ def day_key(timestamp: int) -> str:
     return datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d")
 
 
+def day_moment(day: str) -> int:
+    """日键 → 当天本地 0 点的时间戳（回放网格点的时间坐标）。
+
+    用日期解析而不是「现在 − n 天 × 86400」：跨夏令时的日子后者会差一小时、
+    日键偶尔差一天，回放点必须精确落在网格日上。
+    """
+
+    return int(datetime.fromisoformat(day).timestamp())
+
+
 def day_span(start_day: str, end_day: str) -> int:
     """闭区间 [start_day, end_day] 覆盖的天数，含首尾两天。
 
@@ -299,6 +309,7 @@ __all__ = [
     "aggregate",
     "bucket_of",
     "day_key",
+    "day_moment",
     "day_span",
     "decayed_span",
     "decayed_weight",

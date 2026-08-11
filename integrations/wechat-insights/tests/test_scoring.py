@@ -81,15 +81,11 @@ class RawMetricTests(unittest.TestCase):
         )
         self.assertAlmostEqual(values["balance_msgs"], 0.5)
         self.assertAlmostEqual(values["balance_chars"], 0.25)
-        self.assertAlmostEqual(values["balance_started"], 1 / 3)
-        # 一边完全没数据时是 None，而不是 0——不能把「没数据」当成「一边倒」。
-        self.assertIsNone(
-            raw_metrics(
-                window(msgs_them=1, msgs_me=1, chars_them=1, chars_me=1),
-                STRATEGY,
-                30,
-            )["balance_started"]
-        )
+        # 双方投入的下限 = min(100字/20, 400字/20) / 30：两边的绝对量级都
+        # 参与，只有一边大不算共同投入。
+        self.assertAlmostEqual(values["mutual_cost_per_day"], 5 / 30)
+        # 旧原始值必须真的消失，不留死键。
+        self.assertNotIn("balance_started", values)
 
     def test_extras_are_merged_into_the_raw_values(self) -> None:
         values = raw_metrics(
@@ -154,15 +150,19 @@ class DimensionTests(unittest.TestCase):
         self.assertEqual(scores["a"]["overall"], 50.0)
 
     def test_reciprocity_ranks_balanced_contacts_higher(self) -> None:
+        # 两个联系人的四个新组成项方向一致，两人 cohort 百分位仍是 75/25；
+        # 一边倒的联系人在每个原始值上都被压到低分位。
         balanced = {
+            "mutual_cost_per_day": 8.0,
             "balance_msgs": 0.9,
             "balance_chars": 0.9,
-            "balance_started": 0.9,
+            "llm_mutuality_score": 90.0,
         }
         one_sided = {
+            "mutual_cost_per_day": 0.5,
             "balance_msgs": 0.1,
             "balance_chars": 0.1,
-            "balance_started": 0.1,
+            "llm_mutuality_score": 10.0,
         }
         scores = score_cohort({"balanced": balanced, "one_sided": one_sided}, STRATEGY)
         self.assertGreater(
@@ -170,6 +170,50 @@ class DimensionTests(unittest.TestCase):
         )
         self.assertEqual(scores["balanced"]["reciprocity"], 75.0)
         self.assertEqual(scores["one_sided"]["reciprocity"], 25.0)
+
+    def test_reciprocity_rewards_mutual_volume_over_pure_ratio(self) -> None:
+        # 本次修复的核心语义：同样都是「双向」，投入量级大的拿到更高分。
+        # A：双方各 1000 成本、比例 0.8；B：双方各 10 成本、比例 1.0。
+        # 两人 cohort 下体积项与比例项权重恰好对称（0.35 vs 0.35），纯靠
+        # 这两个数字会精确抵消成平局，所以 LLM 双向性也按量级给（A 高、
+        # B 低）——真实关系里「一起投入很多」的双向性本来就比「都投很少」
+        # 更可信，这也正是 LLM 分放进对等维的意义。
+        a = {
+            "mutual_cost_per_day": 1000.0,
+            "balance_msgs": 0.8,
+            "balance_chars": 0.8,
+            "llm_mutuality_score": 90.0,
+        }
+        b = {
+            "mutual_cost_per_day": 10.0,
+            "balance_msgs": 1.0,
+            "balance_chars": 1.0,
+            "llm_mutuality_score": 70.0,
+        }
+        scores = score_cohort({"a": a, "b": b}, STRATEGY)
+        self.assertGreater(scores["a"]["reciprocity"], scores["b"]["reciprocity"])
+        self.assertAlmostEqual(scores["a"]["reciprocity"], 57.5)
+        self.assertAlmostEqual(scores["b"]["reciprocity"], 42.5)
+
+    def test_reciprocity_without_llm_redistributes_to_three_components(self) -> None:
+        # llm_mutuality_score 缺失时权重按 0.5 / 0.286 / 0.214 归一回流，
+        # 这就是离线部署拿到的那份对等维修复——缺值机制的自然结果，不是特判。
+        cohort = {
+            "a": {
+                "mutual_cost_per_day": 100.0,
+                "balance_msgs": 0.9,
+                "balance_chars": 0.9,
+            },
+            "b": {
+                "mutual_cost_per_day": 1.0,
+                "balance_msgs": 0.1,
+                "balance_chars": 0.1,
+            },
+        }
+        scores = score_cohort(cohort, STRATEGY)
+        expected = 0.5 * 75 + (0.2 / 0.7) * 75 + (0.15 / 0.7) * 75
+        self.assertAlmostEqual(scores["a"]["reciprocity"], expected)
+        self.assertAlmostEqual(scores["b"]["reciprocity"], 25.0)
 
     def test_constancy_ranks_active_contacts_higher(self) -> None:
         steady = {"active_day_rate": 0.8, "current_gap_days": 1.0, "longest_gap_days": 3.0}

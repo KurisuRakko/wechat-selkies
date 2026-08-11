@@ -9,7 +9,8 @@ from unittest.mock import patch
 
 from aiohttp.test_utils import AioHTTPTestCase
 
-from wechat_insights.analyzer import AnalysisResult, refine_limit_day
+from wechat_insights.analyzer import AnalysisResult
+from wechat_insights.history import refine_limit_day
 from wechat_insights.metrics import Metrics, day_key
 from wechat_insights.server import (
     InsightsRuntime,
@@ -409,7 +410,7 @@ class ApiTests(AioHTTPTestCase):
         self.assertIsNotNone(progress["finished_at"])
         self.assertEqual(
             progress["last_result"],
-            {"messages_read": 12, "scored": 7, "llm_scored": 3},
+            {"messages_read": 12, "scored": 7, "llm_scored": 3, "llm_periods": 0},
         )
 
     async def test_refresh_is_debounced(self) -> None:

@@ -73,12 +73,14 @@ class LexicalDepth:
 
 
 class LLMDepth:
-    """v2 可选策略：词法三项保留，另加一项 LLM 打的对话深度分。
+    """v2 可选策略：词法三项保留，另加 LLM 的时段深度分与亲密度分。
 
-    包装 LexicalDepth：raw_metrics 仍只回词法三项，LLM 分数不从这里算，
-    由 analyzer 经 extras 注入（recent/baseline 窗口不注入）。某联系人还
-    没有 LLM 分数（没采样过 / API 挂了）时，缺值权重按 score_cohort 的
-    现有机制回流给词法三项，深度维度自动退化成纯词法，不需要任何特判。
+    包装 LexicalDepth：raw_metrics 仍只回词法三项，LLM 分数不从这里算，由
+    analyzer 经 extras 注入——分数不是「当前时刻的一个缓存」，而是时段分
+    （llm_period 表）按 as-of 聚合出来的历史可重放值（recent/baseline
+    窗口不注入）。某联系人还没有 LLM 分（没采样过 / API 挂了 / 该月样本
+    不足）时，缺值权重按 score_cohort 的现有机制回流给词法三项，深度维度
+    自动退化成纯词法，不需要任何特判。
     """
 
     name = "llm"
@@ -91,11 +93,14 @@ class LLMDepth:
 
     def components(self) -> tuple[Component, ...]:
         return (
-            # 词法三项权重各 ×0.5（0.4/0.3/0.3 减半），LLM 分占一半权重。
-            Component("avg_len_them", 0.4 * 0.5, True),
-            Component("question_rate_them", 0.3 * 0.5, True),
-            Component("long_msg_rate_them", 0.3 * 0.5, True),
-            Component("llm_depth_score", 0.5, True),
+            # 词法三项权重各 ×0.3（0.4/0.3/0.3 缩到 0.30 总权重，内部仍是
+            # 4:3:3）：词法代理在「高频短消息型亲密」上系统性误判，只留
+            # LLM 不可用时的回退份额。LLM 两项等权，占 0.70。
+            Component("avg_len_them", 0.4 * 0.3, True),
+            Component("question_rate_them", 0.3 * 0.3, True),
+            Component("long_msg_rate_them", 0.3 * 0.3, True),
+            Component("llm_depth_score", 0.35, True),
+            Component("llm_warmth_score", 0.35, True),
         )
 
 
