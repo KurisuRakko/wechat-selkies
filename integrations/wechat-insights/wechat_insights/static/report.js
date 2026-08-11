@@ -18,7 +18,11 @@
 
   els.back.href = I.linkTo("/");
 
-  var state = { year: new Date().getFullYear() };
+  var state = {
+    year: new Date().getFullYear(),
+    // 首屏入场动画只播一次：切换年份后的重绘不重播。
+    entered: false
+  };
 
   /* ------------------------------------------------------------------ *
    * 入口与年份切换
@@ -329,6 +333,15 @@
     cards.push(hahaCard(stats.haha_king));
 
     els.content.innerHTML = '<div class="stack">' + cards.join("") + "</div>";
+
+    // 首屏成功渲染时才加入场类；换年份的重绘已置位，不再重播。
+    if (!state.entered) {
+      state.entered = true;
+      var stackEl = els.content.querySelector(".stack");
+      if (stackEl) {
+        stackEl.classList.add("enter-stagger");
+      }
+    }
 
     els.content.querySelectorAll(".fading-row[data-hash]").forEach(function (row) {
       row.addEventListener("click", function () {

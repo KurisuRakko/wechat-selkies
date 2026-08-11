@@ -758,6 +758,8 @@ body {
   stroke-linecap: round;
   transform: rotate(-90deg);
   transform-origin: 50% 50%;
+  /* 描边动画结束后的终态，也是无动画时的静态值（默认 0 = 环全满） */
+  stroke-dashoffset: var(--ring-offset, 0);
 }
 
 .ring__label {
@@ -1186,6 +1188,78 @@ body {
 .snackbar--open {
   opacity: 1;
   transform: translate(-50%, 0);
+}
+
+/* ==========================================================================
+   首屏内容入场动画
+   ========================================================================== */
+
+/* 内容卡片逐项淡入 + 8px 上浮，200ms 的 MD2 标准缓动。
+ * fill-mode 用 backwards 而不是 both：延迟期间保持 from 起始态，动画
+ * 结束后交还元素自身样式，不残留 transform——残留的 transform 会给后代
+ * 创建 containing block，影响 fixed/absolute 定位与层叠上下文。 */
+@keyframes content-enter {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+}
+
+/* 延迟放在 --enter-delay 自定义属性上而不是直接写 animation-delay：
+ * 卡片内的圆环动画可以继承自己卡片的那份延迟，接续入场时序。 */
+.enter-stagger > * {
+  --enter-delay: 0s;
+  animation: content-enter 0.2s cubic-bezier(0.4, 0, 0.2, 1) var(--enter-delay) backwards;
+}
+
+/* 每项递增 0.03s；第 6 项起封顶，长列表不会把节奏拖得太久 */
+.enter-stagger > :nth-child(2) {
+  --enter-delay: 0.03s;
+}
+
+.enter-stagger > :nth-child(3) {
+  --enter-delay: 0.06s;
+}
+
+.enter-stagger > :nth-child(4) {
+  --enter-delay: 0.09s;
+}
+
+.enter-stagger > :nth-child(5) {
+  --enter-delay: 0.12s;
+}
+
+.enter-stagger > :nth-child(n + 6) {
+  --enter-delay: 0.15s;
+}
+
+/* 综合分圆环从 0 描边到目标分数：from 只给出整周长（全空）的起始偏移，
+ * 终态由 .ring__value 常驻的 stroke-dashoffset: var(--ring-offset, 0) 提供。
+ * 延迟 = 卡片自身入场延迟 + 0.2s，等卡片 200ms 淡入跑完再开始描边；
+ * 0.2s 与 content-enter 的 duration 绑定，改一个必须改另一个。
+ * 用后代选择器而不是直接子代：只有首屏那次渲染的环会描边，排序切换、
+ * 刷新重拉都不重播。 */
+@keyframes ring-fill {
+  from {
+    stroke-dashoffset: var(--ring-circumference);
+  }
+}
+
+.enter-stagger .ring__value {
+  animation: ring-fill 0.6s cubic-bezier(0.4, 0, 0.2, 1)
+    calc(var(--enter-delay, 0s) + 0.2s) backwards;
+}
+
+/* 入场是单次动画，直接关掉而不是拉长 duration——文件里两处 reduced-motion
+ * 的「拉长」写法只适用于无限循环的进度条/转圈。 */
+@media (prefers-reduced-motion: reduce) {
+  .enter-stagger > * {
+    animation: none;
+  }
+
+  .enter-stagger .ring__value {
+    animation: none;
+  }
 }
 
 @media (max-width: 599px) {

@@ -38,7 +38,9 @@
     // 本轮完成收尾已由进度轮询做过（防止在途的旧状态轮询再重拉一次列表）。
     progressDone: false,
     hideTimer: 0,
-    unauthorized: false
+    unauthorized: false,
+    // 首屏入场动画只播一次：排序切换、刷新完成后的重拉都不再播。
+    entered: false
   };
 
   var PROGRESS_LABELS = {
@@ -276,6 +278,9 @@
       state.items = payload.items || [];
       renderFading(payload.fading || []);
       renderList();
+      // fading 卡与网格是同一屏的两块，必须等两者都渲染完再置位，
+      // 否则先置位的那一方会把另一块的入场动画吃掉。
+      state.entered = true;
     } catch (err) {
       if (err.status === 401) {
         showUnauthorized();
@@ -353,6 +358,9 @@
   function renderFading(fading) {
     if (!fading.length) {
       els.fadingSlot.innerHTML = "";
+      // fadingSlot 是常驻元素，清空 innerHTML 不会带走类；首屏没播过也
+      // 不能残留类名，否则会误导后续重绘。
+      els.fadingSlot.classList.remove("enter-stagger");
       return;
     }
     var rows = fading
@@ -398,6 +406,15 @@
       "</div>" +
       "</section>";
 
+    // 入场动画只给首屏。fading 卡与联系人网格是同一屏的两块，置位统一
+    // 由 loadContacts 在两者都渲染完后做；这里只按是否已入场决定类名，
+    // 已入场时必须清掉，否则重绘后类名残留会误导。
+    if (state.entered) {
+      els.fadingSlot.classList.remove("enter-stagger");
+    } else {
+      els.fadingSlot.classList.add("enter-stagger");
+    }
+
     els.fadingSlot
       .querySelector(".fading-card__header")
       .addEventListener("click", function () {
@@ -419,7 +436,9 @@
   var RING_RADIUS = 24;
   var RING_STROKE = 4;
 
-  /** 综合分环形：inline SVG，用 stroke-dasharray 表示 0–100 的占比。 */
+  /** 综合分环形：inline SVG。stroke-dasharray 固定为整周长，占比由
+   *  stroke-dashoffset（--ring-offset）表示：首屏时 CSS 动画从 0 描边
+   *  到目标分数，之后常驻静态偏移。 */
   function ringSvg(overall) {
     var circumference = 2 * Math.PI * RING_RADIUS;
     var pct = Math.max(0, Math.min(100, overall));
@@ -465,9 +484,11 @@
       '" stroke="' +
       color +
       '" stroke-dasharray="' +
-      filled.toFixed(2) +
-      " " +
       circumference.toFixed(2) +
+      '" style="--ring-circumference: ' +
+      circumference.toFixed(2) +
+      "; --ring-offset: " +
+      (circumference - filled).toFixed(2) +
       '"></circle>' +
       '<text class="ring__label" x="' +
       center +
@@ -673,7 +694,7 @@
     }
 
     var grid = document.createElement("div");
-    grid.className = "grid";
+    grid.className = state.entered ? "grid" : "grid enter-stagger";
     var radarJobs = [];
     items.forEach(function (item) {
       var card = buildCard(item);
