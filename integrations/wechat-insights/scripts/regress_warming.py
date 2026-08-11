@@ -3,8 +3,8 @@
 用法：
   cd integrations/wechat-insights
   PYTHONPATH=../wechat-history:. .venv/bin/python scripts/regress_warming.py \
-      --db /tmp/metrics-snap.db
-可选：--session w1609308090 --from 2025-06-01 --to 2026-03-01
+      --db /tmp/metrics-snap.db --session <目标联系人的 session_id>
+可选：--from 2025-06-01 --to 2026-03-01
 
 三条曲线在同一进程、同一时区、同一份只读快照上计算，彼此可比（不受
 「快照晚于生产回放时刻」造成的漂移影响）：
@@ -458,7 +458,8 @@ def run(db_path: str, session: str, from_day: str, to_day: str) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description="关系温度升温回归（只读快照，零网络）")
     parser.add_argument("--db", required=True, help="metrics.db 只读快照路径")
-    parser.add_argument("--session", default="w1609308090", help="目标联系人 session_id")
+    # 不给默认值：本仓库公开，真实 session_id 属于身份信息，不能落进源码。
+    parser.add_argument("--session", required=True, help="目标联系人 session_id")
     parser.add_argument("--from", dest="from_day", help="网格起点（含）")
     parser.add_argument("--to", dest="to_day", help="网格终点（含）")
     args = parser.parse_args()
