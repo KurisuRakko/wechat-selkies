@@ -31,6 +31,10 @@
 
   els.back.href = I.linkTo("/");
 
+  // 首屏入场动画只播一次：改判/换粒度后的整页重载会重置，但同一载入
+  // 周期内的重绘不重播。
+  var entered = false;
+
   /* ------------------------------------------------------------------ *
    * 入口
    * ------------------------------------------------------------------ */
@@ -349,6 +353,16 @@
       ) +
       kindCard(contact) +
       "</div>";
+
+    // 首屏成功渲染时才加入场类；图表挂载前加好，让动画与图表首次绘制
+    // 同步发生。
+    if (!entered) {
+      entered = true;
+      var stackEl = els.content.querySelector(".stack");
+      if (stackEl) {
+        stackEl.classList.add("enter-stagger");
+      }
+    }
 
     var picker = els.content.querySelector(".kind-picker__select");
     if (picker) {

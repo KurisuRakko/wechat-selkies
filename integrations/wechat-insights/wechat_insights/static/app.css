@@ -1188,6 +1188,54 @@ body {
   transform: translate(-50%, 0);
 }
 
+/* ==========================================================================
+   首屏内容入场动画
+   ========================================================================== */
+
+/* 内容卡片逐项淡入 + 8px 上浮，200ms 的 MD2 标准缓动。
+ * fill-mode 用 backwards 而不是 both：延迟期间保持 from 起始态，动画
+ * 结束后交还元素自身样式，不残留 transform——残留的 transform 会给后代
+ * 创建 containing block，影响 fixed/absolute 定位与层叠上下文。 */
+@keyframes content-enter {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+}
+
+.enter-stagger > * {
+  animation: content-enter 0.2s cubic-bezier(0.4, 0, 0.2, 1) backwards;
+}
+
+/* 每项递增 0.03s；第 6 项起封顶，长列表不会把节奏拖得太久 */
+.enter-stagger > :nth-child(2) {
+  animation-delay: 0.03s;
+}
+
+.enter-stagger > :nth-child(3) {
+  animation-delay: 0.06s;
+}
+
+.enter-stagger > :nth-child(4) {
+  animation-delay: 0.09s;
+}
+
+.enter-stagger > :nth-child(5) {
+  animation-delay: 0.12s;
+}
+
+.enter-stagger > :nth-child(n + 6) {
+  animation-delay: 0.15s;
+}
+
+/* 入场是单次动画，直接关掉而不是拉长 duration——文件里两处 reduced-motion
+ * 的「拉长」写法只适用于无限循环的进度条/转圈。 */
+@media (prefers-reduced-motion: reduce) {
+  .enter-stagger > * {
+    animation: none;
+  }
+}
+
 @media (max-width: 599px) {
   .app-bar__row,
   .page {
