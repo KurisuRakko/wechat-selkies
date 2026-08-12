@@ -172,8 +172,8 @@ class AggregateTests(unittest.TestCase):
                 ]
             ]
         )
-        # 40 字 = 2 个成本单位，一次通话 = 8。
-        self.assertAlmostEqual(result.buckets[day_key(start)].cost("them"), 10.0)
+        # 40 字 = 2 个成本单位，一次通话 = 20。
+        self.assertAlmostEqual(result.buckets[day_key(start)].cost("them"), 22.0)
 
     def test_longest_laugh_run_is_reported_for_the_batch(self) -> None:
         start = at(2026, 3, 10, 12)

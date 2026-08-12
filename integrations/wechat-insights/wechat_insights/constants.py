@@ -80,10 +80,12 @@ FADE_MIN_OVERALL = _int_env("INSIGHTS_FADE_MIN_OVERALL", 40, 0, 100)
 FADE_LIST_LIMIT = _int_env("INSIGHTS_FADE_LIST_LIMIT", 8, 1, 50)
 
 # —— 投入维度的类型成本权重 ——
-# 语音/通话比一条文字贵得多，直接按「等价条数」加权。
+# 语音/通话比一条文字贵得多，直接按「等价条数」加权。通话是强关系信号
+# （愿意打电话 ≈ 关系亲近，是文本频率看不见的投入），故 call 权重显著
+# 高于其他类型。
 COST_WEIGHTS = {
-    "call": 8.0,
-    "voice": 3.0,
+    "call": 20.0,
+    "voice": 5.0,
     "video": 3.0,
     "image": 1.5,
     "sticker": 1.0,
@@ -143,7 +145,7 @@ LLM_PERIOD_SAMPLE_BLOCKS = 6
 # 改动维度组成、权重或 LLM 注入方式时 +1。版本与库里记录的不一致时，下一轮
 # 分析会自动清掉全史回放标记与逐日细化进度、重放一遍曲线，不需要人工开
 # INSIGHTS_FORCE_HISTORY_BACKFILL。
-SCORE_FORMULA_VERSION = 2
+SCORE_FORMULA_VERSION = 3
 
 # —— 破坏性操作前的自动备份 ——
 # 打分口径重置与 llm_depth 去 score 列这两个不可逆时刻，会先 VACUUM INTO 一份

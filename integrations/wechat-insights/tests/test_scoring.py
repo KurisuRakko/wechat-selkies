@@ -221,6 +221,21 @@ class DimensionTests(unittest.TestCase):
         scores = score_cohort({"steady": steady, "fading": fading}, STRATEGY)
         self.assertGreater(scores["steady"]["constancy"], scores["fading"]["constancy"])
 
+    def test_calls_lift_investment(self) -> None:
+        # 两个联系人文字量完全一致，唯一差别是 A 有通话往来：通话是文本
+        # 频率看不见的强信号，投入维度必须拉开分差。
+        a = window(msgs_them=30, chars_them=300, kind_call_them=3, kind_call_me=2)
+        b = window(msgs_them=30, chars_them=300)
+        raws = {
+            "a": raw_metrics(a, STRATEGY, 30),
+            "b": raw_metrics(b, STRATEGY, 30),
+        }
+        # 通话条数 / 天数：双方合计 5 条，30 天窗口。
+        self.assertAlmostEqual(raws["a"]["calls_per_day"], 5 / 30)
+        self.assertAlmostEqual(raws["b"]["calls_per_day"], 0.0)
+        scores = score_cohort(raws, STRATEGY)
+        self.assertGreater(scores["a"]["investment"], scores["b"]["investment"])
+
 
 class CohortScoreTests(unittest.TestCase):
     def test_faster_replies_score_higher_on_responsiveness(self) -> None:

@@ -113,6 +113,9 @@ def raw_metrics(
         # 一边热一边冷时被 min 掐住。单位与投入维的 cost_them_per_day 一致，
         # 复用同一套类型成本折算，不另造一套货币。
         "mutual_cost_per_day": min(window.cost("them"), window.cost("me")) / span,
+        # 通话事件日均：双方的通话记录条数（打电话本身就是双向事件，不分侧）。
+        # 愿意打电话是文本频率看不见的强亲密信号，作为投入维度的独立组成项。
+        "calls_per_day": (window.get("kind_call_them") + window.get("kind_call_me")) / span,
     }
     values.update(strategy.raw_metrics(window))
     if extras is not None:
@@ -142,10 +145,11 @@ def dimensions(strategy: DepthStrategy) -> tuple[tuple[str, tuple[Component, ...
         (
             "investment",
             (
-                Component("cost_them_per_day", 0.45, True),
-                Component("msgs_them_per_day", 0.2, True),
-                Component("chars_them_per_day", 0.2, True),
+                Component("cost_them_per_day", 0.35, True),
+                Component("msgs_them_per_day", 0.15, True),
+                Component("chars_them_per_day", 0.15, True),
                 Component("sticker_rate", 0.15, True),
+                Component("calls_per_day", 0.2, True),
             ),
         ),
         (
