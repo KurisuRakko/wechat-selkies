@@ -5,8 +5,8 @@
 # 机制：
 #   * FAKE_WORLD 每行一个窗口：id width height modal viewable；
 #   * 桩把每次调用原样追加到 FAKE_ACTIONS，并按世界文件应答；
-#   * FAKE_CLOSE_MODAL_ON=key|click（默认 none）命中时，桩把世界里 modal
-#     行的 viewable 改写为 0，模拟弹窗被关掉；
+#   * FAKE_CLOSE_MODAL_ON=click（默认 none）命中时，桩把世界里 modal 行的
+#     viewable 改写为 0，模拟弹窗被关掉；
 #   * sleep() 被覆盖为 no-op，全部用例毫秒级跑完；
 #   * 每个用例在子 shell 里 export 环境变量后 source 脚本，直接调
 #     handle_login_screen（或 find_window），再在父 shell 断言动作与日志。
@@ -79,9 +79,6 @@ case "$cmd" in
             echo "HEIGHT=$h"
         done < "$FAKE_WORLD"
         ;;
-    key)
-        [ "${FAKE_CLOSE_MODAL_ON:-none}" = "key" ] && close_modal
-        ;;
     mousemove)
         [ "${FAKE_CLOSE_MODAL_ON:-none}" = "click" ] && close_modal
         ;;
@@ -144,7 +141,7 @@ fail() {
     done
 }
 
-# 真正会被执行的操作行（xdotool windowactivate/key/mousemove）
+# 真正会被执行的操作行（xdotool windowactivate/mousemove）
 action_lines() {
     grep -E '^xdotool (windowactivate|key |mousemove)' "$FAKE_ACTIONS"
 }
@@ -223,34 +220,18 @@ printf '100 560 760 0 1\n200 564 516 1 1\n' > "$FAKE_WORLD"
 )
 printf '%s\n' \
     'xdotool windowactivate 200' \
-    'xdotool key --clearmodifiers Return' \
     'xdotool mousemove --window 200 282 402 click 1' \
     'xdotool windowactivate 100' \
-    'xdotool key --clearmodifiers Return' \
     'xdotool mousemove --window 100 280 532 click 1' > "$tmp/expect"
 assert_actions_eq "case 1: 弹窗在时按 弹窗→登录窗 顺序动作" "$tmp/expect"
 assert_log_contains "case 1: 弹窗坐标点击后仍在" 'modal 200 still up after the click'
+if grep -Fq 'xdotool key' "$FAKE_ACTIONS"; then
+    fail "case 1: 动作中不应出现任何合成按键" "$(grep -F 'xdotool key' "$FAKE_ACTIONS")"
+else
+    echo "ok - case 1: 全程无合成按键"
+fi
 
-# 用例 2：Return 关掉弹窗 → 不再坐标点击弹窗，登录窗序列照常
-begin_case
-printf '100 560 760 0 1\n200 564 516 1 1\n' > "$FAKE_WORLD"
-(
-    export ENABLE_WECHAT_WINDOW_WATCHDOG=true WECHAT_WATCHDOG_LIB_ONLY=1
-    export WECHAT_WATCHDOG_LOG="$WATCH_LOG" FAKE_CLOSE_MODAL_ON=key
-    unset_relogin_env
-    . "$WATCHDOG"
-    handle_login_screen 100
-)
-printf '%s\n' \
-    'xdotool windowactivate 200' \
-    'xdotool key --clearmodifiers Return' \
-    'xdotool windowactivate 100' \
-    'xdotool key --clearmodifiers Return' \
-    'xdotool mousemove --window 100 280 532 click 1' > "$tmp/expect"
-assert_actions_eq "case 2: Return 关掉弹窗后不再坐标点击" "$tmp/expect"
-assert_log_contains "case 2: 弹窗被 Return 关闭" 'modal 200 closed by Return'
-
-# 用例 3：坐标点击关掉弹窗
+# 用例 2：坐标点击关掉弹窗
 begin_case
 printf '100 560 760 0 1\n200 564 516 1 1\n' > "$FAKE_WORLD"
 (
@@ -260,14 +241,14 @@ printf '100 560 760 0 1\n200 564 516 1 1\n' > "$FAKE_WORLD"
     . "$WATCHDOG"
     handle_login_screen 100
 )
-assert_log_contains "case 3: 弹窗被坐标点击关闭" 'modal 200 closed by the click'
+assert_log_contains "case 2: 弹窗被坐标点击关闭" 'modal 200 closed by the click'
 if action_lines | grep -Fq 'mousemove --window 200 282 402'; then
-    echo "ok - case 3: 含弹窗坐标点击"
+    echo "ok - case 2: 含弹窗坐标点击"
 else
-    fail "case 3: 缺弹窗坐标点击" "实际: $(tr '\n' '|' < <(action_lines))"
+    fail "case 2: 缺弹窗坐标点击" "实际: $(tr '\n' '|' < <(action_lines))"
 fi
 
-# 用例 4：只有登录窗没有弹窗 → 不出现任何 200 的动作
+# 用例 3：只有登录窗没有弹窗 → 不出现任何 200 的动作
 begin_case
 printf '100 560 760 0 1\n' > "$FAKE_WORLD"
 (
@@ -279,11 +260,10 @@ printf '100 560 760 0 1\n' > "$FAKE_WORLD"
 )
 printf '%s\n' \
     'xdotool windowactivate 100' \
-    'xdotool key --clearmodifiers Return' \
     'xdotool mousemove --window 100 280 532 click 1' > "$tmp/expect"
-assert_actions_eq "case 4: 无弹窗只点登录窗" "$tmp/expect"
+assert_actions_eq "case 3: 无弹窗只点登录窗" "$tmp/expect"
 
-# 用例 5：重试上限 3，连调 5 次 → attempt 恰 3 行、giving up 恰 1 行、点击恰 3 次
+# 用例 4：重试上限 3，连调 5 次 → attempt 恰 3 行、giving up 恰 1 行、点击恰 3 次
 begin_case
 printf '100 560 760 0 1\n' > "$FAKE_WORLD"
 (
@@ -298,11 +278,11 @@ printf '100 560 760 0 1\n' > "$FAKE_WORLD"
     handle_login_screen 100
     handle_login_screen 100
 )
-assert_log_count "case 5: 重试恰 3 次" 'relogin: attempt ' 3
-assert_log_count "case 5: giving up 恰 1 次" 'relogin: giving up' 1
-assert_actions_count "case 5: 登录窗点击恰 3 次" 'mousemove --window 100 280 532 click 1' 3
+assert_log_count "case 4: 重试恰 3 次" 'relogin: attempt ' 3
+assert_log_count "case 4: giving up 恰 1 次" 'relogin: giving up' 1
+assert_actions_count "case 4: 登录窗点击恰 3 次" 'mousemove --window 100 280 532 click 1' 3
 
-# 用例 6：防抖，RETRY_DELAY=999 连调 3 次 → attempt 恰 1 行
+# 用例 5：防抖，RETRY_DELAY=999 连调 3 次 → attempt 恰 1 行
 begin_case
 printf '100 560 760 0 1\n' > "$FAKE_WORLD"
 (
@@ -314,9 +294,9 @@ printf '100 560 760 0 1\n' > "$FAKE_WORLD"
     handle_login_screen 100
     handle_login_screen 100
 )
-assert_log_count "case 6: 防抖只试 1 次" 'relogin: attempt ' 1
+assert_log_count "case 5: 防抖只试 1 次" 'relogin: attempt ' 1
 
-# 用例 7：auto-login.py 在跑 → 让路，无任何点击，deferring 只记 1 次
+# 用例 6：auto-login.py 在跑 → 让路，无任何点击，deferring 只记 1 次
 begin_case
 printf '100 560 760 0 1\n' > "$FAKE_WORLD"
 (
@@ -328,10 +308,10 @@ printf '100 560 760 0 1\n' > "$FAKE_WORLD"
     handle_login_screen 100
     handle_login_screen 100
 )
-assert_no_actions "case 7: 让路时无任何点击"
-assert_log_count "case 7: deferring 只记 1 次" 'deferring to it' 1
+assert_no_actions "case 6: 让路时无任何点击"
+assert_log_count "case 6: deferring 只记 1 次" 'deferring to it' 1
 
-# 用例 8：关闭开关 → 无动作、日志无 relogin 行
+# 用例 7：关闭开关 → 无动作、日志无 relogin 行
 begin_case
 printf '100 560 760 0 1\n' > "$FAKE_WORLD"
 (
@@ -341,14 +321,14 @@ printf '100 560 760 0 1\n' > "$FAKE_WORLD"
     . "$WATCHDOG"
     handle_login_screen 100
 )
-assert_no_actions "case 8: 关闭开关后无动作"
+assert_no_actions "case 7: 关闭开关后无动作"
 if grep -Fq 'relogin:' "$WATCH_LOG" 2>/dev/null; then
-    fail "case 8: 日志不应有 relogin 行" "$(cat "$WATCH_LOG")"
+    fail "case 7: 日志不应有 relogin 行" "$(cat "$WATCH_LOG")"
 else
-    echo "ok - case 8: 日志无 relogin 行"
+    echo "ok - case 7: 日志无 relogin 行"
 fi
 
-# 用例 9：dry-run 只记日志不执行动作（只读探测如 search/xwininfo 仍会跑）
+# 用例 8：dry-run 只记日志不执行动作（只读探测如 search/xwininfo 仍会跑）
 begin_case
 printf '100 560 760 0 1\n200 564 516 1 1\n' > "$FAKE_WORLD"
 (
@@ -358,11 +338,11 @@ printf '100 560 760 0 1\n200 564 516 1 1\n' > "$FAKE_WORLD"
     . "$WATCHDOG"
     handle_login_screen 100
 )
-assert_no_actions "case 9: dry-run 不产生任何动作"
-assert_log_contains "case 9: dry-run 打印弹窗点击" '[dry-run] xdotool mousemove --window 200 282 402 click 1'
-assert_log_contains "case 9: dry-run 打印登录窗点击" '[dry-run] xdotool mousemove --window 100 280 532 click 1'
+assert_no_actions "case 8: dry-run 不产生任何动作"
+assert_log_contains "case 8: dry-run 打印弹窗点击" '[dry-run] xdotool mousemove --window 200 282 402 click 1'
+assert_log_contains "case 8: dry-run 打印登录窗点击" '[dry-run] xdotool mousemove --window 100 280 532 click 1'
 
-# 用例 10：giving up 后主窗口回来 → 状态重置，再出现 attempt 1/3
+# 用例 9：giving up 后主窗口回来 → 状态重置，再出现 attempt 1/3
 begin_case
 printf '100 560 760 0 1\n' > "$FAKE_WORLD"
 (
@@ -377,16 +357,16 @@ printf '100 560 760 0 1\n' > "$FAKE_WORLD"
     relogin_note_recovered
     handle_login_screen 100
 )
-assert_log_contains "case 10: 恢复日志" 'main window is back after 3 attempt(s)'
+assert_log_contains "case 9: 恢复日志" 'main window is back after 3 attempt(s)'
 n_rec=$(grep -Fn 'main window is back after 3 attempt(s)' "$WATCH_LOG" | head -1 | cut -d: -f1)
 n_att=$(grep -Fn 'relogin: attempt 1/3' "$WATCH_LOG" | tail -1 | cut -d: -f1)
 if [ -n "$n_rec" ] && [ -n "$n_att" ] && [ "$n_rec" -lt "$n_att" ]; then
-    echo "ok - case 10: 恢复后重新开始 attempt 1/3"
+    echo "ok - case 9: 恢复后重新开始 attempt 1/3"
 else
-    fail "case 10: 恢复后没有重新开始尝试" "恢复行号=$n_rec 最后 attempt 行号=$n_att"
+    fail "case 9: 恢复后没有重新开始尝试" "恢复行号=$n_rec 最后 attempt 行号=$n_att"
 fi
 
-# 用例 11：find_window 兼容性 —— 默认跳过 modal，want_modal=yes 选中
+# 用例 10：find_window 兼容性 —— 默认跳过 modal，want_modal=yes 选中
 begin_case
 printf '200 564 516 1 1\n' > "$FAKE_WORLD"
 (
@@ -403,14 +383,14 @@ printf '200 564 516 1 1\n' > "$FAKE_WORLD"
     find_window visible 200 200 yes > "$tmp/fw-modal"
 )
 if grep -q '^notfound$' "$tmp/fw-nonmodal"; then
-    echo "ok - case 11: 默认不选 modal 窗口"
+    echo "ok - case 10: 默认不选 modal 窗口"
 else
-    fail "case 11: 默认把 modal 窗口当普通窗口选出来了" "结果: $(cat "$tmp/fw-nonmodal")"
+    fail "case 10: 默认把 modal 窗口当普通窗口选出来了" "结果: $(cat "$tmp/fw-nonmodal")"
 fi
 if [ "$(cat "$tmp/fw-modal")" = "200" ]; then
-    echo "ok - case 11: want_modal=yes 选中 modal 窗口"
+    echo "ok - case 10: want_modal=yes 选中 modal 窗口"
 else
-    fail "case 11: want_modal=yes 结果应为 200" "结果: $(cat "$tmp/fw-modal")"
+    fail "case 10: want_modal=yes 结果应为 200" "结果: $(cat "$tmp/fw-modal")"
 fi
 
 if [ "$failures" -gt 0 ]; then

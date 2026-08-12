@@ -40,13 +40,15 @@
 #      recover on its own, so the watchdog clicks the dialog away and the login
 #      button (see handle_login_screen below).
 #
-# Why the auto-relogin clicks use XTEST instead of `xdotool key --window`:
-# Qt ignores XSendEvent, so synthetic key events are dropped before they reach
-# the widget; XTEST events are indistinguishable from real input.
+# Why the auto-relogin sequence uses only mouse clicks: WeChat is a self-drawn
+# Qt UI and its buttons ignore synthetic keyboard events, whether delivered via
+# XSendEvent or XTEST. Pointer events are indistinguishable from real input, so
+# the relogin sequence only issues coordinate clicks (`xdotool mousemove
+# --window ... click 1`, XTEST pointer events).
 #
-# Why the modal check between the two dismissal steps matters: the dialog may
-# close from the Return press, and then a coordinate click would land on the
-# login window underneath instead.
+# Why the modal is re-checked after the click: the log then reflects what
+# actually happened, and a modal that stays up does not stop the login-button
+# attempt that follows.
 #
 # Why deferring to `pgrep wechat-auto-login.py` rather than a timestamp: the
 # one-shot login helper covers the launch moment only, and observing the other
@@ -229,20 +231,14 @@ relogin_note_recovered() {
     relogin_reset
 }
 
-# 「我知道了」。Qt 丢弃 XSendEvent，所以先 activate + XTEST Return；没关掉再按
-# 坐标点。两步之间必须校验存活，否则弹窗已关时坐标点击会穿透到下层登录窗。
+# 「我知道了」。微信是自绘 Qt 界面，合成键盘事件不可靠，只用坐标点击；
+# 点完校验弹窗是否已关，避免后续误判。
 dismiss_modal() {
     local wid="$1" w h
     set -- $(win_geom "$wid"); w="$1"; h="$2"
     [ -n "$w" ] && [ -n "$h" ] || { log "relogin: modal $wid has no geometry"; return 1; }
     x_action xdotool windowactivate "$wid"
     sleep 0.3
-    x_action xdotool key --clearmodifiers Return
-    sleep 0.4
-    if ! window_is_viewable "$wid"; then
-        log "relogin: modal $wid closed by Return"
-        return 0
-    fi
     x_action xdotool mousemove --window "$wid" $((w / 2)) $((h * MODAL_BTN_Y_PCT / 100)) click 1
     sleep 0.4
     if window_is_viewable "$wid"; then
@@ -259,7 +255,6 @@ click_login_button() {
     [ -n "$w" ] && [ -n "$h" ] || { log "relogin: login window $wid has no geometry"; return 1; }
     x_action xdotool windowactivate "$wid"
     sleep 0.3
-    x_action xdotool key --clearmodifiers Return
     x_action xdotool mousemove --window "$wid" $((w / 2)) $((h * LOGIN_BTN_Y_PCT / 100)) click 1
 }
 
