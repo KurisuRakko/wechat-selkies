@@ -279,6 +279,14 @@ Configure the following environment variables in `docker-compose.yml`. Variables
 | `WECHAT_NIGHTLY_START_TIME` | `01:30` | Daily scheduled restart time for WeChat (HH:MM format) |
 | `ENABLE_WECHAT_AUTO_LOGIN` | `true` | Whether to automatically detect and click the login button after WeChat starts/restarts |
 | `AUTO_LOGIN_DELAY` | `3` | Delay in seconds after WeChat launch to wait for UI rendering before login action |
+| `ENABLE_WECHAT_WINDOW_WATCHDOG` | `true` | Whether to run a persistent watchdog for the WeChat window (relogin self-healing, tray recovery and process relaunch all depend on it) |
+| `WECHAT_FORCE_MAXIMIZED` | `true` | Whether to keep the WeChat main window maximized |
+| `WECHAT_WINDOW_CHECK_INTERVAL` | `5` | Watchdog polling interval in seconds (minimum 2) |
+| `ENABLE_WECHAT_AUTO_RELOGIN` | `true` | Whether to automatically dismiss the prompt dialog and re-login after a server-side forced logout (requires the window watchdog) |
+| `WECHAT_RELOGIN_MAX_ATTEMPTS` | `3` | Maximum retry count per logout event; clicking stops and the log explains once exhausted |
+| `WECHAT_RELOGIN_RETRY_DELAY` | `30` | Minimum interval between retries in seconds |
+
+> **Watchdog troubleshooting tip**: the watchdog log lives in `/config/.wechat-watchdog.log`. To only preview the actions that would be performed without actually clicking, run `WECHAT_RELOGIN_DRY_RUN=true /scripts/wechat/wechat-window-watchdog.sh --relogin-once` inside the container; it prints the commands it would execute.
 
 
 
