@@ -267,6 +267,14 @@ docker run -it -p 3001:3001 -v ./config:/config --device /dev/dri:/dev/dri nickr
 | `WECHAT_NIGHTLY_START_TIME` | `01:30` | 每日自动重新启动微信的时刻（HH:MM 格式） |
 | `ENABLE_WECHAT_AUTO_LOGIN` | `true` | 是否在微信启动/重启后自动识别并点击登录按钮 |
 | `AUTO_LOGIN_DELAY` | `3` | 微信启动后等待 UI 渲染完成的秒数 |
+| `ENABLE_WECHAT_WINDOW_WATCHDOG` | `true` | 是否常驻守护微信窗口（掉线自愈、托盘恢复、进程重拉都依赖它） |
+| `WECHAT_FORCE_MAXIMIZED` | `true` | 是否强制保持微信主窗口最大化 |
+| `WECHAT_WINDOW_CHECK_INTERVAL` | `5` | 窗口守护的巡检间隔（秒，最小 2） |
+| `ENABLE_WECHAT_AUTO_RELOGIN` | `true` | 被服务端强制登出后是否自动点掉提示弹窗并重新登录（需窗口守护开启） |
+| `WECHAT_RELOGIN_MAX_ATTEMPTS` | `3` | 单次登出事件内的最大重试次数，用尽后停止点击并在日志中说明 |
+| `WECHAT_RELOGIN_RETRY_DELAY` | `30` | 两次重试之间的最小间隔（秒） |
+
+> **窗口守护排障提示**：守护日志在 `/config/.wechat-watchdog.log`。想在容器里只查看将要执行的动作而不实际点击，可运行 `WECHAT_RELOGIN_DRY_RUN=true /scripts/wechat/wechat-window-watchdog.sh --relogin-once`，它会打印将要执行的命令但不会真正点击。
 
 
 
