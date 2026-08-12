@@ -75,7 +75,13 @@ CREATE TABLE IF NOT EXISTS contacts (
     -- 关系温度采样粒度：'' = 每周一个采样点（默认），'day' = 从相识日起逐日细化。
     history_granularity      TEXT NOT NULL DEFAULT '',
     -- 逐日细化已推进到（含）的日键；'' = 还没开始。断点续跑的进度点。
-    history_daily_until      TEXT NOT NULL DEFAULT ''
+    history_daily_until      TEXT NOT NULL DEFAULT '',
+    -- 好感度校准：feedback_pending 是 ''/'up'/'down' 未消化标记；
+    -- feedback_pending_at 是标记时刻 epoch 秒的十进制文本；
+    -- calibration 是累计校准 JSON，'' = 无校准。
+    feedback_pending         TEXT NOT NULL DEFAULT '',
+    feedback_pending_at      TEXT NOT NULL DEFAULT '',
+    calibration              TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS stats_daily (
@@ -170,10 +176,24 @@ class ContactRow:
     kind_manual: str
     history_granularity: str = ""
     history_daily_until: str = ""
+    feedback_pending: str = ""
+    feedback_pending_at: str = ""
+    calibration: str = ""
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> ContactRow:
         return cls(**{key: row[key] for key in cls.__slots__})
+
+    def calibration_data(self) -> dict | None:
+        """解析累计校准 JSON；无校准或解析失败返回 None。"""
+
+        if not self.calibration:
+            return None
+        try:
+            data = json.loads(self.calibration)
+        except ValueError:
+            return None
+        return data if isinstance(data, dict) else None
 
     def relation_kind(self) -> str:
         """当前生效的关系类型：手动改判优先，其次自动判定，都空默认 friend。
@@ -405,7 +425,9 @@ class MetricsStore:
                 longest_silence_seconds = ?, longest_silence_ended_at = ?,
                 latest_night_at = ?, latest_night_offset = ?, max_laugh_run = ?,
                 kind_auto = ?, kind_manual = ?,
-                history_granularity = ?, history_daily_until = ?
+                history_granularity = ?, history_daily_until = ?,
+                feedback_pending = ?, feedback_pending_at = ?,
+                calibration = ?
             WHERE session_id = ?
             """,
             (
@@ -425,6 +447,9 @@ class MetricsStore:
                 contact.kind_manual,
                 contact.history_granularity,
                 contact.history_daily_until,
+                contact.feedback_pending,
+                contact.feedback_pending_at,
+                contact.calibration,
                 contact.session_id,
             ),
         )
@@ -460,6 +485,25 @@ class MetricsStore:
             connection.execute(
                 "UPDATE contacts SET history_granularity = ? WHERE session_id = ?",
                 (granularity, session_id),
+            )
+
+    def set_contact_feedback(self, session_id: str, direction: str, at: str) -> None:
+        """写入/清除好感度标记（'' = 清除 pending 与标记时刻）。只改这两列。"""
+
+        with self.connection as connection:
+            connection.execute(
+                "UPDATE contacts SET feedback_pending = ?, feedback_pending_at = ? "
+                "WHERE session_id = ?",
+                (direction, at, session_id),
+            )
+
+    def set_contact_calibration(self, session_id: str, payload: str) -> None:
+        """写入/清除累计校准 JSON（'' = 清除校准）。只改这一列。"""
+
+        with self.connection as connection:
+            connection.execute(
+                "UPDATE contacts SET calibration = ? WHERE session_id = ?",
+                (payload, session_id),
             )
 
     def contacts_needing_daily_refine(self, limit_day: str) -> list[ContactRow]:

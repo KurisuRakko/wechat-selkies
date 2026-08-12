@@ -33,6 +33,11 @@ _EXTRA_COLUMNS = (
             "kind_manual",
             "history_granularity",
             "history_daily_until",
+            # 好感度校准三列：补列不 bump SCHEMA_VERSION，旧库整体重建会
+            # 弄丢联系人游标与里程碑，列迁移比重建便宜得多。
+            "feedback_pending",
+            "feedback_pending_at",
+            "calibration",
         ),
     ),
     # llm_period 补列之前写下的行没有模型名，读回空串 = 模型未知；换模型

@@ -1,0 +1,61 @@
+/* 右键菜单（好感度标记）与校准角标。
+   app.css 零改动的约束下独立成文件：菜单是 MD2 迷你菜单（surface 8dp、
+   圆角 12、hover 态），颜色全部走 :root 上已有的自定义属性。 */
+
+.context-menu {
+  position: fixed;
+  z-index: 1200;
+  min-width: 200px;
+  max-width: 240px;
+  padding: 4px 0;
+  border-radius: 12px;
+  background: var(--md-surface-8, #ffffff);
+  box-shadow: var(--md-elevation-8, 0 6px 20px rgba(0, 0, 0, 0.16));
+  opacity: 0;
+  transform: scale(0.9);
+  transform-origin: top left;
+  transition: opacity 120ms ease, transform 120ms ease;
+  pointer-events: none;
+}
+
+.context-menu--open {
+  opacity: 1;
+  transform: scale(1);
+  pointer-events: auto;
+}
+
+.context-menu__item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  width: 100%;
+  padding: 10px 16px;
+  border: none;
+  background: none;
+  font-family: var(--md-font, "Noto Sans SC", sans-serif);
+  font-size: 14px;
+  color: var(--md-on-surface, #1a1a1a);
+  text-align: left;
+  cursor: pointer;
+}
+
+.context-menu__item:hover {
+  background: var(--md-state-hover, rgba(0, 0, 0, 0.06));
+}
+
+.context-menu__label {
+  white-space: nowrap;
+}
+
+.context-menu__hint {
+  font-size: 12px;
+  color: var(--md-on-surface-disabled, rgba(0, 0, 0, 0.45));
+}
+
+/* 校准角标：主色描边，底色用主色 6% 的浅色，暗色主题下同样成立 */
+.chip--calibration {
+  border-color: var(--md-primary);
+  color: var(--md-primary);
+  background: rgba(21, 101, 192, 0.06);
+}

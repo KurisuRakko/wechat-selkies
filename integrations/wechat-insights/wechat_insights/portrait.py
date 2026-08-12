@@ -13,7 +13,6 @@ from dataclasses import dataclass
 
 from . import llm
 from .constants import (
-    BACKFILL_BATCH,
     LLM_MAX_CALLS_PER_RUN,
     LLM_REFRESH_DAYS,
     LLM_REFRESH_MESSAGES,
@@ -22,11 +21,10 @@ from .constants import (
     TREND_BASELINE_DAYS,
     TREND_RECENT_DAYS,
 )
-from .conversation import split_conversations
 from .depth import DepthStrategy
 from .masking import mask
 from .metrics import Metrics, day_key, day_span
-from .reading import Cursor, read_messages_after, transcript_lines
+from .reading import sample_transcript
 from .scoring import anomalies_key, detect_anomalies, raw_metrics
 from .storage import ContactRow, MetricsStore
 
@@ -198,8 +196,13 @@ def refresh_portraits(
                 total=len(selected),
                 detail=contact.display_name,
             )
-        sample = _sample(
-            reader, contact.session_id, contact.display_name, sample_start, gap_seconds
+        sample = sample_transcript(
+            reader,
+            contact.session_id,
+            contact.display_name,
+            sample_start,
+            gap_seconds,
+            LLM_SAMPLE_MAX_CHARS,
         )
         if sample is None:
             skipped += 1
@@ -229,34 +232,3 @@ def refresh_portraits(
         "LLM 关系画像：写入 %d 个，跳过 %d 个，失败 %d 个", scored, skipped, failed
     )
     return scored
-
-
-def _sample(
-    reader, session_id: str, display_name: str, sample_start: int, gap_seconds: int
-) -> str | None:
-    """从采样窗口读一批消息，从最晚往前拼最近几段对话；没有 text 返回 None。
-
-    只取 text 类消息，每行「我: 内容 / TA: 内容」，段与段之间空行分隔，
-    总字数达到 LLM_SAMPLE_MAX_CHARS 就停。窗口内消息超过一个批次时只
-    覆盖最旧的那一批（读接口只支持从游标向前读），采样质量足够。
-    """
-
-    batch = read_messages_after(
-        reader,
-        session_id,
-        display_name,
-        {},
-        Cursor(sample_start, "", -1),
-        BACKFILL_BATCH,
-    )
-    blocks: list[str] = []
-    total = 0
-    for conversation in reversed(split_conversations(batch.messages, gap_seconds)):
-        lines = transcript_lines(conversation)
-        if not lines:
-            continue
-        blocks.append("\n".join(lines))
-        total += sum(len(line) for line in lines)
-        if total >= LLM_SAMPLE_MAX_CHARS:
-            break
-    return None if not blocks else "\n\n".join(blocks)

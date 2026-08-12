@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import time
 from datetime import date, datetime, timedelta
@@ -365,6 +366,97 @@ class ApiTests(AioHTTPTestCase):
             (await self.client.post("/api/contact/nope/kind", json={"kind": "family"})).status,
             404,
         )
+
+    async def test_contact_feedback_marks_and_updates_payload(self) -> None:
+        response = await self.client.post(
+            f"/api/contact/{HASH}/feedback", json={"action": "up"}
+        )
+        self.assertEqual(response.status, 200)
+        body = await response.json()
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["pending"], "up")
+        # 标记写进联系人行：下一轮分析消化。
+        contact = self.store.get_contact(SESSION_ID)
+        self.assertEqual(contact.feedback_pending, "up")
+        self.assertNotEqual(contact.feedback_pending_at, "")
+        # payload 就地写入排队提示：详情页与列表页马上可见。
+        stored = self.store.score_by_hash(HASH)
+        self.assertEqual(stored["calibration_pending"], "up")
+        # 标记本身不立即改分：overall 保持原值。
+        self.assertEqual(stored["overall"], 73.4)
+        self.assertNotIn("calibration", stored)
+
+    async def test_contact_feedback_rejects_invalid_values(self) -> None:
+        for bad in ("raise", "UP", "", 42, None):
+            response = await self.client.post(
+                f"/api/contact/{HASH}/feedback", json={"action": bad}
+            )
+            self.assertEqual(response.status, 400)
+            body = await response.json()
+            self.assertEqual(body["error"]["code"], "BAD_REQUEST")
+        # 只接受 JSON body。
+        self.assertEqual(
+            (await self.client.post(f"/api/contact/{HASH}/feedback")).status, 400
+        )
+
+    async def test_contact_feedback_requires_an_existing_contact(self) -> None:
+        response = await self.client.post(
+            f"/api/contact/{'0' * 24}/feedback", json={"action": "up"}
+        )
+        self.assertEqual(response.status, 404)
+        body = await response.json()
+        self.assertEqual(body["error"]["code"], "CONTACT_NOT_FOUND")
+        self.assertEqual(
+            (
+                await self.client.post(
+                    "/api/contact/nope/feedback", json={"action": "up"}
+                )
+            ).status,
+            404,
+        )
+
+    async def test_contact_feedback_clear_restores_the_base_score(self) -> None:
+        # 模拟「已消化过一轮」的完整状态：校准生效 + 标记排队。
+        self.store.set_contact_feedback(SESSION_ID, "up", "1700000001")
+        self.store.set_contact_calibration(
+            SESSION_ID,
+            json.dumps(
+                {
+                    "dims": {"investment": 4.0},
+                    "updated_at": 1700000001,
+                    "source": "llm",
+                    "note": "",
+                }
+            ),
+        )
+        stored = self.store.score_by_hash(HASH)
+        stored["calibration"] = {
+            "offsets": {"investment": 4.0},
+            "overall_delta": 0.6,
+            "base": {"overall": 73.4, "dimensions": dict(stored["dimensions"])},
+            "note": None,
+            "updated_at": 1700000001,
+        }
+        stored["calibration_pending"] = "up"
+        self.store.update_score_payload(SESSION_ID, stored)
+        response = await self.client.post(
+            f"/api/contact/{HASH}/feedback", json={"action": "clear"}
+        )
+        self.assertEqual(response.status, 200)
+        body = await response.json()
+        self.assertTrue(body["ok"])
+        self.assertIsNone(body["pending"])
+        self.assertTrue(body["cleared"])
+        # 联系人行的标记与校准都清空。
+        contact = self.store.get_contact(SESSION_ID)
+        self.assertEqual(contact.feedback_pending, "")
+        self.assertEqual(contact.calibration, "")
+        # payload 按 base 快照还原：综合分与七维回客观口径，角标消失。
+        after = self.store.score_by_hash(HASH)
+        self.assertEqual(after["overall"], 73.4)
+        self.assertEqual(after["dimensions"], stored["calibration"]["base"]["dimensions"])
+        self.assertNotIn("calibration", after)
+        self.assertNotIn("calibration_pending", after)
 
     async def test_contact_history_switches_granularity(self) -> None:
         response = await self.client.post(

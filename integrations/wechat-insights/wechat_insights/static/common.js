@@ -233,6 +233,31 @@
     return "";
   }
 
+  /**
+   * 好感度校准角标：校准生效时显示带符号的综合分偏移（+1.2 / -0.8），
+   * title 悬浮显示 LLM 给的校准理由；没有校准时返回空串。展示用
+   * overall_delta，正好说明「比客观分抬了多少/压了多少」。
+   */
+  function calibrationChipHtml(payload) {
+    var calibration = payload && payload.calibration;
+    if (!calibration || !isNumber(calibration.overall_delta)) {
+      return "";
+    }
+    var delta = calibration.overall_delta;
+    var text = (delta > 0 ? "+" : "") + delta.toFixed(1);
+    var tip = "好感度校准 " + text;
+    if (calibration.note) {
+      tip += "：" + String(calibration.note);
+    }
+    return (
+      '<span class="chip chip--small chip--calibration" title="' +
+      escapeHtml(tip) +
+      '">校准 ' +
+      text +
+      "</span>"
+    );
+  }
+
   /* ------------------------------------------------------------------ *
    * 状态占位（加载 / 空 / 错误）
    * ------------------------------------------------------------------ */
@@ -283,6 +308,90 @@
     snackbarTimer = global.setTimeout(function () {
       snackbarEl.classList.remove("snackbar--open");
     }, 3000);
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 右键菜单（好感度校准标记）
+   * ------------------------------------------------------------------ */
+
+  var contextMenuEl = null;
+  // 当前菜单的动作项：click 监听只在首次创建时注册一次，闭包不能捕获
+  // 当次的 items，否则之后在别的卡片上打开菜单会错按第一张卡片的动作。
+  var contextMenuItems = null;
+
+  /** 收起右键菜单并清空内容；菜单外点击/滚动/Esc/失焦都会走到这里。 */
+  function closeContextMenu() {
+    if (!contextMenuEl) {
+      return;
+    }
+    contextMenuEl.classList.remove("context-menu--open");
+    contextMenuEl.innerHTML = "";
+  }
+
+  /**
+   * 在鼠标位置弹出一个迷你菜单（右键标记「偏高/偏低/清除」用）。
+   * items：[{ label, hint, onClick }]；hint 是项右边的次要说明文字。
+   * 全局单例：开新菜单前自动关掉旧的。菜单项点击后先收起再执行动作，
+   * 因此动作里可以放心触发 snackbar 等界面反馈。
+   */
+  function openContextMenu(event, items) {
+    if (!items || !items.length) {
+      return;
+    }
+    contextMenuItems = items;
+    if (!contextMenuEl) {
+      contextMenuEl = document.createElement("div");
+      contextMenuEl.className = "context-menu";
+      contextMenuEl.setAttribute("role", "menu");
+      document.body.appendChild(contextMenuEl);
+      // 菜单项的 click 会先于 document 的收起监听到达，动作照常执行。
+      contextMenuEl.addEventListener("click", function (menuEvent) {
+        var button = menuEvent.target.closest(".context-menu__item");
+        if (!button) {
+          return;
+        }
+        var index = Number(button.dataset.index);
+        closeContextMenu();
+        if (contextMenuItems && contextMenuItems[index]) {
+          contextMenuItems[index].onClick();
+        }
+      });
+      global.addEventListener("click", closeContextMenu);
+      global.addEventListener("scroll", closeContextMenu, true);
+      global.addEventListener("blur", closeContextMenu);
+      global.addEventListener("keydown", function (event) {
+        if (event.key === "Escape") {
+          closeContextMenu();
+        }
+      });
+    }
+    contextMenuEl.innerHTML = items
+      .map(function (item, index) {
+        return (
+          '<button type="button" class="context-menu__item" role="menuitem" ' +
+          'data-index="' +
+          index +
+          '">' +
+          '<span class="context-menu__label">' +
+          escapeHtml(item.label) +
+          "</span>" +
+          (item.hint
+            ? '<span class="context-menu__hint">' +
+              escapeHtml(item.hint) +
+              "</span>"
+            : "") +
+          "</button>"
+        );
+      })
+      .join("");
+    // 菜单在右下边界处翻转，避免弹出视口外；尺寸按 240px 宽、每项 44px 估。
+    var width = Math.min(240, global.document.documentElement.clientWidth - 16);
+    var x = Math.min(event.clientX, global.innerWidth - width - 8);
+    var y = Math.min(event.clientY, global.innerHeight - items.length * 44 - 16);
+    contextMenuEl.style.left = Math.max(8, x) + "px";
+    contextMenuEl.style.top = Math.max(8, y) + "px";
+    contextMenuEl.style.minWidth = width + "px";
+    contextMenuEl.classList.add("context-menu--open");
   }
 
   /* ------------------------------------------------------------------ *
@@ -437,10 +546,10 @@
       {
         name: "投入",
         desc:
-          "TA 每天花在你身上的「成本」。语音、通话、图片按等价条数加权" +
-          "（通话×8、语音/视频×3、图片/文件×1.5），文字每 20 字算 1 个单位，" +
-          "折成日均成本（45%）；再加日均消息条数（20%）、日均字数（20%）、" +
-          "表情包占比（15%）。"
+          "TA 每天花在你身上的「成本」。语音通话是强信号（通话×20、语音×5、" +
+          "视频×3、图片/文件×1.5），文字每 20 字算 1 个单位，折成日均成本" +
+          "（35%）；再加通话次数日均（20%）、日均消息条数（15%）、日均字数" +
+          "（15%）、表情包占比（15%）。"
       },
       {
         name: "节奏",
@@ -468,7 +577,9 @@
           "谁发起对话的均衡度（30%）；完全对等记满值，一边倒则趋近于零。"
       }
     ],
-    footnote: "往来消息不足 50 条的联系人不打分；打分每天自动更新一次。"
+    footnote:
+      "往来消息不足 50 条的联系人不打分；打分每天自动更新一次。" +
+      "右键联系人卡片可以标记「感觉偏高/偏低」，下一轮分析会自动校准。"
   };
 
   var helpDialogEl = null;
@@ -561,6 +672,8 @@
     api: api,
     apiPost: apiPost,
     kindBadgeHtml: kindBadgeHtml,
+    calibrationChipHtml: calibrationChipHtml,
+    openContextMenu: openContextMenu,
     linkTo: linkTo,
     formatDuration: formatDuration,
     formatDateTime: formatDateTime,

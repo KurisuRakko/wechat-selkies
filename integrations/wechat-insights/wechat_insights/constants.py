@@ -80,10 +80,12 @@ FADE_MIN_OVERALL = _int_env("INSIGHTS_FADE_MIN_OVERALL", 40, 0, 100)
 FADE_LIST_LIMIT = _int_env("INSIGHTS_FADE_LIST_LIMIT", 8, 1, 50)
 
 # —— 投入维度的类型成本权重 ——
-# 语音/通话比一条文字贵得多，直接按「等价条数」加权。
+# 语音/通话比一条文字贵得多，直接按「等价条数」加权。通话是强关系信号
+# （愿意打电话 ≈ 关系亲近，是文本频率看不见的投入），故 call 权重显著
+# 高于其他类型。
 COST_WEIGHTS = {
-    "call": 8.0,
-    "voice": 3.0,
+    "call": 20.0,
+    "voice": 5.0,
     "video": 3.0,
     "image": 1.5,
     "sticker": 1.0,
@@ -143,7 +145,7 @@ LLM_PERIOD_SAMPLE_BLOCKS = 6
 # 改动维度组成、权重或 LLM 注入方式时 +1。版本与库里记录的不一致时，下一轮
 # 分析会自动清掉全史回放标记与逐日细化进度、重放一遍曲线，不需要人工开
 # INSIGHTS_FORCE_HISTORY_BACKFILL。
-SCORE_FORMULA_VERSION = 2
+SCORE_FORMULA_VERSION = 3
 
 # —— 破坏性操作前的自动备份 ——
 # 打分口径重置与 llm_depth 去 score 列这两个不可逆时刻，会先 VACUUM INTO 一份
@@ -157,6 +159,18 @@ BACKUP_KEEP = _int_env("INSIGHTS_BACKUP_KEEP", 5, 1, 100)
 CLASSIFY_MAX_PER_RUN = _int_env("INSIGHTS_CLASSIFY_MAX_PER_RUN", 20, 1, 500)
 # 一次判定采样最多送出的总字数（三段全时段样本合计，达到即停）。
 CLASSIFY_SAMPLE_CHARS = _int_env("INSIGHTS_CLASSIFY_SAMPLE_CHARS", 2000, 500, 10000)
+
+# —— 好感度手动校准（右键反馈 → 下一轮分析消化）——
+# 单轮最多消化多少个联系人的校准标记。
+CALIBRATE_MAX_PER_RUN = _int_env("INSIGHTS_CALIBRATE_MAX_PER_RUN", 20, 1, 500)
+# 一次校准采样最多送出的聊天总字数。
+CALIBRATE_SAMPLE_CHARS = _int_env("INSIGHTS_CALIBRATE_SAMPLE_CHARS", 2000, 500, 10000)
+# 单次校准每个维度的最大偏移幅度（LLM 给出的幅度会被截到这里）。
+CALIBRATE_STEP_MAX = 6.0
+# 每个维度的累计校准偏移上下限（多次标记累加后被夹在 ±这个值内）。
+CALIBRATE_TOTAL_MAX = 12.0
+# LLM 不可用或调用失败时的确定性回退：全维统一偏移这个幅度。
+CALIBRATE_FALLBACK_STEP = 3.0
 
 # —— 增量读取 ——
 # 单批读取的消息条数上限；首轮回填靠多批循环推进。
