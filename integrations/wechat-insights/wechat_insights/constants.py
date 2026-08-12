@@ -160,6 +160,18 @@ CLASSIFY_MAX_PER_RUN = _int_env("INSIGHTS_CLASSIFY_MAX_PER_RUN", 20, 1, 500)
 # 一次判定采样最多送出的总字数（三段全时段样本合计，达到即停）。
 CLASSIFY_SAMPLE_CHARS = _int_env("INSIGHTS_CLASSIFY_SAMPLE_CHARS", 2000, 500, 10000)
 
+# —— 好感度手动校准（右键反馈 → 下一轮分析消化）——
+# 单轮最多消化多少个联系人的校准标记。
+CALIBRATE_MAX_PER_RUN = _int_env("INSIGHTS_CALIBRATE_MAX_PER_RUN", 20, 1, 500)
+# 一次校准采样最多送出的聊天总字数。
+CALIBRATE_SAMPLE_CHARS = _int_env("INSIGHTS_CALIBRATE_SAMPLE_CHARS", 2000, 500, 10000)
+# 单次校准每个维度的最大偏移幅度（LLM 给出的幅度会被截到这里）。
+CALIBRATE_STEP_MAX = 6.0
+# 每个维度的累计校准偏移上下限（多次标记累加后被夹在 ±这个值内）。
+CALIBRATE_TOTAL_MAX = 12.0
+# LLM 不可用或调用失败时的确定性回退：全维统一偏移这个幅度。
+CALIBRATE_FALLBACK_STEP = 3.0
+
 # —— 增量读取 ——
 # 单批读取的消息条数上限；首轮回填靠多批循环推进。
 BACKFILL_BATCH = _int_env("INSIGHTS_BACKFILL_BATCH", 5000, 100, 200000)

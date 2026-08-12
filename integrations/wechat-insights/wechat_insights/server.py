@@ -563,6 +563,77 @@ def create_app(runtime: InsightsRuntime) -> web.Application:
             {"ok": True, "relation_kind": effective, "kind_source": source}
         )
 
+    async def contact_feedback(request: web.Request) -> web.Response:
+        """好感度标记：'up'/'down' 不立即改分，记到联系人行，下一轮分析消化；
+        'clear' 清除标记并按 payload 里的 base 快照即时还原分数。
+
+        标记本身只写 contacts 两列，分数变化发生在下一轮分析的校准消化里。
+        清除是即时的：payload 里带着最近一次校准的 base 快照，按它还原
+        综合分与七维，界面马上回到客观口径。标记只落在响应里，wxid 不
+        出现在任何响应中。
+        """
+
+        value = request.match_info["hash"]
+        if not _HASH_PATTERN.fullmatch(value):
+            raise web.HTTPNotFound(text="not found")
+        row = store.get_contact_by_hash(value)
+        if row is None:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "CONTACT_NOT_FOUND",
+                        "message": "找不到该联系人，可能还没跑过分析",
+                    },
+                },
+                status=404,
+                headers={"Cache-Control": "no-store"},
+            )
+        try:
+            body = json.loads(await request.text())
+        except ValueError:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": {"code": "BAD_REQUEST", "message": "请求体不是合法 JSON"},
+                },
+                status=400,
+                headers={"Cache-Control": "no-store"},
+            )
+        action = body.get("action") if isinstance(body, dict) else None
+        if action not in ("up", "down", "clear"):
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": {"code": "BAD_REQUEST", "message": "action 取值非法"},
+                },
+                status=400,
+                headers={"Cache-Control": "no-store"},
+            )
+        payload = store.score_by_hash(value)
+        if action == "clear":
+            store.set_contact_feedback(row.session_id, "", "")
+            store.set_contact_calibration(row.session_id, "")
+            if payload is not None:
+                calibration = payload.get("calibration")
+                if isinstance(calibration, dict) and isinstance(
+                    calibration.get("base"), dict
+                ):
+                    base = calibration["base"]
+                    if "overall" in base:
+                        payload["overall"] = base["overall"]
+                    if isinstance(base.get("dimensions"), dict):
+                        payload["dimensions"] = base["dimensions"]
+                payload.pop("calibration", None)
+                payload.pop("calibration_pending", None)
+                store.update_score_payload(row.session_id, payload)
+            return no_store({"ok": True, "pending": None, "cleared": True})
+        store.set_contact_feedback(row.session_id, action, str(int(time.time())))
+        if payload is not None:
+            payload["calibration_pending"] = action
+            store.update_score_payload(row.session_id, payload)
+        return no_store({"ok": True, "pending": action})
+
     async def contact_history(request: web.Request) -> web.Response:
         """切换联系人的温度采样粒度：'day' = 逐日细化，'week' = 每周（默认）。
 
@@ -652,6 +723,7 @@ def create_app(runtime: InsightsRuntime) -> web.Application:
     app.router.add_get("/api/contact/{hash}", contact_detail)
     app.router.add_post("/api/contact/{hash}/kind", contact_kind)
     app.router.add_post("/api/contact/{hash}/history", contact_history)
+    app.router.add_post("/api/contact/{hash}/feedback", contact_feedback)
     app.router.add_get("/api/report", report)
     app.router.add_get("/api/progress", progress)
     app.router.add_post("/api/refresh", refresh)

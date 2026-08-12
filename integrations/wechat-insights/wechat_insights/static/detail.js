@@ -26,10 +26,84 @@
     name: document.getElementById("contact-name"),
     meta: document.getElementById("contact-meta"),
     back: document.getElementById("back-link"),
+    bar: document.querySelector(".app-bar"),
     content: document.getElementById("content")
   };
 
   els.back.href = I.linkTo("/");
+
+  /* ------------------------------------------------------------------ *
+   * 好感度校准：页头右键弹出标记菜单
+   * ------------------------------------------------------------------ */
+
+  // 当前联系人的 payload：右键菜单、标记动作都从它取 hash 与校准状态。
+  var current = null;
+
+  function markFeedback(action) {
+    I.apiPost(
+      "/api/contact/" + encodeURIComponent(current.hash) + "/feedback",
+      { action: action }
+    )
+      .then(function (result) {
+        if (action === "clear") {
+          // 清除是即时的：服务端已按 payload 里的 base 快照还原分数，
+          // 重拉详情页让页头角标与七维立刻回到客观口径。
+          load();
+          I.snackbar("已清除校准，分数还原为客观口径");
+          return;
+        }
+        var pending = result.data && result.data.pending;
+        if (pending) {
+          I.snackbar(
+            action === "up"
+              ? "已标记「感觉偏低」：下一轮分析后分数上调"
+              : "已标记「感觉偏高」：下一轮分析后分数下调"
+          );
+        }
+      })
+      .catch(function (err) {
+        I.snackbar((err && err.message) || "标记失败");
+      });
+  }
+
+  function feedbackItems() {
+    var items = [
+      {
+        label: "标记：感觉偏低",
+        hint: "校准后分数上调",
+        onClick: function () {
+          markFeedback("up");
+        }
+      },
+      {
+        label: "标记：感觉偏高",
+        hint: "校准后分数下调",
+        onClick: function () {
+          markFeedback("down");
+        }
+      }
+    ];
+    // 只有校准生效中或标记排队中才需要「清除」；干净的联系人没有可清的东西。
+    if (current.calibration || current.calibration_pending) {
+      items.push({
+        label: "清除校准",
+        hint: "还原客观分",
+        onClick: function () {
+          markFeedback("clear");
+        }
+      });
+    }
+    return items;
+  }
+
+  // 页头右键 = 好感度标记菜单；数据还没加载出来时忽略。
+  els.bar.addEventListener("contextmenu", function (event) {
+    if (!current) {
+      return;
+    }
+    event.preventDefault();
+    I.openContextMenu(event, feedbackItems());
+  });
 
   // 首屏入场动画只播一次：改判/换粒度后的整页重载会重置，但同一载入
   // 周期内的重绘不重播。
@@ -273,6 +347,7 @@
 
   function render(payload) {
     var contact = payload.contact || {};
+    current = contact;
     var monthly = payload.monthly || [];
     var types = payload.types || [];
     var history = payload.history || [];
@@ -287,12 +362,23 @@
         (contact.recent_messages || 0) +
         " 条"
       : contact.sample_note || "数据不足";
+    var pendingText = "";
+    if (contact.calibration_pending) {
+      pendingText =
+        contact.calibration_pending === "up"
+          ? "校准排队中（偏低）"
+          : "校准排队中（偏高）";
+    }
     els.meta.innerHTML =
       '<span class="contact-meta">' +
       I.kindBadgeHtml(contact.relation_kind) +
+      I.calibrationChipHtml(contact) +
       "<span>" +
       I.escapeHtml(metaText) +
       "</span>" +
+      (pendingText
+        ? '<span class="md-caption">' + I.escapeHtml(pendingText) + "</span>"
+        : "") +
       "</span>";
 
     var radarBody = contact.scored

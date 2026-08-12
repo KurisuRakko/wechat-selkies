@@ -22,6 +22,7 @@ from wechat_insights.analyzer import Analyzer
 from wechat_insights.depth import LLMDepth
 from wechat_insights.metrics import day_key
 from wechat_insights.reading import Cursor, read_messages_after
+from wechat_insights.storage import contact_hash
 
 
 class ReadWindowTests(AnalyzerTestCase):
@@ -682,6 +683,51 @@ class FadeTests(AnalyzerTestCase):
         self.assertEqual(self.fading(), [])
 
 
+class CalibrationAnalysisTests(AnalyzerTestCase):
+    """整轮分析里的校准消化：标记 → 偏移叠加进 payload，历史曲线保持客观。"""
+
+    def seed_two_contacts(self) -> None:
+        rows = []
+        for index in range(1, 21):
+            offset = index * 120
+            rows.append(them(index, offset) if index % 2 else me(index, offset))
+        build_database(self.database, rows)
+        # 百分位至少需要两个联系人做参照，第二个直接写库。
+        self.seed_messages("friend2", "Bob", {BASE + 5 * 86400: 15})
+
+    def run_round(self):
+        with patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10):
+            return self.run_analysis(now=BASE + 10 * 86400)
+
+    def test_marked_contact_gets_calibrated_on_next_round(self) -> None:
+        self.seed_two_contacts()
+        self.run_round()
+        base = self.store.score_by_hash(contact_hash(SESSION_ID))
+        base_overall = base["overall"]
+        # 标记「感觉偏低」：下一轮分析消化，词法策略下回退为全维 +3。
+        self.store.set_contact_feedback(SESSION_ID, "up", str(NOW))
+        result = self.run_round()
+        self.assertEqual(result.calibrated, 1)
+        payload = self.store.score_by_hash(contact_hash(SESSION_ID))
+        calibration = payload["calibration"]
+        self.assertAlmostEqual(calibration["overall_delta"], 3.0)
+        self.assertEqual(calibration["base"]["overall"], base_overall)
+        self.assertAlmostEqual(payload["overall"], base_overall + 3.0)
+        # 标记已被消化：payload 里不再有排队提示。
+        self.assertNotIn("calibration_pending", payload)
+
+    def test_history_records_base_score_not_calibrated(self) -> None:
+        self.seed_two_contacts()
+        self.run_round()
+        base = self.store.score_by_hash(contact_hash(SESSION_ID))
+        base_overall = base["overall"]
+        self.store.set_contact_feedback(SESSION_ID, "up", str(NOW))
+        self.run_round()
+        rows = self.store.load_score_history(SESSION_ID)
+        # 温度历史曲线只记校准前的客观值：校准只影响展示，不改客观轨迹。
+        self.assertEqual(rows[-1][1], base_overall)
+
+
 class ProgressTests(AnalyzerTestCase):
     """进度上报：阶段顺序、计数递增，以及 cb 异常绝不影响分析本身。"""
 
@@ -704,20 +750,25 @@ class ProgressTests(AnalyzerTestCase):
     def test_lexical_run_reports_sync_then_score(self) -> None:
         build_database(self.database, [them(1, 0), me(2, 60)])
         _, events = self.run_with_progress(now=NOW)
-        # 阶段顺序：sync（起点 + 1 个会话）→ score → history（全史回放网格，
-        # 起点 + 每 7 天一个点）。
+        # 阶段顺序：sync（起点 + 1 个会话）→ calibrate（本数据无标记，只发
+        # 起点 0/0）→ score → history（全史回放网格，起点 + 每 7 天一个点）。
         grid = backfill_grid(day_key(BASE), day_key(NOW))
         phases = [event["phase"] for event in events]
-        self.assertEqual(phases[:3], ["sync", "sync", "score"])
-        self.assertEqual(phases[3:], ["history"] * (len(grid) + 1))
+        self.assertEqual(phases[:3], ["sync", "sync", "calibrate"])
+        self.assertEqual(phases[3:], ["score"] + ["history"] * (len(grid) + 1))
         # sync 起点：total=会话数、done=0；随后每个会话前上报一次 display_name。
         self.assertEqual(events[0], {"phase": "sync", "done": 0, "total": 1, "detail": ""})
         self.assertEqual(
             events[1],
             {"phase": "sync", "done": 0, "total": 1, "detail": DISPLAY_NAME},
         )
+        # calibrate 阶段没有候选：只发起点 0/0。
+        self.assertEqual(
+            events[2],
+            {"phase": "calibrate", "done": 0, "total": 0, "detail": ""},
+        )
         # score 阶段没有逐项计数：total=0。
-        self.assertEqual(events[2], {"phase": "score", "done": 0, "total": 0, "detail": ""})
+        self.assertEqual(events[3], {"phase": "score", "done": 0, "total": 0, "detail": ""})
         # history 起点 total=网格点数，随后逐点上报日期。
         history = [event for event in events if event["phase"] == "history"]
         self.assertEqual(
@@ -763,14 +814,15 @@ class ProgressTests(AnalyzerTestCase):
         self.assertEqual(fake.call_count, 2)
         phases = [event["phase"] for event in events]
         # 阶段顺序：sync（起点 + 3 个会话）→ llm（起点 + 2 个候选）→
-        # period（时段评分，本数据无候选，只发起点 0/0）→ score →
-        # history（全史回放网格）。
+        # period（时段评分，本数据无候选，只发起点 0/0）→ calibrate（好感度
+        # 校准，本数据无标记，只发起点 0/0）→ score → history（全史回放网格）。
         grid = backfill_grid(day_key(BASE), day_key(NOW))
         self.assertEqual(
             phases,
             ["sync"] * 4
             + ["llm"] * 3
             + ["period"]
+            + ["calibrate"]
             + ["score"]
             + ["history"] * (len(grid) + 1),
         )

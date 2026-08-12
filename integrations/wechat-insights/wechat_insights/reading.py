@@ -10,7 +10,8 @@ from dataclasses import dataclass
 
 from wechat_history.reader import HistoryReader, _read_connection
 
-from .conversation import ME, Message
+from .constants import BACKFILL_BATCH
+from .conversation import ME, Message, split_conversations
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,7 +136,8 @@ def read_messages_after(
 def transcript_lines(messages: list[Message]) -> list[str]:
     """把一段对话压成「我: … / TA: …」文本行，只取有内容的 text 消息。
 
-    三个 LLM 采样点（画像、分类、时段评分）共用这一份格式，出站文本形状只有一处定义。
+    画像、分类、时段评分与好感度校准四个采样点共用这一份格式，
+    出站文本形状只有一处定义。
     """
 
     return [
@@ -143,3 +145,39 @@ def transcript_lines(messages: list[Message]) -> list[str]:
         for message in messages
         if message.kind == "text" and message.text
     ]
+
+
+def sample_transcript(
+    reader: HistoryReader,
+    session_id: str,
+    display_name: str,
+    sample_start: int,
+    gap_seconds: int,
+    max_chars: int,
+) -> str | None:
+    """从采样窗口读一批消息，从最晚往前拼最近几段对话；没有 text 返回 None。
+
+    只取 text 类消息，每行「我: 内容 / TA: 内容」，段与段之间空行分隔，
+    总字数达到 max_chars 就停。窗口内消息超过一个批次时只覆盖最旧的那一批
+    （读接口只支持从游标向前读），采样质量足够。
+    """
+
+    batch = read_messages_after(
+        reader,
+        session_id,
+        display_name,
+        {},
+        Cursor(sample_start, "", -1),
+        BACKFILL_BATCH,
+    )
+    blocks: list[str] = []
+    total = 0
+    for conversation in reversed(split_conversations(batch.messages, gap_seconds)):
+        lines = transcript_lines(conversation)
+        if not lines:
+            continue
+        blocks.append("\n".join(lines))
+        total += sum(len(line) for line in lines)
+        if total >= max_chars:
+            break
+    return None if not blocks else "\n\n".join(blocks)

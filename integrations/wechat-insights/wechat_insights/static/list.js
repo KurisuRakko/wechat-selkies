@@ -49,6 +49,8 @@
     classify: "关系分类",
     // 时段化评分：按自然月给历史时段补 LLM 分，首轮回填量大。
     period: "AI 时段评分",
+    // 好感度校准：消化右键标记，把幅度分配到七维。
+    calibrate: "好感度校准",
     score: "重算打分",
     history: "回放历史",
     // 逐日细化：把某位联系人的历史从每周重算成每天，全史很耗时。
@@ -603,6 +605,67 @@
     };
   }
 
+  /* ------------------------------------------------------------------ *
+   * 好感度校准：右键卡片弹出标记菜单
+   * ------------------------------------------------------------------ */
+
+  function markFeedback(item, action) {
+    I.apiPost(
+      "/api/contact/" + encodeURIComponent(item.hash) + "/feedback",
+      { action: action }
+    )
+      .then(function (result) {
+        if (action === "clear") {
+          // 清除是即时的：服务端已按 payload 里的 base 快照还原分数并
+          // 清空校准，重新拉一遍列表让角标与分数立刻回到客观口径。
+          loadContacts();
+          I.snackbar("已清除校准，分数还原为客观口径");
+          return;
+        }
+        var pending = result.data && result.data.pending;
+        if (pending) {
+          I.snackbar(
+            action === "up"
+              ? "已标记「感觉偏低」：下一轮分析后分数上调"
+              : "已标记「感觉偏高」：下一轮分析后分数下调"
+          );
+        }
+      })
+      .catch(function (err) {
+        I.snackbar((err && err.message) || "标记失败");
+      });
+  }
+
+  function feedbackItems(item) {
+    var items = [
+      {
+        label: "标记：感觉偏低",
+        hint: "校准后分数上调",
+        onClick: function () {
+          markFeedback(item, "up");
+        }
+      },
+      {
+        label: "标记：感觉偏高",
+        hint: "校准后分数下调",
+        onClick: function () {
+          markFeedback(item, "down");
+        }
+      }
+    ];
+    // 只有校准生效中或标记排队中才需要「清除」；干净的联系人没有可清的东西。
+    if (item.calibration || item.calibration_pending) {
+      items.push({
+        label: "清除校准",
+        hint: "还原客观分",
+        onClick: function () {
+          markFeedback(item, "clear");
+        }
+      });
+    }
+    return items;
+  }
+
   function buildCard(item) {
     var card = document.createElement("button");
     card.type = "button";
@@ -624,6 +687,7 @@
       I.escapeHtml(item.display_name) +
       "</span>" +
       I.kindBadgeHtml(item.relation_kind) +
+      I.calibrationChipHtml(item) +
       anomalyBadgeHtml(item) +
       "</span>" +
       cardTagsHtml(item.llm_tags) +
@@ -670,6 +734,11 @@
 
     card.addEventListener("click", function () {
       global.location.href = I.linkTo("/contact/" + encodeURIComponent(item.hash));
+    });
+    // 右键 = 好感度标记菜单；左键跳详情不受影响。
+    card.addEventListener("contextmenu", function (event) {
+      event.preventDefault();
+      I.openContextMenu(event, feedbackItems(item));
     });
     return card;
   }

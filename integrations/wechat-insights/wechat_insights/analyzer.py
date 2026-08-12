@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from wechat_history.reader import HistoryReader
 from wechat_history.sessions import scan_direct_rows
 
+from .calibrate import refresh_calibrations
 from .classify import classify_contacts
 from .constants import (
     BACKFILL_BATCH,
@@ -74,6 +75,8 @@ class AnalysisResult:
     classified: int = 0
     # 本轮写入的时段化 LLM 分行数。
     llm_periods: int = 0
+    # 本轮消化的好感度右键标记数（写入校准的联系人数）。
+    calibrated: int = 0
     # 本轮全史回放写入的采样点行数（关系温度曲线补上部署日之前的历史）。
     history_points: int = 0
     # 本轮逐日细化写入的采样点行数（每日粒度联系人从相识日逐日补点）。
@@ -239,6 +242,20 @@ class Analyzer:
                     replay_since = refresh.earliest_past_end
                 except Exception:
                     LOG.exception("时段化 LLM 评分失败，本轮跳过")
+            # 好感度校准也要在 reader 关闭前做（llm 策略下要从快照里读采样
+            # 文本）。所有策略都跑：回退路径不依赖 LLM。可选项，出意外
+            # 不能拖垮整轮打分，隔离处理。
+            try:
+                result.calibrated = refresh_calibrations(
+                    self.store,
+                    reader,
+                    self.strategy,
+                    self.gap_seconds,
+                    moment,
+                    self._report,
+                )
+            except Exception:
+                LOG.exception("好感度校准失败，本轮跳过")
         finally:
             reader.close()
 
@@ -462,7 +479,45 @@ class Analyzer:
         }
         if zeroed:
             payload["zeroed"] = True
+        # 标记还在（上一轮没消化完、或消化前就查看）：透传给前端，详情页
+        # 与列表页据此展示「校准排队中」，而不是无声无息。
+        if contact.feedback_pending:
+            payload["calibration_pending"] = contact.feedback_pending
         return payload
+
+    @staticmethod
+    def _apply_calibration(payload: dict[str, object], contact: ContactRow) -> None:
+        """把累计校准偏移叠加进 payload 的七维与综合分（就地修改）。
+
+        calibration JSON 的 dims 是「当前生效的累计偏移」；叠加到本轮
+        round 过 1 位的 base 值上，并把 base 快照与偏移一并塞进 payload
+        的 calibration 键——前端据此显示角标，清除时按 base 即时还原。
+        """
+
+        data = contact.calibration_data()
+        if data is None:
+            return
+        offsets = data.get("dims")
+        if not isinstance(offsets, dict):
+            return
+        base_overall = float(payload["overall"])
+        base_dims = dict(payload["dimensions"])  # type: dict[str, object]
+        calibrated: dict[str, float] = {}
+        for name in DIMENSION_NAMES:
+            base = base_dims.get(name, 50.0)
+            calibrated[name] = round(
+                min(100.0, max(0.0, float(base) + float(offsets.get(name, 0.0)))),
+                1,
+            )
+        payload["dimensions"] = calibrated
+        payload["overall"] = round(sum(calibrated.values()) / 7, 1)
+        payload["calibration"] = {
+            "offsets": offsets,
+            "overall_delta": round(float(payload["overall"]) - base_overall, 1),
+            "base": {"overall": base_overall, "dimensions": base_dims},
+            "note": data.get("note") or None,
+            "updated_at": data.get("updated_at"),
+        }
 
     def _scores_asof(
         self,
@@ -605,6 +660,8 @@ class Analyzer:
         # 画像字段只属于今日详情页 payload，在 _scores_asof 之外单独读：
         # 打分内核不依赖「当前」时刻的缓存，历史回放才没有第二份真相。
         llm_scores = self.store.all_llm_depth() if self.strategy.name == "llm" else {}
+        # 校准前的客观值快照：温度历史曲线只记它，不记被校准抬过/压过的分。
+        history_rows_base: dict[str, tuple[float, dict[str, float]]] = {}
         payloads: list[tuple[str, dict[str, object]]] = []
         for contact in contacts_by_id.values():
             session_id = contact.session_id
@@ -707,28 +764,41 @@ class Analyzer:
                     and anomalies_key(anomalies) == llm_row.anomalies_key
                     else None
                 )
+            if scored:
+                # 好感度校准：叠加之前先按 base 快照留档，温度历史曲线只记
+                # 客观口径、不吃校准；标记还在的透传给前端展示「排队中」。
+                history_rows_base[session_id] = (
+                    float(payload["overall"]),
+                    {
+                        name: float(payload["dimensions"][name])
+                        for name in DIMENSION_NAMES
+                    },
+                )
+                self._apply_calibration(payload, contact)
+                if contact.feedback_pending:
+                    payload["calibration_pending"] = contact.feedback_pending
             payloads.append((session_id, payload))
 
         self.store.save_scores(payloads)
         # 关系温度历史：每天一个采样点，从部署日起积累。scored 与归零的
         # 联系人都记（归零也是曲线的一部分），数据不足的跳过——没有分数
-        # 就没有温度。UPSERT 语义保证同一天多轮分析只留一个点。
-        self.store.record_score_history(
-            today,
-            [
+        # 就没有温度。UPSERT 语义保证同一天多轮分析只留一个点。历史只记
+        # 校准前的客观值：校准是用户主观手感，不该写进客观曲线。
+        history_rows = []
+        for session_id, payload in payloads:
+            if payload["overall"] is None:
+                continue
+            overall, dimensions = history_rows_base.get(
+                session_id, (payload["overall"], payload["dimensions"])
+            )
+            history_rows.append(
                 (
                     session_id,
-                    payload["overall"],
-                    json.dumps(
-                        payload["dimensions"],
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    ),
+                    overall,
+                    json.dumps(dimensions, ensure_ascii=False, separators=(",", ":")),
                 )
-                for session_id, payload in payloads
-                if payload["overall"] is not None
-            ],
-        )
+            )
+        self.store.record_score_history(today, history_rows)
         # 「正在淡出」提醒：在归零之前抓住正在滑落的高分关系——已打分、
         # 当前沉默达到 FADE_MIN_GAP_DAYS 天、综合分还高于 FADE_MIN_OVERALL
         # 的联系人，按综合分降序取前 FADE_LIST_LIMIT 个，让看板从观赏变成
