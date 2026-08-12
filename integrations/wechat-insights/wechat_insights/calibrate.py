@@ -171,15 +171,23 @@ def refresh_calibrations(
         old = (contact.calibration_data() or {}).get("dims")
         old_dims = old if isinstance(old, dict) else {}
         new_dims: dict[str, float] = {}
-        for name, magnitude in dims.items():
-            value = round(
-                _clamp(
-                    float(old_dims.get(name, 0.0)) + sign * magnitude,
+        # 键并集：本次没建议的维度原样保留旧偏移，否则累计偏移会在
+        # 一轮只动个别维度的校准中静默丢失。
+        for name in dict.fromkeys((*old_dims, *dims)):
+            if name in dims:
+                value = _clamp(
+                    float(old_dims.get(name, 0.0)) + sign * float(dims[name]),
                     -CALIBRATE_TOTAL_MAX,
                     CALIBRATE_TOTAL_MAX,
-                ),
-                1,
-            )
+                )
+            else:
+                # 保留旧值也夹界/取整一次，防历史数据越界。
+                value = _clamp(
+                    float(old_dims.get(name, 0.0)),
+                    -CALIBRATE_TOTAL_MAX,
+                    CALIBRATE_TOTAL_MAX,
+                )
+            value = round(value, 1)
             if value:
                 new_dims[name] = value
         if new_dims:

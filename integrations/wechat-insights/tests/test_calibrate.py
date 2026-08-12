@@ -201,6 +201,26 @@ class RefreshCalibrationsTests(AnalyzerTestCase):
             self.calibration_dims(), {"investment": CALIBRATE_TOTAL_MAX}
         )
 
+    def test_cumulative_preserves_untouched_dims(self) -> None:
+        self.seed_scored()
+        # 预置校准只动过 responsiveness；下一轮 LLM 只建议 depth，合并后
+        # responsiveness 的累计偏移必须原样保留，不能被静默丢弃。
+        self.store.set_contact_calibration(
+            SESSION_ID,
+            json.dumps(
+                {"dims": {"responsiveness": 4.0}, "updated_at": NOW, "source": "llm", "note": ""}
+            ),
+        )
+        with patch(
+            "wechat_insights.llm.chat",
+            return_value=_chat_reply(depth=3.0),
+        ):
+            self.refresh(mark="up")
+        self.assertEqual(
+            self.calibration_dims(),
+            {"responsiveness": 4.0, "depth": 3.0},
+        )
+
     def test_merge_through_zero_clears_calibration(self) -> None:
         self.seed_scored()
         # 反方向抵消到净值为 0：校准列清空，等于没校准过。

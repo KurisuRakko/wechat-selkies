@@ -315,6 +315,9 @@
    * ------------------------------------------------------------------ */
 
   var contextMenuEl = null;
+  // 当前菜单的动作项：click 监听只在首次创建时注册一次，闭包不能捕获
+  // 当次的 items，否则之后在别的卡片上打开菜单会错按第一张卡片的动作。
+  var contextMenuItems = null;
 
   /** 收起右键菜单并清空内容；菜单外点击/滚动/Esc/失焦都会走到这里。 */
   function closeContextMenu() {
@@ -335,6 +338,7 @@
     if (!items || !items.length) {
       return;
     }
+    contextMenuItems = items;
     if (!contextMenuEl) {
       contextMenuEl = document.createElement("div");
       contextMenuEl.className = "context-menu";
@@ -348,7 +352,9 @@
         }
         var index = Number(button.dataset.index);
         closeContextMenu();
-        items[index].onClick();
+        if (contextMenuItems && contextMenuItems[index]) {
+          contextMenuItems[index].onClick();
+        }
       });
       global.addEventListener("click", closeContextMenu);
       global.addEventListener("scroll", closeContextMenu, true);

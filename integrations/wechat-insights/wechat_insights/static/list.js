@@ -624,6 +624,9 @@
         }
         var pending = result.data && result.data.pending;
         if (pending) {
+          // 服务端已把 calibration_pending 写进 payload，重拉列表让
+          // 「校准排队中」角标与清除项立刻可见。
+          loadContacts();
           I.snackbar(
             action === "up"
               ? "已标记「感觉偏低」：下一轮分析后分数上调"
