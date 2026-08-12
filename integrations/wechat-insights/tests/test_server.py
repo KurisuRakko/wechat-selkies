@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import time
 from datetime import date, datetime, timedelta
@@ -16,7 +17,7 @@ from wechat_insights.server import (
     InsightsRuntime,
     create_app,
     next_run_at,
-    parse_analyze_time,
+    parse_analyze_times,
 )
 from wechat_insights.storage import MetricsStore, contact_hash
 
@@ -86,14 +87,91 @@ class ScheduleTests(AioHTTPTestCase):
         await super().asyncSetUp()
 
     def test_invalid_analyze_time_falls_back(self) -> None:
-        self.assertEqual(parse_analyze_time("06:15"), (6, 15))
-        self.assertEqual(parse_analyze_time("25:00"), (4, 30))
-        self.assertEqual(parse_analyze_time("nonsense"), (4, 30))
+        self.assertEqual(parse_analyze_times("06:15"), ((6, 15),))
+        self.assertEqual(parse_analyze_times("25:00"), ((4, 30),))
+        self.assertEqual(parse_analyze_times("nonsense"), ((4, 30),))
 
     def test_next_run_is_always_in_the_future(self) -> None:
         now = 1_700_000_000.0
-        self.assertGreater(next_run_at(now, 4, 30), now)
-        self.assertLessEqual(next_run_at(now, 4, 30) - now, 86400)
+        self.assertGreater(next_run_at(now, ((4, 30),)), now)
+        self.assertLessEqual(next_run_at(now, ((4, 30),)) - now, 86400)
+
+    def test_analyze_times_parses_multiple_sorted_and_deduped(self) -> None:
+        self.assertEqual(
+            parse_analyze_times("04:30,12:30,20:30"),
+            ((4, 30), (12, 30), (20, 30)),
+        )
+        self.assertEqual(
+            parse_analyze_times("20:30, 04:30 ,12:30"),
+            ((4, 30), (12, 30), (20, 30)),
+        )
+        self.assertEqual(parse_analyze_times("04:30,4:30,04:30"), ((4, 30),))
+
+    def test_analyze_times_keeps_the_valid_subset(self) -> None:
+        self.assertEqual(
+            parse_analyze_times("04:30,99:99,12:30"),
+            ((4, 30), (12, 30)),
+        )
+        self.assertEqual(parse_analyze_times("04:30,,12:30"), ((4, 30), (12, 30)))
+        self.assertEqual(parse_analyze_times("04:30,12:30:00"), ((4, 30),))
+        self.assertEqual(parse_analyze_times("nope,25:61"), ((4, 30),))
+
+    def test_analyze_times_never_returns_empty(self) -> None:
+        for raw in ("", ",", ",,", "nonsense", "24:00", "-1:30", "04:70", "1:2:3", None):
+            parsed = parse_analyze_times(raw)
+            self.assertIsInstance(parsed, tuple)
+            self.assertTrue(parsed)
+            for hour, minute in parsed:
+                self.assertTrue(0 <= hour < 24)
+                self.assertTrue(0 <= minute < 60)
+
+    def test_next_run_picks_the_earliest_upcoming_time(self) -> None:
+        # 固定基准日 2026-06-15，本地朴素时间构造，不依赖运行时区。
+        day = datetime(2026, 6, 15).timestamp()
+        times = ((4, 30), (12, 30), (20, 30))
+
+        def expected_at(hour: int, minute: int) -> float:
+            return datetime(2026, 6, 15, hour, minute).timestamp()
+
+        def expected_next_day(hour: int, minute: int) -> float:
+            return datetime(2026, 6, 16, hour, minute).timestamp()
+
+        self.assertEqual(next_run_at(day + 5 * 3600, times), expected_at(12, 30))
+        self.assertEqual(next_run_at(day + 13 * 3600, times), expected_at(20, 30))
+        self.assertEqual(next_run_at(day + 23 * 3600, times), expected_next_day(4, 30))
+        # 正好落在时刻上要跳到下一个。
+        self.assertEqual(next_run_at(day + 12.5 * 3600, times), expected_at(20, 30))
+        # 单时刻退化情形。
+        self.assertEqual(
+            next_run_at(day + 5 * 3600, ((4, 30),)), expected_next_day(4, 30)
+        )
+
+    def test_runtime_reads_the_configured_times(self) -> None:
+        with patch("wechat_insights.server.ANALYZE_TIME", "20:30,04:30,12:30"):
+            runtime = InsightsRuntime(self.store, analyzer_factory=lambda: None)
+        self.assertEqual(runtime.times, ((4, 30), (12, 30), (20, 30)))
+
+    async def test_schedule_loop_waits_for_the_earliest_slot(self) -> None:
+        # 独立的 runtime：create_app 的 cleanup_ctx 已经给 self.runtime 起了
+        # 一个真实循环，这里再起一个会多开一条调度任务。asyncSetUp 已写入
+        # last_analyzed_at，immediate 必为 False，循环第一件事就是算 next_run
+        # 并 sleep，不会调用分析器。
+        with patch("wechat_insights.server.ANALYZE_TIME", "04:30,12:30,20:30"):
+            runtime = InsightsRuntime(self.store, analyzer_factory=lambda: None)
+        started = time.time()
+        await runtime.start()
+        try:
+            for _ in range(100):
+                if runtime.next_run is not None:
+                    break
+                await asyncio.sleep(0)
+            self.assertIsNotNone(runtime.next_run)
+            moment = datetime.fromtimestamp(runtime.next_run)
+            self.assertIn((moment.hour, moment.minute), {(4, 30), (12, 30), (20, 30)})
+            self.assertGreater(runtime.next_run, started)
+            self.assertLessEqual(runtime.next_run - started, 9 * 3600)
+        finally:
+            await runtime.close()
 
 
 class ApiTests(AioHTTPTestCase):
@@ -139,6 +217,18 @@ class ApiTests(AioHTTPTestCase):
         self.assertFalse(body["running"])
         self.assertEqual(body["contacts"], 1)
         self.assertEqual(body["scored_contacts"], 1)
+
+    async def test_status_reports_the_next_run_timestamp(self) -> None:
+        # 先等应用生命周期里的循环写入自己的 next_run，避免断言撞上它的
+        # 写入；之后循环已停在数小时的 asyncio.sleep 上，不会回写。
+        for _ in range(100):
+            if self.runtime.next_run is not None:
+                break
+            await asyncio.sleep(0)
+        self.assertIsNotNone(self.runtime.next_run)
+        self.runtime.next_run = 1_700_000_123.7
+        body = await (await self.client.get("/api/status")).json()
+        self.assertEqual(body["next_run_at"], 1_700_000_123)
 
     async def test_contact_list_keeps_anomalies_and_fills_missing_medians(self) -> None:
         body = await (await self.client.get("/api/contacts")).json()

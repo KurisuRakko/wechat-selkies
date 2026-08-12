@@ -27,7 +27,8 @@ BIND_PORT = _int_env("INSIGHTS_BIND_PORT", 8300, 1, 65535)
 AUTH_TOKEN = os.environ.get("INSIGHTS_AUTH_TOKEN", "")
 AUTH_COOKIE = "wechat_insights_token"
 
-# 每天固定时刻跑一轮增量分析，格式 HH:MM（容器本地时区）。
+# 每天跑分析的时刻，格式 HH:MM；逗号分隔可配多个时刻（容器本地时区），
+# 非法项丢弃，全部非法时回退 04:30。
 ANALYZE_TIME = os.environ.get("INSIGHTS_ANALYZE_TIME", "04:30")
 # 容器启动后如果从未成功分析过，立即补跑一轮（首轮全量回填）。
 RUN_ON_START = os.environ.get("INSIGHTS_RUN_ON_START", "true").lower() != "false"

@@ -88,26 +88,50 @@ def _history_sampling(row: ContactRow) -> dict:
     }
 
 
-def parse_analyze_time(value: str) -> tuple[int, int]:
-    """解析 HH:MM，非法值回退到 04:30。"""
+def _parse_hhmm(value: str) -> tuple[int, int] | None:
+    """解析单个 HH:MM，非法返回 None。"""
 
     try:
         hour, minute = value.split(":", 1)
         parsed = (int(hour), int(minute))
-    except (AttributeError, ValueError):
-        parsed = (4, 30)
+    except (TypeError, ValueError):
+        return None
     if not 0 <= parsed[0] < 24 or not 0 <= parsed[1] < 60:
-        return 4, 30
+        return None
     return parsed
 
 
-def next_run_at(now: float, hour: int, minute: int) -> float:
-    """下一个每日分析时刻的 Unix 秒（容器本地时区）。"""
+def parse_analyze_times(value: str) -> tuple[tuple[int, int], ...]:
+    """解析逗号分隔的 HH:MM 列表，非法项丢弃、去重升序；全非法回退 04:30。
 
+    返回值保证非空（至少 (4, 30)），调用方可以放心对时刻组直接取 min()。
+    用 str(value) 包一层是为了容忍非 str 输入，与旧实现行为一致。
+    """
+
+    valid = {
+        item
+        for raw in str(value).split(",")
+        if (item := _parse_hhmm(raw)) is not None
+    }
+    if not valid:
+        return ((4, 30),)
+    return tuple(sorted(valid))
+
+
+def next_run_at(now: float, times: tuple[tuple[int, int], ...]) -> float:
+    """下一个每日分析时刻的 Unix 秒（容器本地时区）。
+
+    times 必须非空，由 parse_analyze_times 保证；返回所有候选时刻里
+    此刻之后最早的那个。
+    """
+
+    candidates = []
     current = datetime.fromtimestamp(now)
-    target = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    stamp = target.timestamp()
-    return stamp if stamp > now else stamp + 86400
+    for hour, minute in times:
+        target = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        stamp = target.timestamp()
+        candidates.append(stamp if stamp > now else stamp + 86400)
+    return min(candidates)
 
 
 class InsightsRuntime:
@@ -118,7 +142,8 @@ class InsightsRuntime:
         self.analyzer_factory = analyzer_factory or (
             lambda progress_cb: Analyzer(store, progress_cb=progress_cb)
         )
-        self.hour, self.minute = parse_analyze_time(ANALYZE_TIME)
+        # 已去重升序的每日分析时刻，至少一项。
+        self.times = parse_analyze_times(ANALYZE_TIME)
         self.running = False
         self.last_error: dict[str, str] | None = None
         self.last_duration = 0.0
@@ -231,13 +256,20 @@ class InsightsRuntime:
             self.store.close()
 
     async def _schedule_loop(self) -> None:
+        # 多时刻调度语义：每次醒来只求「此刻之后最早的时刻」，跑完一轮后
+        # 重新求一次；一轮分析耗时超过时刻间隔、或失败后进入 900 秒重试
+        # 循环期间跨过的时刻直接跳过，不补跑、不排队——重试循环本身就是在
+        # 补这一轮，重试成功后回到常规节奏、从当前时间重新求最近时刻。
+        # RUN_ON_START 冷启动（last_analyzed_at() 为空）才立即跑；手动
+        # /api/refresh 与定时触发共用 analyze() 的 asyncio.Lock 防抖，多
+        # 时刻不改变这一行为。
         immediate = RUN_ON_START and self.last_analyzed_at() is None
         if immediate:
             LOG.info("尚无历史结果，启动后立即执行首轮全量回填")
         while True:
             if not immediate:
                 now = time.time()
-                self.next_run = next_run_at(now, self.hour, self.minute)
+                self.next_run = next_run_at(now, self.times)
                 await asyncio.sleep(max(1.0, self.next_run - now))
             immediate = False
             # 失败（多半是密钥过期）就按固定间隔重试，成功后回到每日节奏。

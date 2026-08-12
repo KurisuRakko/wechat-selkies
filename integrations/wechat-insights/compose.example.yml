@@ -66,7 +66,8 @@ services:
       - WECHAT_HISTORY_IDENTITY_TOKENS=${WECHAT_HISTORY_IDENTITY_TOKENS:?需要设置身份标记}
       # 容器本地时区决定「按天/深夜/周末」的切分，建议与你自己一致。
       - TZ=${TZ:-Asia/Shanghai}
-      # 每天固定时刻跑一轮增量分析（HH:MM）。
+      # 每天固定时刻跑一轮增量分析（HH:MM）；逗号分隔可配多个时刻，
+      # 如 04:30,12:30,20:30。
       - INSIGHTS_ANALYZE_TIME=${INSIGHTS_ANALYZE_TIME:-04:30}
       # ⚠️ 强烈建议设置：设置后所有请求（含静态资源）都需要
       #    Authorization: Bearer <token> 或 ?token=<token>。留空则只打印一条警告。
