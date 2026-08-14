@@ -100,5 +100,6 @@ PYTHONPATH="$root/opt/wechat-history/site-packages:$root/opt/wechat-history" \
     'import aiohttp, cryptography, http_ece, py_vapid, pywebpush, requests'
 grep -Fq 'wechatNotificationsInstalled' "$dashboard/src/wechat-notifications.js"
 grep -Fq 'pushsubscriptionchange' "$dashboard/wechat-notification-sw.js"
+grep -Fq 'wechat-notifications/api/raise' "$dashboard/wechat-notification-sw.js"
 
 echo "install-wechat-notifications: browser, nginx and s6 integration installed"

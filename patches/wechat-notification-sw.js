@@ -2,6 +2,7 @@
 "use strict";
 
 var API_SUBSCRIPTION = "/wechat-notifications/api/subscription";
+var API_RAISE = "/wechat-notifications/api/raise";
 
 function normalizePayload(event) {
   var payload = {};
@@ -49,23 +50,39 @@ self.addEventListener("push", function (event) {
   }()));
 });
 
+async function focusController(target) {
+  var windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+  for (var i = 0; i < windows.length; i += 1) {
+    if (isControllerUrl(windows[i].url) &&
+        new URL(windows[i].url).origin === new URL(target).origin) {
+      if ("navigate" in windows[i] && windows[i].url !== target) {
+        await windows[i].navigate(target);
+      }
+      return windows[i].focus();
+    }
+  }
+  return self.clients.openWindow(target);
+}
+
+function requestRaise(tag) {
+  return fetch(API_RAISE, {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ tag: String(tag || "") })
+  }).catch(function (error) {
+    console.warn("[wechat-notifications] window raise request failed", error);
+  });
+}
+
 self.addEventListener("notificationclick", function (event) {
   event.notification.close();
   var target = event.notification.data && event.notification.data.url ?
     event.notification.data.url : self.registration.scope;
-  event.waitUntil((async function () {
-    var windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
-    for (var i = 0; i < windows.length; i += 1) {
-      if (isControllerUrl(windows[i].url) &&
-          new URL(windows[i].url).origin === new URL(target).origin) {
-        if ("navigate" in windows[i] && windows[i].url !== target) {
-          await windows[i].navigate(target);
-        }
-        return windows[i].focus();
-      }
-    }
-    return self.clients.openWindow(target);
-  }()));
+  event.waitUntil(Promise.all([
+    focusController(target),
+    requestRaise(event.notification.tag)
+  ]));
 });
 
 self.addEventListener("pushsubscriptionchange", function (event) {
