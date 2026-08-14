@@ -181,3 +181,42 @@ def sample_transcript(
         if total >= max_chars:
             break
     return None if not blocks else "\n\n".join(blocks)
+
+
+def sample_transcript_between(
+    reader: HistoryReader,
+    session_id: str,
+    display_name: str,
+    start_ts: int,
+    end_ts: int,
+    gap_seconds: int,
+    max_chars: int,
+) -> str | None:
+    """从 [start_ts, end_ts] 窗口开头往前拼对话文本；没有 text 返回 None。
+
+    与 sample_transcript 方向相反：那里从最晚往回取「最近的对话」，这里按
+    时间正序取「窗口开头的对话」——绝交核实要看的吵架通常发生在标记日
+    之前的窗口前半段，最新消息反而可能是争吵之后的冷场，正序采样才能
+    把冲突送进样本。窗口内消息超过一个批次时只覆盖最旧的那一批。
+    """
+
+    batch = read_messages_after(
+        reader,
+        session_id,
+        display_name,
+        {},
+        Cursor(start_ts, "", -1),
+        BACKFILL_BATCH,
+    )
+    messages = [message for message in batch.messages if message.timestamp <= end_ts]
+    blocks: list[str] = []
+    total = 0
+    for conversation in split_conversations(messages, gap_seconds):
+        lines = transcript_lines(conversation)
+        if not lines:
+            continue
+        blocks.append("\n".join(lines))
+        total += sum(len(line) for line in lines)
+        if total >= max_chars:
+            break
+    return None if not blocks else "\n\n".join(blocks)

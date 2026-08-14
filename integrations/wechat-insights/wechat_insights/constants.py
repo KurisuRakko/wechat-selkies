@@ -172,6 +172,21 @@ CALIBRATE_TOTAL_MAX = 12.0
 # LLM 不可用或调用失败时的确定性回退：全维统一偏移这个幅度。
 CALIBRATE_FALLBACK_STEP = 3.0
 
+# —— 绝交检测（右键标记 → 下一轮分析核实）——
+# 单轮最多核实多少个绝交标记。
+BREAKUP_MAX_PER_RUN = _int_env("INSIGHTS_BREAKUP_MAX_PER_RUN", 10, 1, 100)
+# 送 LLM 的采样窗口：标记日前后各这么多天。
+BREAKUP_WINDOW_DAYS = 7
+# 一次核实采样最多送出的聊天总字数。
+BREAKUP_SAMPLE_CHARS = _int_env("INSIGHTS_BREAKUP_SAMPLE_CHARS", 3000, 500, 10000)
+# 冷断判定：标记日之后双方消息合计不超过这么多条……
+BREAKUP_SILENCE_MAX_MSGS = 5
+# ……且标记日距今至少这么多天，才够格判「冷断」。
+BREAKUP_MIN_ELAPSED_DAYS = 14
+# 确认绝交后的综合分封顶：「已经绝交」/「我认为的绝交」。
+BREAKUP_CAP_CERTAIN = 10.0
+BREAKUP_CAP_SUSPECTED = 20.0
+
 # —— 增量读取 ——
 # 单批读取的消息条数上限；首轮回填靠多批循环推进。
 BACKFILL_BATCH = _int_env("INSIGHTS_BACKFILL_BATCH", 5000, 100, 200000)

@@ -59,3 +59,63 @@
   color: var(--md-primary);
   background: rgba(21, 101, 192, 0.06);
 }
+
+/* 绝交角标：排队中用禁用灰底（同 calibration pending 风格），
+   核实结论用错误红——浅色主题 #B00020、深色主题 #CF6679（即
+   --md-error 两套值），底色用对应 8% 透明度 */
+.chip--breakup-pending {
+  border-color: var(--md-divider);
+  color: var(--md-on-surface-disabled);
+  background: var(--md-state-hover);
+}
+
+.chip--breakup {
+  border-color: var(--md-error);
+  color: var(--md-error);
+  background: rgba(176, 0, 32, 0.08);
+}
+
+@media (prefers-color-scheme: dark) {
+  .chip--breakup {
+    background: rgba(207, 102, 121, 0.08);
+  }
+}
+
+/* 绝交日期弹窗：复用 dialog-scrim / dialog 的框架，只补 MD2 dialog 的
+   动作按钮行与日期输入框样式 */
+.dialog__actions {
+  flex: none;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 0 16px 16px;
+}
+
+.dialog__btn {
+  border: none;
+  background: none;
+  padding: 10px 16px;
+  border-radius: 4px;
+  font-family: var(--md-font, "Noto Sans SC", sans-serif);
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  color: var(--md-primary);
+  cursor: pointer;
+}
+
+.dialog__btn:hover {
+  background: var(--md-state-hover, rgba(0, 0, 0, 0.06));
+}
+
+.date-dialog__input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px 12px;
+  border: 1px solid var(--md-divider);
+  border-radius: 4px;
+  background: var(--md-surface-1);
+  color: var(--md-on-surface);
+  font-family: var(--md-font, "Noto Sans SC", sans-serif);
+  font-size: 15px;
+}

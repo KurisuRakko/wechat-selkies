@@ -69,6 +69,29 @@
       });
   }
 
+  function postBreakup(action, date, certainty) {
+    var body = { action: action, date: date, certainty: certainty };
+    if (action !== "mark") {
+      body = { action: action };
+    }
+    I.apiPost("/api/contact/" + encodeURIComponent(current.hash) + "/breakup", body)
+      .then(function (result) {
+        if (action === "clear") {
+          // 清除是即时的：服务端已按 base 快照还原分数，重拉详情页。
+          load();
+          I.snackbar("已清除");
+          return;
+        }
+        if (result.data && result.data.pending) {
+          load();
+          I.snackbar("已标记，下一轮分析核实");
+        }
+      })
+      .catch(function (err) {
+        I.snackbar((err && err.message) || "标记失败");
+      });
+  }
+
   function feedbackItems() {
     var items = [
       {
@@ -95,6 +118,23 @@
           markFeedback("clear");
         }
       });
+    }
+    // 绝交标记：两种置信度都要先选日期，核实排队中或已有结论时提供清除。
+    function pushBreakupItem(label, hint, certainty) {
+      items.push({
+        label: label,
+        hint: hint,
+        onClick: function () {
+          I.openDateDialog("你们是什么时候绝交的？", function (date) {
+            postBreakup("mark", date, certainty);
+          });
+        }
+      });
+    }
+    pushBreakupItem("已经绝交…", "输入日期，下轮核实", "certain");
+    pushBreakupItem("我认为的绝交…", "存疑标记，AI 复核", "suspected");
+    if (current.breakup || current.breakup_pending) {
+      items.push({ label: "清除绝交标记", onClick: function () { postBreakup("clear"); } });
     }
     return items;
   }
@@ -376,6 +416,7 @@
       '<span class="contact-meta">' +
       I.kindBadgeHtml(contact.relation_kind) +
       I.calibrationChipHtml(contact) +
+      I.breakupChipHtml(contact) +
       "<span>" +
       I.escapeHtml(metaText) +
       "</span>" +

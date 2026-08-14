@@ -38,6 +38,10 @@ _EXTRA_COLUMNS = (
             "feedback_pending",
             "feedback_pending_at",
             "calibration",
+            # 绝交检测两列：与上面三列同理，补列不 bump SCHEMA_VERSION，
+            # 旧库整体重建会弄丢联系人游标与里程碑。
+            "breakup_pending",
+            "breakup",
         ),
     ),
     # llm_period 补列之前写下的行没有模型名，读回空串 = 模型未知；换模型
