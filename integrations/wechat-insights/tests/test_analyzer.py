@@ -756,6 +756,17 @@ class BreakupAnalysisTests(AnalyzerTestCase):
             ),
         )
 
+    def mark_unknown(self, certainty: str) -> None:
+        self.store.ensure_contact(SESSION_ID, DISPLAY_NAME)
+        self.store.set_contact_breakup_pending(
+            SESSION_ID,
+            json.dumps(
+                {"date": None, "certainty": certainty, "at": NOW},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
+
     def test_marked_contact_is_capped_on_next_round(self) -> None:
         self.seed_two_contacts()
         self.run_round()
@@ -795,6 +806,22 @@ class BreakupAnalysisTests(AnalyzerTestCase):
         # 温度历史曲线只记封顶前的客观值：绝交只影响展示，不改客观轨迹。
         self.assertEqual(rows[-1][1], base_overall)
 
+    def test_unknown_mark_with_insufficient_elapsed_time_yields_unknown_verdict(
+        self,
+    ) -> None:
+        self.seed_two_contacts()
+        self.run_round()
+        # 标记「不知道」；moment=BASE+10 天天然满足「距今不足 14 天」，
+        # 唯一候选日（消息集中的那一天）过不了 elapsed 门槛，推算不出
+        # 候选，同一轮内直接落终态失败，不会排到 refresh_breakups 那一步。
+        self.mark_unknown("certain")
+        result = self.run_round()
+        self.assertEqual(result.breakup_guesses, 1)
+        self.assertEqual(result.breakups, 0)
+        payload = self.store.score_by_hash(contact_hash(SESSION_ID))
+        self.assertEqual(payload["breakup"]["verdict"], "unknown")
+        self.assertNotIn("breakup_pending", payload)
+
 
 class ProgressTests(AnalyzerTestCase):
     """进度上报：阶段顺序、计数递增，以及 cb 异常绝不影响分析本身。"""
@@ -819,12 +846,15 @@ class ProgressTests(AnalyzerTestCase):
         build_database(self.database, [them(1, 0), me(2, 60)])
         _, events = self.run_with_progress(now=NOW)
         # 阶段顺序：sync（起点 + 1 个会话）→ calibrate（本数据无标记，只发
+        # 起点 0/0）→ breakup_guess（绝交日期推算，本数据无标记，只发
         # 起点 0/0）→ breakup（绝交核实，本数据无标记，只发起点 0/0）→
         # score → history（全史回放网格，起点 + 每 7 天一个点）。
         grid = backfill_grid(day_key(BASE), day_key(NOW))
         phases = [event["phase"] for event in events]
-        self.assertEqual(phases[:4], ["sync", "sync", "calibrate", "breakup"])
-        self.assertEqual(phases[4:], ["score"] + ["history"] * (len(grid) + 1))
+        self.assertEqual(
+            phases[:5], ["sync", "sync", "calibrate", "breakup_guess", "breakup"]
+        )
+        self.assertEqual(phases[5:], ["score"] + ["history"] * (len(grid) + 1))
         # sync 起点：total=会话数、done=0；随后每个会话前上报一次 display_name。
         self.assertEqual(events[0], {"phase": "sync", "done": 0, "total": 1, "detail": ""})
         self.assertEqual(
@@ -836,13 +866,18 @@ class ProgressTests(AnalyzerTestCase):
             events[2],
             {"phase": "calibrate", "done": 0, "total": 0, "detail": ""},
         )
-        # breakup 阶段同样没有候选：只发起点 0/0。
+        # breakup_guess 阶段同样没有候选：只发起点 0/0。
         self.assertEqual(
             events[3],
+            {"phase": "breakup_guess", "done": 0, "total": 0, "detail": ""},
+        )
+        # breakup 阶段同样没有候选：只发起点 0/0。
+        self.assertEqual(
+            events[4],
             {"phase": "breakup", "done": 0, "total": 0, "detail": ""},
         )
         # score 阶段没有逐项计数：total=0。
-        self.assertEqual(events[4], {"phase": "score", "done": 0, "total": 0, "detail": ""})
+        self.assertEqual(events[5], {"phase": "score", "done": 0, "total": 0, "detail": ""})
         # history 起点 total=网格点数，随后逐点上报日期。
         history = [event for event in events if event["phase"] == "history"]
         self.assertEqual(
@@ -889,8 +924,9 @@ class ProgressTests(AnalyzerTestCase):
         phases = [event["phase"] for event in events]
         # 阶段顺序：sync（起点 + 3 个会话）→ llm（起点 + 2 个候选）→
         # period（时段评分，本数据无候选，只发起点 0/0）→ calibrate（好感度
-        # 校准，本数据无标记，只发起点 0/0）→ breakup（绝交核实，本数据无
-        # 标记，只发起点 0/0）→ score → history（全史回放网格）。
+        # 校准，本数据无标记，只发起点 0/0）→ breakup_guess（绝交日期推算，
+        # 本数据无标记，只发起点 0/0）→ breakup（绝交核实，本数据无标记，
+        # 只发起点 0/0）→ score → history（全史回放网格）。
         grid = backfill_grid(day_key(BASE), day_key(NOW))
         self.assertEqual(
             phases,
@@ -898,6 +934,7 @@ class ProgressTests(AnalyzerTestCase):
             + ["llm"] * 3
             + ["period"]
             + ["calibrate"]
+            + ["breakup_guess"]
             + ["breakup"]
             + ["score"]
             + ["history"] * (len(grid) + 1),

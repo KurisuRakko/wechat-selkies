@@ -132,8 +132,12 @@ llm 策略下还会有一段大模型写的年度总结，文案缓存在 `metri
 ## 绝交标记
 
 右键联系人卡片（详情页在页头右键）可以标记「已经绝交…」或「我认为的绝交…」，两者
-都会弹出一个日期选择框（不能选未来日期）。标记本身不立即改分，而是记进联系人行，
-下一轮分析核实：
+都会弹出一个日期选择框（不能选未来日期），弹窗里还有第三个选项「不知道」：选了它，
+下一轮分析会先从消息统计里找往来断崖推算候选日期，再走跟具体日期完全一样的核实
+流程；推算不出候选就显示灰色「日期不明」角标，不影响分数，用户可以清除，也可以
+手动选一个具体日期重新标记。
+
+标记本身不立即改分，而是记进联系人行，下一轮分析核实：
 
 - **已经绝交（certain）**：用户确信已经绝交。核实优先级：AI 从标记日前后各 7 天
   的聊天采样里判出「吵架决裂」→ 确认；否则统计判定「冷断」（标记日之后双方消息
@@ -159,6 +163,9 @@ llm 策略下还会有一段大模型写的年度总结，文案缓存在 `metri
 | --- | --- | --- |
 | `INSIGHTS_BREAKUP_MAX_PER_RUN` | `10` | 单轮绝交核实最多处理的标记数（1–100） |
 | `INSIGHTS_BREAKUP_SAMPLE_CHARS` | `3000` | 绝交核实 LLM 一次采样送出的字数上限（500–10000） |
+| `INSIGHTS_BREAKUP_CANDIDATE_TRAILING_DAYS` | `60` | 候选断点前的观察窗口天数（7–365） |
+| `INSIGHTS_BREAKUP_CANDIDATE_MIN_TRAILING_MSGS` | `20` | 窗口内至少要有这么多条消息才算真的聊得起来（1–100000） |
+| `INSIGHTS_BREAKUP_GUESS_MAX_PER_RUN` | `50` | 单轮最多推算多少个「不知道」标记（1–500） |
 
 ## 近期异动角标
 
@@ -399,6 +406,9 @@ tmpfs 的大小直接决定明文缓存的写满点：缓存数据量达到 `siz
 | `INSIGHTS_CALIBRATE_SAMPLE_CHARS` | `2000` | 校准 LLM 一次采样送出的字数上限（500–10000） |
 | `INSIGHTS_BREAKUP_MAX_PER_RUN` | `10` | 单轮绝交核实最多处理的标记数（1–100） |
 | `INSIGHTS_BREAKUP_SAMPLE_CHARS` | `3000` | 绝交核实 LLM 一次采样送出的字数上限（500–10000） |
+| `INSIGHTS_BREAKUP_CANDIDATE_TRAILING_DAYS` | `60` | 候选断点前的观察窗口天数（7–365） |
+| `INSIGHTS_BREAKUP_CANDIDATE_MIN_TRAILING_MSGS` | `20` | 窗口内至少要有这么多条消息才算真的聊得起来（1–100000） |
+| `INSIGHTS_BREAKUP_GUESS_MAX_PER_RUN` | `50` | 单轮最多推算多少个「不知道」标记（1–500） |
 | `TZ` | 容器默认 | 决定「按天 / 深夜 / 周末」的切分，建议设成你自己的时区 |
 
 身份三变量（`WECHAT_HISTORY_ACCOUNT_DIR`、`WECHAT_HISTORY_USERNAME`、

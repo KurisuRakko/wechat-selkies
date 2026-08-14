@@ -266,17 +266,26 @@
   };
 
   /**
-   * 绝交角标：三态展示——排队中（灰）、核实确认（错误红，带压低的分数）、
-   * 核实否决（「绝交存疑」）。所有插值过 escapeHtml，包括大模型给的 note。
+   * 绝交角标：四态展示——日期待推算（灰）、核实排队中（灰）、核实确认
+   * （错误红，带压低的分数）、核实否决（「绝交存疑」）、推算彻底失败
+   * （「日期不明」）。所有插值过 escapeHtml，包括大模型给的 note。
    */
   function breakupChipHtml(payload) {
     if (!payload) {
       return "";
     }
     if (payload.breakup_pending) {
+      // date 为 null：标记是「不知道」，还没轮到 guess_breakup_dates
+      // 推算候选；有具体日期才是真正排队等 LLM/统计核实。
+      var awaitingGuess = payload.breakup_pending.date == null;
       return (
-        '<span class="chip chip--small chip--breakup-pending" ' +
-        'title="绝交核实排队中，下一轮分析处理">绝交核实中</span>'
+        '<span class="chip chip--small chip--breakup-pending" title="' +
+        (awaitingGuess
+          ? "日期待推算，下一轮分析处理"
+          : "绝交核实排队中，下一轮分析处理") +
+        '">' +
+        (awaitingGuess ? "推算日期中" : "绝交核实中") +
+        "</span>"
       );
     }
     var breakup = payload.breakup;
@@ -291,6 +300,9 @@
       if (breakup.note) {
         tip += "：" + String(breakup.note);
       }
+      if (breakup.date_source === "guessed") {
+        tip += "（系统推算日期）";
+      }
       return (
         '<span class="chip chip--small chip--breakup" title="' +
         escapeHtml(tip) +
@@ -304,6 +316,14 @@
         '<span class="chip chip--small chip--breakup" title="' +
         escapeHtml("AI 复核未确认：" + String(breakup.note || "")) +
         '">绝交存疑</span>'
+      );
+    }
+    if (breakup.verdict === "unknown") {
+      // 推算彻底失败的终态：中性展示，不是坏消息，只是「猜不出来」。
+      return (
+        '<span class="chip chip--small chip--breakup-unknown" title="' +
+        escapeHtml(String(breakup.note || "")) +
+        '">日期不明</span>'
       );
     }
     return "";
@@ -754,6 +774,7 @@
         '" />' +
         "</div>" +
         '<div class="dialog__actions">' +
+        '<button class="dialog__btn dialog__btn--unknown" type="button">不知道</button>' +
         '<button class="dialog__btn" type="button">取消</button>' +
         '<button class="dialog__btn dialog__btn--confirm" type="button">确定</button>' +
         "</div>" +
@@ -768,8 +789,12 @@
       dateDialogEl
         .querySelector(".dialog__close")
         .addEventListener("click", closeDateDialog);
+      // 「取消」是唯一不带修饰类的按钮：三个按钮加入后必须都排除掉才
+      // 能精确命中它，不然会被排在它前面的「不知道」抢先匹配。
       dateDialogEl
-        .querySelector(".dialog__btn:not(.dialog__btn--confirm)")
+        .querySelector(
+          ".dialog__btn:not(.dialog__btn--confirm):not(.dialog__btn--unknown)"
+        )
         .addEventListener("click", closeDateDialog);
       dateDialogEl
         .querySelector(".dialog__btn--confirm")
@@ -784,6 +809,17 @@
           closeDateDialog();
           if (callback) {
             callback(value);
+          }
+        });
+      // 「不知道」不校验、不判空，直接回调 null：候选日期留给下一轮分析
+      // 的 guess_breakup_dates 去推算。
+      dateDialogEl
+        .querySelector(".dialog__btn--unknown")
+        .addEventListener("click", function () {
+          var callback = dateDialogSubmit;
+          closeDateDialog();
+          if (callback) {
+            callback(null);
           }
         });
     }

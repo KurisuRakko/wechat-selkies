@@ -172,7 +172,7 @@ CALIBRATE_TOTAL_MAX = 12.0
 # LLM 不可用或调用失败时的确定性回退：全维统一偏移这个幅度。
 CALIBRATE_FALLBACK_STEP = 3.0
 
-# —— 绝交检测（右键标记 → 下一轮分析核实）——
+# —— 绝交检测（右键标记 → 下一轮分析核实；"不知道" 先推算候选日期）——
 # 单轮最多核实多少个绝交标记。
 BREAKUP_MAX_PER_RUN = _int_env("INSIGHTS_BREAKUP_MAX_PER_RUN", 10, 1, 100)
 # 送 LLM 的采样窗口：标记日前后各这么多天。
@@ -186,6 +186,22 @@ BREAKUP_MIN_ELAPSED_DAYS = 14
 # 确认绝交后的综合分封顶：「已经绝交」/「我认为的绝交」。
 BREAKUP_CAP_CERTAIN = 10.0
 BREAKUP_CAP_SUSPECTED = 20.0
+
+# 日期不知道时的候选推算：从 stats_daily 找「活跃度断崖」——断崖前
+# TRAILING_DAYS 天内消息量过 MIN_TRAILING_MSGS（证明关系有分量，排除
+# 本来就稀疏的联系人），断崖后消息量回落到 BREAKUP_SILENCE_MAX_MSGS
+# 以下且过了 BREAKUP_MIN_ELAPSED_DAYS（与冷断判定同一把尺子）。
+BREAKUP_CANDIDATE_TRAILING_DAYS = _int_env(
+    "INSIGHTS_BREAKUP_CANDIDATE_TRAILING_DAYS", 60, 7, 365
+)
+# 60 天窗口内至少要有这么多条消息，才算「本来聊得起来」；20/60 天≈
+# 3 天一条，只挡掉真正偶尔联系的泛泛之交。
+BREAKUP_CANDIDATE_MIN_TRAILING_MSGS = _int_env(
+    "INSIGHTS_BREAKUP_CANDIDATE_MIN_TRAILING_MSGS", 20, 1, 100000
+)
+# 单轮最多推算多少个「不知道」标记：纯统计计算、不调 LLM，预算比
+# 上面核实用的 BREAKUP_MAX_PER_RUN 宽松得多。
+BREAKUP_GUESS_MAX_PER_RUN = _int_env("INSIGHTS_BREAKUP_GUESS_MAX_PER_RUN", 50, 1, 500)
 
 # —— 增量读取 ——
 # 单批读取的消息条数上限；首轮回填靠多批循环推进。

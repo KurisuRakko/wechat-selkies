@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta
+from unittest.mock import patch
 
 from tests.server_support import ApiTestCase, HASH, SESSION_ID
 
@@ -119,7 +120,10 @@ class BreakupApiTests(ApiTestCase):
         )
 
     async def test_contact_breakup_rejects_bad_and_future_dates(self) -> None:
-        for bad in ("2020/01/01", "not-a-date", "2020-13-40", "", None):
+        # None 不在这个坏值列表里：它是"不知道"的合法取值（见
+        # test_contact_breakup_mark_unknown_skips_date_format_and_future_checks），
+        # 这里只测格式不对的具体日期字符串。
+        for bad in ("2020/01/01", "not-a-date", "2020-13-40", ""):
             response = await self.client.post(
                 f"/api/contact/{HASH}/breakup",
                 json={"action": "mark", "date": bad, "certainty": "certain"},
@@ -147,6 +151,92 @@ class BreakupApiTests(ApiTestCase):
                 )
             ).status,
             404,
+        )
+
+    async def test_contact_breakup_mark_unknown_writes_null_date_pending(self) -> None:
+        response = await self.client.post(
+            f"/api/contact/{HASH}/breakup",
+            json={"action": "mark", "date": None, "certainty": "certain"},
+        )
+        self.assertEqual(response.status, 200)
+        body = await response.json()
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["pending"], {"date": None, "certainty": "certain"})
+        pending = self.store.get_contact(SESSION_ID).breakup_pending_data()
+        self.assertIsNone(pending["date"])
+        self.assertEqual(pending["certainty"], "certain")
+        self.assertIsInstance(pending["at"], int)
+        stored = self.store.score_by_hash(HASH)
+        self.assertIsNone(stored["breakup_pending"]["date"])
+
+    async def test_contact_breakup_mark_missing_date_key_is_treated_as_unknown(
+        self,
+    ) -> None:
+        # 不传 date 键与显式传 null 效果相同：body.get("date") 两种情况都是 None。
+        response = await self.client.post(
+            f"/api/contact/{HASH}/breakup",
+            json={"action": "mark", "certainty": "suspected"},
+        )
+        self.assertEqual(response.status, 200)
+        body = await response.json()
+        self.assertEqual(body["pending"], {"date": None, "certainty": "suspected"})
+
+    async def test_contact_breakup_mark_unknown_skips_date_format_and_future_checks(
+        self,
+    ) -> None:
+        # date=null 跳过整段格式/未来日期校验：换成任何具体坏值都会 400
+        # （见 test_contact_breakup_rejects_bad_and_future_dates），但 null
+        # 意味着"不知道"，没有值可校验。
+        response = await self.client.post(
+            f"/api/contact/{HASH}/breakup",
+            json={"action": "mark", "date": None, "certainty": "certain"},
+        )
+        self.assertEqual(response.status, 200)
+
+    async def test_contact_breakup_mark_unknown_still_validates_certainty(
+        self,
+    ) -> None:
+        response = await self.client.post(
+            f"/api/contact/{HASH}/breakup",
+            json={"action": "mark", "date": None, "certainty": "maybe"},
+        )
+        self.assertEqual(response.status, 400)
+        body = await response.json()
+        self.assertEqual(body["error"]["message"], "certainty 取值非法")
+
+    async def test_contact_breakup_mark_unknown_does_not_call_llm(self) -> None:
+        # 标记接口本身完全不接触 LLM：候选推算要等下一轮分析才跑。
+        with patch(
+            "wechat_insights.llm.chat", side_effect=AssertionError("不应调用 LLM")
+        ):
+            response = await self.client.post(
+                f"/api/contact/{HASH}/breakup",
+                json={"action": "mark", "date": None, "certainty": "certain"},
+            )
+        self.assertEqual(response.status, 200)
+
+    async def test_contact_breakup_remark_unknown_pulls_down_old_conclusion(
+        self,
+    ) -> None:
+        # 重新标记「不知道」同样要撤下旧结论，与具体日期的重新标记一致。
+        self.store.set_contact_breakup(SESSION_ID, json.dumps(BREAKUP_VERDICT))
+        stored = self.store.score_by_hash(HASH)
+        stored["breakup"] = {
+            **BREAKUP_VERDICT,
+            "overall_delta": -63.4,
+            "base": {"overall": 73.4, "dimensions": dict(stored["dimensions"])},
+        }
+        self.store.update_score_payload(SESSION_ID, stored)
+        response = await self.client.post(
+            f"/api/contact/{HASH}/breakup",
+            json={"action": "mark", "date": None, "certainty": "suspected"},
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(self.store.get_contact(SESSION_ID).breakup, "")
+        after = self.store.score_by_hash(HASH)
+        self.assertNotIn("breakup", after)
+        self.assertEqual(
+            after["breakup_pending"], {"date": None, "certainty": "suspected"}
         )
 
     # 绝交截断：只有 confirmed 结论才在 detail 下发时截断曲线，且只在真的
@@ -180,7 +270,12 @@ class BreakupApiTests(ApiTestCase):
         )
         self.assertEqual(
             body["history_cutoff"],
-            {"day": "2026-03-09", "kind": "quarrel", "certainty": "certain"},
+            {
+                "day": "2026-03-09",
+                "kind": "quarrel",
+                "certainty": "certain",
+                "date_source": "user",
+            },
         )
 
     async def test_detail_cutoff_none_when_verdict_is_rejected(self) -> None:
@@ -250,3 +345,68 @@ class BreakupApiTests(ApiTestCase):
         body = await (await self.client.get(f"/api/contact/{HASH}")).json()
         self.assertEqual(len(body["history"]), 2)
         self.assertEqual(self.store.load_score_history(SESSION_ID), before)
+
+    async def test_detail_reports_unknown_verdict_without_truncating_history(
+        self,
+    ) -> None:
+        # "unknown" 终态与 rejected 一样不是 confirmed，detail 接口的截断
+        # 只认 confirmed，曲线照常完整下发。
+        self._record_history(("2026-03-08", 70.5), ("2026-03-09", 68.0))
+        self.store.set_contact_breakup(
+            SESSION_ID,
+            json.dumps(
+                {
+                    "verdict": "unknown",
+                    "kind": "",
+                    "date": None,
+                    "certainty": "certain",
+                    "note": "聊天记录里找不到明显的往来断崖",
+                    "decided_at": 1700000001,
+                    "source": "guess_failed",
+                }
+            ),
+        )
+        body = await (await self.client.get(f"/api/contact/{HASH}")).json()
+        self.assertEqual(len(body["history"]), 2)
+        self.assertIsNone(body["history_cutoff"])
+
+    async def test_detail_reports_guessed_date_source_on_confirmed_breakup(
+        self,
+    ) -> None:
+        # 推算出来的日期核实确认后，date_source 要能在详情接口的两处
+        # （结论本身与曲线截断信息）都透传给前端。
+        self._record_history(
+            ("2026-03-08", 70.5), ("2026-03-09", 68.0), ("2026-03-10", 66.0)
+        )
+        self.store.set_contact_breakup(
+            SESSION_ID,
+            json.dumps(
+                {**BREAKUP_VERDICT, "date": "2026-03-09", "date_source": "guessed"}
+            ),
+        )
+        stored = self.store.score_by_hash(HASH)
+        stored["breakup"] = {
+            "verdict": "confirmed",
+            "kind": "quarrel",
+            "date": "2026-03-09",
+            "certainty": "certain",
+            "note": None,
+            "overall_delta": -63.4,
+            "base": {"overall": 73.4, "dimensions": dict(stored["dimensions"])},
+            "date_source": "guessed",
+        }
+        self.store.update_score_payload(SESSION_ID, stored)
+        body = await (await self.client.get(f"/api/contact/{HASH}")).json()
+        self.assertEqual(body["contact"]["breakup"]["date_source"], "guessed")
+        self.assertEqual(body["history_cutoff"]["date_source"], "guessed")
+
+    async def test_contact_list_surfaces_awaiting_guess_pending(self) -> None:
+        # 列表接口原样透传 payload：date=null 的"待推算"标记要能端到端
+        # 经过 JSON 序列化/反序列化不变形，前端据此区分"推算中"三态。
+        stored = self.store.score_by_hash(HASH)
+        stored["breakup_pending"] = {"date": None, "certainty": "certain"}
+        self.store.update_score_payload(SESSION_ID, stored)
+        body = await (await self.client.get("/api/contacts")).json()
+        item = body["items"][0]
+        self.assertIsNone(item["breakup_pending"]["date"])
+        self.assertEqual(item["breakup_pending"]["certainty"], "certain")

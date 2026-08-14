@@ -81,6 +81,14 @@
   }
 }
 
+/* 「日期不明」角标：推算彻底失败的终态，用与 pending 相同的中性
+   灰底——这不是坏消息，只是「猜不出来」，不该用错误红。 */
+.chip--breakup-unknown {
+  border-color: var(--md-divider);
+  color: var(--md-on-surface-disabled);
+  background: var(--md-state-hover);
+}
+
 /* 绝交日期弹窗：复用 dialog-scrim / dialog 的框架，只补 MD2 dialog 的
    动作按钮行与日期输入框样式 */
 .dialog__actions {
@@ -106,6 +114,12 @@
 
 .dialog__btn:hover {
   background: var(--md-state-hover, rgba(0, 0, 0, 0.06));
+}
+
+/* 「不知道」是中性/次要动作，与取消/确定的按钮组左右分开——
+   MD2 dialog 里 neutral action 与 positive/negative 分离的惯例。 */
+.dialog__btn--unknown {
+  margin-right: auto;
 }
 
 .date-dialog__input {

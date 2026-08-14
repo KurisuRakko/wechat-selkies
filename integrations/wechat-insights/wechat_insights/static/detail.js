@@ -69,7 +69,12 @@
         }
         if (result.data && result.data.pending) {
           load();
-          I.snackbar("已标记，下一轮分析核实");
+          var pending = result.data.pending;
+          I.snackbar(
+            pending.date == null
+              ? "已标记，下一轮分析会先推算日期再核实"
+              : "已标记，下一轮分析核实"
+          );
         }
       })
       .catch(function (err) {
@@ -457,6 +462,9 @@
       if (cutoff) {
         // 绝交日之后的点照常计算但不下发，副标题注明曲线止于当天。
         tempSubtitle += " · 止于绝交 " + cutoff.day;
+        if (cutoff.date_source === "guessed") {
+          tempSubtitle += "（推算）";
+        }
       }
     }
 

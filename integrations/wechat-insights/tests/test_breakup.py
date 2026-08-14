@@ -12,6 +12,8 @@ from unittest.mock import patch
 
 from wechat_insights.analyzer import Analyzer
 from wechat_insights.breakup import (
+    find_breakup_candidate,
+    guess_breakup_dates,
     messages_after,
     parse_reply,
     refresh_breakups,
@@ -27,6 +29,7 @@ from wechat_insights.storage import contact_hash
 
 from tests.support import (
     AnalyzerTestCase,
+    BASE,
     DISPLAY_NAME,
     NOW,
     SESSION_ID,
@@ -113,6 +116,223 @@ class MessagesAfterTests(AnalyzerTestCase):
         self.assertEqual(messages_after(self.store, SESSION_ID, "2026-03-01"), 9)
         self.assertEqual(messages_after(self.store, SESSION_ID, "2026-03-02"), 3)
         self.assertEqual(messages_after(self.store, SESSION_ID, "2026-03-03"), 0)
+
+
+class FindBreakupCandidateTests(AnalyzerTestCase):
+    """候选推算的三个条件与「取最早满足者」在各种活跃度形状下的行为。"""
+
+    def test_no_active_days_returns_none(self) -> None:
+        self.assertIsNone(find_breakup_candidate(self.store, SESSION_ID, NOW))
+
+    def test_clear_cliff_returns_the_last_active_day_before_silence(self) -> None:
+        # 有分量的一次往来（25 条）之后 30 天又聊了 6 条（超过 5 条容忍度，
+        # 前一次不会被误判为断点），然后彻底沉默；moment 距最后一次往来
+        # 20 天，够格判「冷断」。
+        self.seed_messages(
+            SESSION_ID, DISPLAY_NAME, {BASE: 25, BASE + 30 * 86400: 6}
+        )
+        moment = BASE + 30 * 86400 + 20 * 86400
+        candidate = find_breakup_candidate(self.store, SESSION_ID, moment)
+        self.assertEqual(candidate, day_key(BASE + 30 * 86400))
+
+    def test_sparse_contact_without_a_real_relationship_returns_none(self) -> None:
+        # 长期零星联系，60 天窗口内从未凑够 20 条：末尾沉默也不算数——
+        # 从来没有真正熟络过，不是「断崖」。
+        days = {BASE + offset * 20 * 86400: 2 for offset in range(6)}
+        self.seed_messages(SESSION_ID, DISPLAY_NAME, days)
+        moment = BASE + 100 * 86400 + 20 * 86400
+        self.assertIsNone(find_breakup_candidate(self.store, SESSION_ID, moment))
+
+    def test_gradual_decay_without_a_breakpoint_returns_none(self) -> None:
+        # 消息量逐月递减到很低但从未清零，一直延续到 moment 附近：递减
+        # 尾部随时都还有零星消息，没有真正的断点。
+        counts = [15, 14, 13, 12, 11, 10, 9, 8, 7, 6]
+        days = {
+            BASE + month * 30 * 86400: count for month, count in enumerate(counts)
+        }
+        self.seed_messages(SESSION_ID, DISPLAY_NAME, days)
+        last_ts = BASE + (len(counts) - 1) * 30 * 86400
+        moment = last_ts + 5 * 86400  # 距最后一条消息只有 5 天，够不上冷断。
+        self.assertIsNone(find_breakup_candidate(self.store, SESSION_ID, moment))
+
+    def test_temporary_gap_that_later_resumed_is_not_picked(self) -> None:
+        # 第一段往来（0/10/20 天，各 10 条）之后空了 70 天——单独看已经
+        # 满足冷断两条件——但随后恢复聊天（90/100/110 天，各 10 条）又
+        # 彻底沉默。候选必须是恢复期的最后一天，不是假空窗前那天。
+        self.seed_messages(
+            SESSION_ID,
+            DISPLAY_NAME,
+            {
+                BASE: 10,
+                BASE + 10 * 86400: 10,
+                BASE + 20 * 86400: 10,
+                BASE + 90 * 86400: 10,
+                BASE + 100 * 86400: 10,
+                BASE + 110 * 86400: 10,
+            },
+        )
+        moment = BASE + 110 * 86400 + 20 * 86400
+        candidate = find_breakup_candidate(self.store, SESSION_ID, moment)
+        self.assertEqual(candidate, day_key(BASE + 110 * 86400))
+
+    def test_too_recent_silence_is_rejected(self) -> None:
+        self.seed_messages(SESSION_ID, DISPLAY_NAME, {BASE: 25})
+        moment = BASE + 5 * 86400  # 只过了 5 天，不够 14 天。
+        self.assertIsNone(find_breakup_candidate(self.store, SESSION_ID, moment))
+
+    def test_stray_messages_after_cutoff_within_tolerance_still_match(self) -> None:
+        # 真正的断点日（25 天）之后仍有 3 条零星消息分散在两天里（在 5 条
+        # 容忍度内）才彻底沉默：候选定位到断点日本身，不是零星消息里
+        # 最后一天。
+        self.seed_messages(
+            SESSION_ID,
+            DISPLAY_NAME,
+            {
+                BASE: 10,
+                BASE + 10 * 86400: 10,
+                BASE + 20 * 86400: 10,
+                BASE + 25 * 86400: 8,
+                BASE + 30 * 86400: 1,
+                BASE + 35 * 86400: 2,
+            },
+        )
+        moment = BASE + 35 * 86400 + 20 * 86400
+        candidate = find_breakup_candidate(self.store, SESSION_ID, moment)
+        self.assertEqual(candidate, day_key(BASE + 25 * 86400))
+
+
+class GuessBreakupDatesTests(AnalyzerTestCase):
+    """消化「不知道」标记：推算候选写回 pending，推算不出就落终态失败。"""
+
+    def seed_scored(self) -> None:
+        # 先建联系人行：set_contact_breakup 之类的 UPDATE 需要行存在。
+        self.store.ensure_contact(SESSION_ID, DISPLAY_NAME)
+        self.store.save_scores(
+            [
+                (
+                    SESSION_ID,
+                    {
+                        "hash": contact_hash(SESSION_ID),
+                        "scored": True,
+                        "overall": 73.4,
+                        "dimensions": {name: 70.0 for name in DIMENSION_NAMES},
+                    },
+                )
+            ]
+        )
+
+    def mark_unknown(self, certainty: str = "certain", at: int = 1700000001) -> None:
+        self.store.set_contact_breakup_pending(
+            SESSION_ID,
+            json.dumps(
+                {"date": None, "certainty": certainty, "at": at},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
+
+    def test_resolves_pending_date_and_flags_guessed_source(self) -> None:
+        self.seed_scored()
+        self.seed_messages(
+            SESSION_ID, DISPLAY_NAME, {BASE: 25, BASE + 30 * 86400: 6}
+        )
+        self.mark_unknown(at=1700000001)
+        moment = BASE + 30 * 86400 + 20 * 86400
+        events: list[dict] = []
+        count = guess_breakup_dates(
+            self.store, moment, lambda **fields: events.append(dict(fields))
+        )
+        self.assertEqual(count, 1)
+        pending = self.store.get_contact(SESSION_ID).breakup_pending_data()
+        self.assertEqual(pending["date"], day_key(BASE + 30 * 86400))
+        self.assertEqual(pending["date_source"], "guessed")
+        self.assertEqual(pending["certainty"], "certain")
+        self.assertEqual(pending["at"], 1700000001)
+        self.assertEqual(self.store.get_contact(SESSION_ID).breakup, "")
+        self.assertTrue(any(event.get("phase") == "breakup_guess" for event in events))
+
+    def test_writes_unknown_verdict_when_no_candidate_found(self) -> None:
+        self.seed_scored()
+        self.mark_unknown(certainty="suspected")
+        count = guess_breakup_dates(self.store, NOW)
+        self.assertEqual(count, 1)
+        contact = self.store.get_contact(SESSION_ID)
+        self.assertEqual(contact.breakup_pending, "")
+        data = contact.breakup_data()
+        self.assertEqual(data["verdict"], "unknown")
+        self.assertEqual(data["source"], "guess_failed")
+        self.assertEqual(data["certainty"], "suspected")
+
+    def test_unscored_candidate_skipped_and_pending_cleared(self) -> None:
+        # 从未打过分：没有 store.score_by_hash 命中，无从推算候选。
+        self.store.ensure_contact(SESSION_ID, DISPLAY_NAME)
+        self.mark_unknown()
+        count = guess_breakup_dates(self.store, NOW)
+        self.assertEqual(count, 0)
+        contact = self.store.get_contact(SESSION_ID)
+        self.assertEqual(contact.breakup_pending, "")
+        self.assertIsNone(contact.breakup_data())
+
+    def test_ignores_pending_with_a_concrete_date(self) -> None:
+        self.seed_scored()
+        original = json.dumps(
+            {"date": "2026-01-01", "certainty": "certain", "at": 1700000001},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        self.store.set_contact_breakup_pending(SESSION_ID, original)
+        count = guess_breakup_dates(self.store, NOW)
+        self.assertEqual(count, 0)
+        self.assertEqual(self.store.get_contact(SESSION_ID).breakup_pending, original)
+
+    def test_respects_the_per_run_budget(self) -> None:
+        second_session = "friend2"
+        self.store.ensure_contact(SESSION_ID, DISPLAY_NAME)
+        self.store.ensure_contact(second_session, "Bob")
+        self.store.save_scores(
+            [
+                (
+                    SESSION_ID,
+                    {
+                        "hash": contact_hash(SESSION_ID),
+                        "scored": True,
+                        "overall": 73.4,
+                        "dimensions": {name: 70.0 for name in DIMENSION_NAMES},
+                    },
+                ),
+                (
+                    second_session,
+                    {
+                        "hash": contact_hash(second_session),
+                        "scored": True,
+                        "overall": 60.0,
+                        "dimensions": {name: 60.0 for name in DIMENSION_NAMES},
+                    },
+                ),
+            ]
+        )
+        for session_id, at in ((SESSION_ID, 100), (second_session, 200)):
+            self.store.set_contact_breakup_pending(
+                session_id,
+                json.dumps(
+                    {"date": None, "certainty": "certain", "at": at},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+            )
+        with patch("wechat_insights.breakup.BREAKUP_GUESS_MAX_PER_RUN", 1):
+            count = guess_breakup_dates(self.store, NOW)
+        self.assertEqual(count, 1)
+        # 预算只够处理 at 更小的那个（SESSION_ID，无候选 → 终态失败）；
+        # 第二个原样保留在「待推算」状态，等下一轮再处理。
+        self.assertEqual(self.store.get_contact(SESSION_ID).breakup_pending, "")
+        self.assertEqual(
+            self.store.get_contact(SESSION_ID).breakup_data()["verdict"], "unknown"
+        )
+        self.assertEqual(
+            self.store.get_contact(second_session).breakup_pending_data()["date"],
+            None,
+        )
 
 
 class RefreshBreakupsTests(AnalyzerTestCase):
@@ -320,6 +540,64 @@ class RefreshBreakupsTests(AnalyzerTestCase):
         self.assertEqual(count, 0)
         self.assertEqual(self.store.get_contact(SESSION_ID).breakup_pending, "")
 
+    def test_pending_awaiting_guess_is_not_cleared_as_dirty(self) -> None:
+        # date=None 但 certainty 合法：这是「待推算」状态，不是脏数据——
+        # guess_breakup_dates 本轮预算没轮到它，refresh_breakups 不能清。
+        self.seed_scored()
+        pending_json = json.dumps(
+            {"date": None, "certainty": "certain", "at": NOW - 60},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        self.store.set_contact_breakup_pending(SESSION_ID, pending_json)
+        count = refresh_breakups(
+            self.store, self.reader, LexicalDepth(), SESSION_GAP_SECONDS, NOW
+        )
+        self.assertEqual(count, 0)
+        self.assertEqual(
+            self.store.get_contact(SESSION_ID).breakup_pending, pending_json
+        )
+
+    def test_confirmed_verdict_carries_guessed_date_source(self) -> None:
+        # pending 带 date_source="guessed" + 满足冷断的具体日期：结论
+        # 原样透传这个来源标记。
+        self.seed_scored()
+        day = day_key(NOW - 20 * 86400)
+        self.store.set_contact_breakup_pending(
+            SESSION_ID,
+            json.dumps(
+                {
+                    "date": day,
+                    "certainty": "certain",
+                    "at": NOW - 60,
+                    "date_source": "guessed",
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
+        with patch("wechat_insights.llm.chat") as chat:
+            count = refresh_breakups(
+                self.store, self.reader, LexicalDepth(), SESSION_GAP_SECONDS, NOW
+            )
+        chat.assert_not_called()
+        self.assertEqual(count, 1)
+        data = self.store.get_contact(SESSION_ID).breakup_data()
+        self.assertEqual(data["verdict"], "confirmed")
+        self.assertEqual(data["date_source"], "guessed")
+
+    def test_confirmed_verdict_defaults_date_source_to_user(self) -> None:
+        # pending 不带 date_source 键（用户手填的具体日期）：结论缺省
+        # 归到 "user"。
+        self.seed_scored()
+        day = day_key(NOW - 20 * 86400)
+        with patch("wechat_insights.llm.chat") as chat:
+            count = self.refresh(strategy=LexicalDepth(), day=day)
+        chat.assert_not_called()
+        self.assertEqual(count, 1)
+        data = self.store.get_contact(SESSION_ID).breakup_data()
+        self.assertEqual(data["date_source"], "user")
+
 
 class ApplyBreakupTests(AnalyzerTestCase):
     """_apply_breakup：封顶缩放、否决不改分、低分不缩放、无结论不动。"""
@@ -412,6 +690,7 @@ class ApplyBreakupTests(AnalyzerTestCase):
                 "verdict": "rejected",
                 "note": "之后仍在正常聊天",
                 "date": "2026-01-01",
+                "date_source": "user",
             },
         )
 
@@ -430,6 +709,37 @@ class ApplyBreakupTests(AnalyzerTestCase):
         Analyzer._apply_breakup(payload, self.store.get_contact(SESSION_ID))
         self.assertEqual(payload["overall"], 70.0)
         self.assertNotIn("breakup", payload)
+
+    def test_unknown_verdict_shows_chip_without_touching_score(self) -> None:
+        # 推算彻底失败的终态：只挂信息不改分，与 rejected 走同一个分支。
+        payload = self.payload(70.0)
+        Analyzer._apply_breakup(
+            payload,
+            self.contact_with_breakup(
+                {
+                    "verdict": "unknown",
+                    "kind": "",
+                    "date": None,
+                    "certainty": "certain",
+                    "note": "聊天记录里找不到明显的往来断崖，无法自动判定绝交日期",
+                    "decided_at": NOW,
+                    "source": "guess_failed",
+                }
+            ),
+        )
+        self.assertEqual(payload["overall"], 70.0)
+        self.assertEqual(
+            payload["dimensions"], {name: 70.0 for name in DIMENSION_NAMES}
+        )
+        self.assertEqual(
+            payload["breakup"],
+            {
+                "verdict": "unknown",
+                "note": "聊天记录里找不到明显的往来断崖，无法自动判定绝交日期",
+                "date": None,
+                "date_source": "user",
+            },
+        )
 
 
 if __name__ == "__main__":
