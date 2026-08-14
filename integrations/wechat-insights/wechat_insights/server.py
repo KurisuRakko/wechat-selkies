@@ -634,6 +634,143 @@ def create_app(runtime: InsightsRuntime) -> web.Application:
             store.update_score_payload(row.session_id, payload)
         return no_store({"ok": True, "pending": action})
 
+    async def contact_breakup(request: web.Request) -> web.Response:
+        """绝交标记：'mark' 记下日期与置信度，下一轮分析核实；'clear' 清除
+        标记并按 payload 里的 base 快照即时还原分数。
+
+        标记本身只写 contacts 两列，分数变化发生在下一轮分析的核实里。
+        清除是即时的：payload 里带着最近一次绝交的 base 快照，按它还原
+        综合分与七维，界面马上回到绝交前的口径。重新标记时旧结论同时从
+        contacts 与 payload 里撤下，避免旧封顶在核实之前一直压着分数。
+        标记只落在响应里，wxid 不出现在任何响应中。
+        """
+
+        value = request.match_info["hash"]
+        if not _HASH_PATTERN.fullmatch(value):
+            raise web.HTTPNotFound(text="not found")
+        row = store.get_contact_by_hash(value)
+        if row is None:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "CONTACT_NOT_FOUND",
+                        "message": "找不到该联系人，可能还没跑过分析",
+                    },
+                },
+                status=404,
+                headers={"Cache-Control": "no-store"},
+            )
+        try:
+            body = json.loads(await request.text())
+        except ValueError:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": {"code": "BAD_REQUEST", "message": "请求体不是合法 JSON"},
+                },
+                status=400,
+                headers={"Cache-Control": "no-store"},
+            )
+        action = body.get("action") if isinstance(body, dict) else None
+        if action not in ("mark", "clear"):
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": {"code": "BAD_REQUEST", "message": "action 取值非法"},
+                },
+                status=400,
+                headers={"Cache-Control": "no-store"},
+            )
+        payload = store.score_by_hash(value)
+        if action == "clear":
+            store.set_contact_breakup(row.session_id, "")
+            store.set_contact_breakup_pending(row.session_id, "")
+            if payload is not None:
+                breakup = payload.get("breakup")
+                if isinstance(breakup, dict) and isinstance(
+                    breakup.get("base"), dict
+                ):
+                    base = breakup["base"]
+                    if "overall" in base:
+                        payload["overall"] = base["overall"]
+                    if isinstance(base.get("dimensions"), dict):
+                        payload["dimensions"] = base["dimensions"]
+                payload.pop("breakup", None)
+                payload.pop("breakup_pending", None)
+                store.update_score_payload(row.session_id, payload)
+            return no_store({"ok": True, "cleared": True})
+        date = body.get("date") if isinstance(body, dict) else None
+        certainty = body.get("certainty") if isinstance(body, dict) else None
+        if not isinstance(date, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "BAD_REQUEST",
+                        "message": "日期格式应为 YYYY-MM-DD",
+                    },
+                },
+                status=400,
+                headers={"Cache-Control": "no-store"},
+            )
+        try:
+            time.strptime(date, "%Y-%m-%d")
+        except ValueError:
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "BAD_REQUEST",
+                        "message": "日期格式应为 YYYY-MM-DD",
+                    },
+                },
+                status=400,
+                headers={"Cache-Control": "no-store"},
+            )
+        if date > datetime.now().date().isoformat():
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "BAD_REQUEST",
+                        "message": "绝交日期不能在未来",
+                    },
+                },
+                status=400,
+                headers={"Cache-Control": "no-store"},
+            )
+        if certainty not in ("certain", "suspected"):
+            return web.json_response(
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "BAD_REQUEST",
+                        "message": "certainty 取值非法",
+                    },
+                },
+                status=400,
+                headers={"Cache-Control": "no-store"},
+            )
+        store.set_contact_breakup_pending(
+            row.session_id,
+            json.dumps(
+                {"date": date, "certainty": certainty, "at": int(time.time())},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
+        # 重新标记要把旧结论从看板上撤下来：contacts.breakup 列同时清空，
+        # 否则旧封顶会在新标记核实之前一直压着分数。
+        store.set_contact_breakup(row.session_id, "")
+        if payload is not None:
+            payload["breakup_pending"] = {"date": date, "certainty": certainty}
+            payload.pop("breakup", None)
+            store.update_score_payload(row.session_id, payload)
+        return no_store(
+            {"ok": True, "pending": {"date": date, "certainty": certainty}}
+        )
+
     async def contact_history(request: web.Request) -> web.Response:
         """切换联系人的温度采样粒度：'day' = 逐日细化，'week' = 每周（默认）。
 
@@ -724,6 +861,7 @@ def create_app(runtime: InsightsRuntime) -> web.Application:
     app.router.add_post("/api/contact/{hash}/kind", contact_kind)
     app.router.add_post("/api/contact/{hash}/history", contact_history)
     app.router.add_post("/api/contact/{hash}/feedback", contact_feedback)
+    app.router.add_post("/api/contact/{hash}/breakup", contact_breakup)
     app.router.add_get("/api/report", report)
     app.router.add_get("/api/progress", progress)
     app.router.add_post("/api/refresh", refresh)

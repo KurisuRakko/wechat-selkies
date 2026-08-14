@@ -258,6 +258,57 @@
     );
   }
 
+  // 绝交核实结论的 kind 取值 → 中文，与后端 breakup 模块的判定一致。
+  var BREAKUP_KIND_LABELS = {
+    quarrel: "吵架决裂",
+    silence: "冷断",
+    asserted: "用户断言"
+  };
+
+  /**
+   * 绝交角标：三态展示——排队中（灰）、核实确认（错误红，带压低的分数）、
+   * 核实否决（「绝交存疑」）。所有插值过 escapeHtml，包括大模型给的 note。
+   */
+  function breakupChipHtml(payload) {
+    if (!payload) {
+      return "";
+    }
+    if (payload.breakup_pending) {
+      return (
+        '<span class="chip chip--small chip--breakup-pending" ' +
+        'title="绝交核实排队中，下一轮分析处理">绝交核实中</span>'
+      );
+    }
+    var breakup = payload.breakup;
+    if (!breakup || !breakup.verdict) {
+      return "";
+    }
+    if (breakup.verdict === "confirmed") {
+      var delta = isNumber(breakup.overall_delta)
+        ? breakup.overall_delta.toFixed(1)
+        : "0.0";
+      var tip = BREAKUP_KIND_LABELS[breakup.kind] || "已绝交";
+      if (breakup.note) {
+        tip += "：" + String(breakup.note);
+      }
+      return (
+        '<span class="chip chip--small chip--breakup" title="' +
+        escapeHtml(tip) +
+        '">绝交 ' +
+        escapeHtml(delta) +
+        "</span>"
+      );
+    }
+    if (breakup.verdict === "rejected") {
+      return (
+        '<span class="chip chip--small chip--breakup" title="' +
+        escapeHtml("AI 复核未确认：" + String(breakup.note || "")) +
+        '">绝交存疑</span>'
+      );
+    }
+    return "";
+  }
+
   /* ------------------------------------------------------------------ *
    * 状态占位（加载 / 空 / 错误）
    * ------------------------------------------------------------------ */
@@ -579,7 +630,8 @@
     ],
     footnote:
       "往来消息不足 50 条的联系人不打分；打分每天自动更新一次。" +
-      "右键联系人卡片可以标记「感觉偏高/偏低」，下一轮分析会自动校准。"
+      "右键联系人卡片可以标记「感觉偏高/偏低」，下一轮分析会自动校准。" +
+      "也可以标记「绝交」，核实后会大幅压低分数。"
   };
 
   var helpDialogEl = null;
@@ -662,6 +714,101 @@
   }
 
   /* ------------------------------------------------------------------ *
+   * 绝交日期弹窗
+   * ------------------------------------------------------------------ */
+
+  var dateDialogEl = null;
+  // 确定时回调的函数：打开时登记、关闭时清空，避免重复打开拿到旧回调。
+  var dateDialogSubmit = null;
+
+  /** 关闭日期弹窗并清空回调。 */
+  function closeDateDialog() {
+    if (!dateDialogEl || !dateDialogEl.classList.contains("dialog-scrim--open")) {
+      return;
+    }
+    dateDialogEl.classList.remove("dialog-scrim--open");
+    dateDialogSubmit = null;
+  }
+
+  /**
+   * 打开「选择绝交日期」弹窗：单个 date 输入（max=今天）+ 确定/取消。
+   * 确定时校验有值并把 YYYY-MM-DD 字符串回调给 onSubmit。单例复用，
+   * Esc 与点遮罩关闭，构建方式与说明弹窗一致。
+   */
+  function openDateDialog(title, onSubmit) {
+    dateDialogSubmit = onSubmit;
+    if (!dateDialogEl) {
+      dateDialogEl = document.createElement("div");
+      dateDialogEl.className = "dialog-scrim";
+      // max 用本地时区的今天，前端先挡住未来日期（后端同样会校验）。
+      var today = formatDate(Date.now() / 1000);
+      dateDialogEl.innerHTML =
+        '<div class="dialog" role="dialog" aria-modal="true">' +
+        '<div class="dialog__head">' +
+        '<h2 class="dialog__title date-dialog__title"></h2>' +
+        '<button class="icon-btn dialog__close" type="button" aria-label="关闭">×</button>' +
+        "</div>" +
+        '<div class="dialog__body">' +
+        '<input type="date" class="date-dialog__input" max="' +
+        escapeHtml(today) +
+        '" />' +
+        "</div>" +
+        '<div class="dialog__actions">' +
+        '<button class="dialog__btn" type="button">取消</button>' +
+        '<button class="dialog__btn dialog__btn--confirm" type="button">确定</button>' +
+        "</div>" +
+        "</div>";
+      document.body.appendChild(dateDialogEl);
+      // 点遮罩（scrim）本身也关闭；内容区点击不冒泡到关闭逻辑。
+      dateDialogEl.addEventListener("click", function (event) {
+        if (event.target === dateDialogEl) {
+          closeDateDialog();
+        }
+      });
+      dateDialogEl
+        .querySelector(".dialog__close")
+        .addEventListener("click", closeDateDialog);
+      dateDialogEl
+        .querySelector(".dialog__btn:not(.dialog__btn--confirm)")
+        .addEventListener("click", closeDateDialog);
+      dateDialogEl
+        .querySelector(".dialog__btn--confirm")
+        .addEventListener("click", function () {
+          var input = dateDialogEl.querySelector(".date-dialog__input");
+          var value = input ? input.value : "";
+          if (!value) {
+            // 没选日期就不回调：弹窗保持打开，让用户补选或取消。
+            return;
+          }
+          var callback = dateDialogSubmit;
+          closeDateDialog();
+          if (callback) {
+            callback(value);
+          }
+        });
+    }
+    dateDialogEl.querySelector(".date-dialog__title").textContent = title;
+    var input = dateDialogEl.querySelector(".date-dialog__input");
+    if (input) {
+      input.value = "";
+    }
+    dateDialogEl.classList.add("dialog-scrim--open");
+    if (input) {
+      input.focus();
+    }
+  }
+
+  global.addEventListener("keydown", function (event) {
+    if (
+      event.key === "Escape" &&
+      dateDialogEl &&
+      dateDialogEl.classList.contains("dialog-scrim--open")
+    ) {
+      closeDateDialog();
+    }
+  });
+
+  /* ------------------------------------------------------------------ *
    * 导出
    * ------------------------------------------------------------------ */
 
@@ -673,7 +820,9 @@
     apiPost: apiPost,
     kindBadgeHtml: kindBadgeHtml,
     calibrationChipHtml: calibrationChipHtml,
+    breakupChipHtml: breakupChipHtml,
     openContextMenu: openContextMenu,
+    openDateDialog: openDateDialog,
     linkTo: linkTo,
     formatDuration: formatDuration,
     formatDateTime: formatDateTime,

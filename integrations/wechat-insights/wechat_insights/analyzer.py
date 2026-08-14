@@ -14,10 +14,13 @@ from dataclasses import dataclass, field
 from wechat_history.reader import HistoryReader
 from wechat_history.sessions import scan_direct_rows
 
+from .breakup import refresh_breakups
 from .calibrate import refresh_calibrations
 from .classify import classify_contacts
 from .constants import (
     BACKFILL_BATCH,
+    BREAKUP_CAP_CERTAIN,
+    BREAKUP_CAP_SUSPECTED,
     DECAY_HALF_LIFE_DAYS,
     FADE_LIST_LIMIT,
     FADE_MIN_GAP_DAYS,
@@ -77,6 +80,8 @@ class AnalysisResult:
     llm_periods: int = 0
     # 本轮消化的好感度右键标记数（写入校准的联系人数）。
     calibrated: int = 0
+    # 本轮核实的绝交标记数（写入结论的联系人数）。
+    breakups: int = 0
     # 本轮全史回放写入的采样点行数（关系温度曲线补上部署日之前的历史）。
     history_points: int = 0
     # 本轮逐日细化写入的采样点行数（每日粒度联系人从相识日逐日补点）。
@@ -256,6 +261,20 @@ class Analyzer:
                 )
             except Exception:
                 LOG.exception("好感度校准失败，本轮跳过")
+            # 绝交核实同样要在 reader 关闭前做（llm 策略下要从快照里读采样
+            # 文本）。所有策略都跑：冷断判定不依赖 LLM。可选项，出意外
+            # 不能拖垮整轮打分，隔离处理。
+            try:
+                result.breakups = refresh_breakups(
+                    self.store,
+                    reader,
+                    self.strategy,
+                    self.gap_seconds,
+                    moment,
+                    self._report,
+                )
+            except Exception:
+                LOG.exception("绝交核实失败，本轮跳过")
         finally:
             reader.close()
 
@@ -483,6 +502,9 @@ class Analyzer:
         # 与列表页据此展示「校准排队中」，而不是无声无息。
         if contact.feedback_pending:
             payload["calibration_pending"] = contact.feedback_pending
+        # 绝交标记同理：排队中的标记透传给前端展示「绝交核实中」。
+        if contact.breakup_pending:
+            payload["breakup_pending"] = contact.breakup_pending_data()
         return payload
 
     @staticmethod
@@ -517,6 +539,54 @@ class Analyzer:
             "base": {"overall": base_overall, "dimensions": base_dims},
             "note": data.get("note") or None,
             "updated_at": data.get("updated_at"),
+        }
+
+    @staticmethod
+    def _apply_breakup(payload: dict[str, object], contact: ContactRow) -> None:
+        """把核实过的绝交结论应用进 payload：确认的封顶压低七维与综合分。
+
+        rejected 只挂信息不改分，供前端展示「绝交存疑」；confirmed 把
+        校准之后的最终值整体等比缩到封顶（分数已低于封顶则不缩放），并
+        把 base 快照与压掉的幅度一并塞进 payload 的 breakup 键——前端
+        据此显示角标，清除时按 base 即时还原。
+        """
+
+        data = contact.breakup_data()
+        if data is None or data.get("verdict") != "confirmed":
+            if data is not None and data.get("verdict") == "rejected":
+                payload["breakup"] = {
+                    "verdict": "rejected",
+                    "note": data.get("note"),
+                    "date": data.get("date"),
+                }
+            return
+        cap = (
+            BREAKUP_CAP_CERTAIN
+            if data.get("certainty") == "certain"
+            else BREAKUP_CAP_SUSPECTED
+        )
+        base_overall = float(payload["overall"])
+        base_dims = dict(payload["dimensions"])  # type: dict[str, object]
+        if base_overall <= cap:
+            # 分数已经够低：只挂信息不缩放，清除时无需还原任何东西。
+            ratio = 1.0
+        else:
+            ratio = cap / base_overall
+        capped: dict[str, float] = {}
+        for name in DIMENSION_NAMES:
+            capped[name] = round(
+                min(100.0, max(0.0, float(base_dims.get(name, 50.0)) * ratio)), 1
+            )
+        payload["dimensions"] = capped
+        payload["overall"] = round(sum(capped.values()) / 7, 1)
+        payload["breakup"] = {
+            "verdict": "confirmed",
+            "kind": data.get("kind"),
+            "date": data.get("date"),
+            "certainty": data.get("certainty"),
+            "note": data.get("note") or None,
+            "overall_delta": round(float(payload["overall"]) - base_overall, 1),
+            "base": {"overall": base_overall, "dimensions": base_dims},
         }
 
     def _scores_asof(
@@ -775,8 +845,12 @@ class Analyzer:
                     },
                 )
                 self._apply_calibration(payload, contact)
+                # 绝交封顶必须作用在校准之后的最终值上：顺序不可反。
+                self._apply_breakup(payload, contact)
                 if contact.feedback_pending:
                     payload["calibration_pending"] = contact.feedback_pending
+                if contact.breakup_pending:
+                    payload["breakup_pending"] = contact.breakup_pending_data()
             payloads.append((session_id, payload))
 
         self.store.save_scores(payloads)

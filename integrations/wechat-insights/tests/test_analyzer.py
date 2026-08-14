@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -728,6 +729,73 @@ class CalibrationAnalysisTests(AnalyzerTestCase):
         self.assertEqual(rows[-1][1], base_overall)
 
 
+class BreakupAnalysisTests(AnalyzerTestCase):
+    """整轮分析里的绝交核实：标记 → 核实 → 封顶作用在校准之后的最终值上。"""
+
+    def seed_two_contacts(self) -> None:
+        rows = []
+        for index in range(1, 21):
+            offset = index * 120
+            rows.append(them(index, offset) if index % 2 else me(index, offset))
+        build_database(self.database, rows)
+        # 百分位至少需要两个联系人做参照，第二个直接写库。
+        self.seed_messages("friend2", "Bob", {BASE + 5 * 86400: 15})
+
+    def run_round(self):
+        with patch("wechat_insights.analyzer.MIN_SCORE_MESSAGES", 10):
+            return self.run_analysis(now=BASE + 10 * 86400)
+
+    def mark(self, certainty: str, day: str) -> None:
+        self.store.ensure_contact(SESSION_ID, DISPLAY_NAME)
+        self.store.set_contact_breakup_pending(
+            SESSION_ID,
+            json.dumps(
+                {"date": day, "certainty": certainty, "at": NOW},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
+
+    def test_marked_contact_is_capped_on_next_round(self) -> None:
+        self.seed_two_contacts()
+        self.run_round()
+        # 标记「已经绝交」在消息之后 5 天：词法策略下冷断不达标（不足 14 天
+        # 且当天之后无消息），走「用户断言」直接确认，封顶 10 分。
+        self.mark("certain", day_key(BASE + 5 * 86400))
+        result = self.run_round()
+        self.assertEqual(result.breakups, 1)
+        payload = self.store.score_by_hash(contact_hash(SESSION_ID))
+        self.assertEqual(payload["breakup"]["verdict"], "confirmed")
+        self.assertEqual(payload["breakup"]["kind"], "asserted")
+        self.assertAlmostEqual(payload["overall"], 10.0, delta=0.2)
+        # 标记已被消化：payload 里不再有排队提示。
+        self.assertNotIn("breakup_pending", payload)
+
+    def test_suspected_mark_without_evidence_stays_pending(self) -> None:
+        self.seed_two_contacts()
+        self.run_round()
+        # 存疑标记 + 证据不足：保留 pending 下一轮再核，本轮不写结论。
+        self.mark("suspected", day_key(BASE + 5 * 86400))
+        result = self.run_round()
+        self.assertEqual(result.breakups, 0)
+        payload = self.store.score_by_hash(contact_hash(SESSION_ID))
+        self.assertEqual(
+            payload["breakup_pending"]["date"], day_key(BASE + 5 * 86400)
+        )
+        self.assertNotIn("breakup", payload)
+
+    def test_history_records_base_score_not_capped(self) -> None:
+        self.seed_two_contacts()
+        self.run_round()
+        base = self.store.score_by_hash(contact_hash(SESSION_ID))
+        base_overall = base["overall"]
+        self.mark("certain", day_key(BASE + 5 * 86400))
+        self.run_round()
+        rows = self.store.load_score_history(SESSION_ID)
+        # 温度历史曲线只记封顶前的客观值：绝交只影响展示，不改客观轨迹。
+        self.assertEqual(rows[-1][1], base_overall)
+
+
 class ProgressTests(AnalyzerTestCase):
     """进度上报：阶段顺序、计数递增，以及 cb 异常绝不影响分析本身。"""
 
@@ -751,11 +819,12 @@ class ProgressTests(AnalyzerTestCase):
         build_database(self.database, [them(1, 0), me(2, 60)])
         _, events = self.run_with_progress(now=NOW)
         # 阶段顺序：sync（起点 + 1 个会话）→ calibrate（本数据无标记，只发
-        # 起点 0/0）→ score → history（全史回放网格，起点 + 每 7 天一个点）。
+        # 起点 0/0）→ breakup（绝交核实，本数据无标记，只发起点 0/0）→
+        # score → history（全史回放网格，起点 + 每 7 天一个点）。
         grid = backfill_grid(day_key(BASE), day_key(NOW))
         phases = [event["phase"] for event in events]
-        self.assertEqual(phases[:3], ["sync", "sync", "calibrate"])
-        self.assertEqual(phases[3:], ["score"] + ["history"] * (len(grid) + 1))
+        self.assertEqual(phases[:4], ["sync", "sync", "calibrate", "breakup"])
+        self.assertEqual(phases[4:], ["score"] + ["history"] * (len(grid) + 1))
         # sync 起点：total=会话数、done=0；随后每个会话前上报一次 display_name。
         self.assertEqual(events[0], {"phase": "sync", "done": 0, "total": 1, "detail": ""})
         self.assertEqual(
@@ -767,8 +836,13 @@ class ProgressTests(AnalyzerTestCase):
             events[2],
             {"phase": "calibrate", "done": 0, "total": 0, "detail": ""},
         )
+        # breakup 阶段同样没有候选：只发起点 0/0。
+        self.assertEqual(
+            events[3],
+            {"phase": "breakup", "done": 0, "total": 0, "detail": ""},
+        )
         # score 阶段没有逐项计数：total=0。
-        self.assertEqual(events[3], {"phase": "score", "done": 0, "total": 0, "detail": ""})
+        self.assertEqual(events[4], {"phase": "score", "done": 0, "total": 0, "detail": ""})
         # history 起点 total=网格点数，随后逐点上报日期。
         history = [event for event in events if event["phase"] == "history"]
         self.assertEqual(
@@ -815,7 +889,8 @@ class ProgressTests(AnalyzerTestCase):
         phases = [event["phase"] for event in events]
         # 阶段顺序：sync（起点 + 3 个会话）→ llm（起点 + 2 个候选）→
         # period（时段评分，本数据无候选，只发起点 0/0）→ calibrate（好感度
-        # 校准，本数据无标记，只发起点 0/0）→ score → history（全史回放网格）。
+        # 校准，本数据无标记，只发起点 0/0）→ breakup（绝交核实，本数据无
+        # 标记，只发起点 0/0）→ score → history（全史回放网格）。
         grid = backfill_grid(day_key(BASE), day_key(NOW))
         self.assertEqual(
             phases,
@@ -823,6 +898,7 @@ class ProgressTests(AnalyzerTestCase):
             + ["llm"] * 3
             + ["period"]
             + ["calibrate"]
+            + ["breakup"]
             + ["score"]
             + ["history"] * (len(grid) + 1),
         )

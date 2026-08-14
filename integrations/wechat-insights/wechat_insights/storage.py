@@ -81,7 +81,10 @@ CREATE TABLE IF NOT EXISTS contacts (
     -- calibration 是累计校准 JSON，'' = 无校准。
     feedback_pending         TEXT NOT NULL DEFAULT '',
     feedback_pending_at      TEXT NOT NULL DEFAULT '',
-    calibration              TEXT NOT NULL DEFAULT ''
+    calibration              TEXT NOT NULL DEFAULT '',
+    -- 绝交检测：breakup_pending 未核实标记 / breakup 核实结论，紧凑 JSON、'' = 无。
+    breakup_pending          TEXT NOT NULL DEFAULT '',
+    breakup                  TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS stats_daily (
@@ -179,6 +182,8 @@ class ContactRow:
     feedback_pending: str = ""
     feedback_pending_at: str = ""
     calibration: str = ""
+    breakup_pending: str = ""
+    breakup: str = ""
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> ContactRow:
@@ -191,6 +196,22 @@ class ContactRow:
             return None
         try:
             data = json.loads(self.calibration)
+        except ValueError:
+            return None
+        return data if isinstance(data, dict) else None
+
+    def breakup_pending_data(self) -> dict | None:
+        """解析未核实的绝交标记 JSON；空串与解析失败都返回 None。"""
+        try:
+            data = json.loads(self.breakup_pending)
+        except ValueError:
+            return None
+        return data if isinstance(data, dict) else None
+
+    def breakup_data(self) -> dict | None:
+        """解析绝交核实结论 JSON；空串与解析失败都返回 None。"""
+        try:
+            data = json.loads(self.breakup)
         except ValueError:
             return None
         return data if isinstance(data, dict) else None
@@ -427,7 +448,7 @@ class MetricsStore:
                 kind_auto = ?, kind_manual = ?,
                 history_granularity = ?, history_daily_until = ?,
                 feedback_pending = ?, feedback_pending_at = ?,
-                calibration = ?
+                calibration = ?, breakup_pending = ?, breakup = ?
             WHERE session_id = ?
             """,
             (
@@ -450,6 +471,7 @@ class MetricsStore:
                 contact.feedback_pending,
                 contact.feedback_pending_at,
                 contact.calibration,
+                contact.breakup_pending, contact.breakup,
                 contact.session_id,
             ),
         )
@@ -503,6 +525,22 @@ class MetricsStore:
         with self.connection as connection:
             connection.execute(
                 "UPDATE contacts SET calibration = ? WHERE session_id = ?",
+                (payload, session_id),
+            )
+
+    def set_contact_breakup_pending(self, session_id: str, payload: str) -> None:
+        """写入/清除未核实的绝交标记 JSON（'' = 清除标记）。只改这一列。"""
+        with self.connection as connection:
+            connection.execute(
+                "UPDATE contacts SET breakup_pending = ? WHERE session_id = ?",
+                (payload, session_id),
+            )
+
+    def set_contact_breakup(self, session_id: str, payload: str) -> None:
+        """写入/清除绝交核实结论 JSON（'' = 清除结论）。只改这一列。"""
+        with self.connection as connection:
+            connection.execute(
+                "UPDATE contacts SET breakup = ? WHERE session_id = ?",
                 (payload, session_id),
             )
 

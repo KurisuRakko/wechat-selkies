@@ -51,6 +51,8 @@
     period: "AI 时段评分",
     // 好感度校准：消化右键标记，把幅度分配到七维。
     calibrate: "好感度校准",
+    // 绝交核实：消化右键绝交标记，核实后封顶压低分数。
+    breakup: "绝交核实",
     score: "重算打分",
     history: "回放历史",
     // 逐日细化：把某位联系人的历史从每周重算成每天，全史很耗时。
@@ -639,6 +641,37 @@
       });
   }
 
+  function postBreakup(item, action, date, certainty) {
+    var body = { action: action };
+    if (action === "mark") {
+      body.date = date;
+      body.certainty = certainty;
+    }
+    I.apiPost(
+      "/api/contact/" + encodeURIComponent(item.hash) + "/breakup",
+      body
+    )
+      .then(function (result) {
+        if (action === "clear") {
+          // 清除是即时的：服务端已按 payload 里的 base 快照还原分数并
+          // 清空结论，重新拉一遍列表让角标与分数立刻回到绝交前的口径。
+          loadContacts();
+          I.snackbar("已清除");
+          return;
+        }
+        var pending = result.data && result.data.pending;
+        if (pending) {
+          // 服务端已把 breakup_pending 写进 payload，重拉列表让
+          // 「绝交核实中」角标与清除项立刻可见。
+          loadContacts();
+          I.snackbar("已标记，下一轮分析核实");
+        }
+      })
+      .catch(function (err) {
+        I.snackbar((err && err.message) || "标记失败");
+      });
+  }
+
   function feedbackItems(item) {
     var items = [
       {
@@ -663,6 +696,33 @@
         hint: "还原客观分",
         onClick: function () {
           markFeedback(item, "clear");
+        }
+      });
+    }
+    // 绝交标记：两种置信度都要先选日期，核实排队中或已有结论时提供清除。
+    items.push({
+      label: "已经绝交…",
+      hint: "输入日期，下轮核实",
+      onClick: function () {
+        I.openDateDialog("你们是什么时候绝交的？", function (date) {
+          postBreakup(item, "mark", date, "certain");
+        });
+      }
+    });
+    items.push({
+      label: "我认为的绝交…",
+      hint: "存疑标记，AI 复核",
+      onClick: function () {
+        I.openDateDialog("你们是什么时候绝交的？", function (date) {
+          postBreakup(item, "mark", date, "suspected");
+        });
+      }
+    });
+    if (item.breakup || item.breakup_pending) {
+      items.push({
+        label: "清除绝交标记",
+        onClick: function () {
+          postBreakup(item, "clear");
         }
       });
     }
@@ -691,6 +751,7 @@
       "</span>" +
       I.kindBadgeHtml(item.relation_kind) +
       I.calibrationChipHtml(item) +
+      I.breakupChipHtml(item) +
       anomalyBadgeHtml(item) +
       "</span>" +
       cardTagsHtml(item.llm_tags) +
