@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import signal
+import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +26,7 @@ from pywebpush import WebPushException, webpush_async
 from .attach import AttachPreparer
 from .errors import HistoryError
 from .reader import HistoryReader, _read_connection
+from .reply import CommandRunner, find_wechat_window
 from .sessions import scan_direct_rows
 
 
@@ -43,6 +45,7 @@ COALESCE_MAX_SECONDS = 5.0
 PREVIEW_MAX_CHARS = 160
 MAX_SUBSCRIPTIONS = 16
 MAX_API_BODY_BYTES = 16 * 1024
+RAISE_TAG_MAX_CHARS = 128
 MAX_MESSAGES_PER_CHANGE = 200
 WEB_PUSH_TTL_SECONDS = 300
 WEB_PUSH_TIMEOUT_SECONDS = 10
@@ -705,8 +708,19 @@ def _error_details(exc: BaseException) -> tuple[str, str]:
     return code, ""
 
 
+def _raise_wechat_window(runner: CommandRunner) -> bool:
+    """把微信主窗口激活到前台。找不到、有歧义或有弹窗挡着时放弃，返回 False 而不是抛异常——
+    这些都是 find_wechat_window 已经处理过的正常情况，不需要在这里再区分。"""
+    try:
+        window = find_wechat_window(runner)
+        runner.action(["xdotool", "windowactivate", "--sync", window.window_id])
+        return True
+    except (HistoryError, OSError, subprocess.SubprocessError):
+        return False
+
+
 class NotificationRuntime:
-    def __init__(self, state_root: Path = STATE_ROOT):
+    def __init__(self, state_root: Path = STATE_ROOT, window_runner: CommandRunner | None = None):
         state_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         if os.name == "posix":
             state_root.chmod(0o700)
@@ -721,6 +735,7 @@ class NotificationRuntime:
         self.last_error = ""
         self.last_error_message = ""
         self._last_error_log = 0.0
+        self.window_runner = window_runner or CommandRunner()
 
     async def start(self) -> None:
         self.session = ClientSession()
@@ -864,6 +879,18 @@ def create_app(runtime: NotificationRuntime) -> web.Application:
         asyncio.create_task(runtime.sender.send_one(item, event))
         return web.json_response({"ok": True}, status=202)
 
+    async def raise_window(request: web.Request) -> web.Response:
+        _request_origin(request)
+        body = await _json_body(request)
+        if not isinstance(body, dict):
+            raise web.HTTPBadRequest(text="object body required")
+        tag = body.get("tag", "")
+        if not isinstance(tag, str) or len(tag) > RAISE_TAG_MAX_CHARS:
+            raise web.HTTPBadRequest(text="tag must be a string")
+        raised = await asyncio.to_thread(_raise_wechat_window, runtime.window_runner)
+        LOG.info("notification click requested a window raise (tag=%s, raised=%s)", tag or "-", raised)
+        return web.json_response({"ok": True, "raised": raised})
+
     async def attach(request: web.Request) -> web.Response:
         _request_origin(request)
         body = await _json_body(request)
@@ -891,6 +918,7 @@ def create_app(runtime: NotificationRuntime) -> web.Application:
     app.router.add_put("/wechat-notifications/api/subscription", put_subscription)
     app.router.add_delete("/wechat-notifications/api/subscription", delete_subscription)
     app.router.add_post("/wechat-notifications/api/test", test_subscription)
+    app.router.add_post("/wechat-notifications/api/raise", raise_window)
     app.router.add_post("/wechat-notifications/api/attach", attach)
 
     async def lifecycle(_: web.Application):

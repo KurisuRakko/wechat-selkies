@@ -23,6 +23,7 @@ from wechat_history.errors import fail
 from wechat_history.notifications import (
     NotificationError,
     _error_details,
+    _raise_wechat_window,
     MAX_SUBSCRIPTIONS,
     CursorStore,
     DirectSession,
@@ -41,6 +42,7 @@ from wechat_history.notifications import (
     scan_direct_sessions,
     validate_subscription,
 )
+from wechat_history.reply import CommandRunner
 
 
 def encoded(value: bytes) -> str:
@@ -77,6 +79,24 @@ def direct(
 class FakeReader:
     def close(self) -> None:
         pass
+
+
+class FakeWindowRunner(CommandRunner):
+    def __init__(self, window_id: str = "123", found: bool = True):
+        self.commands: list[list[str]] = []
+        self.window_id = window_id
+        self.found = found
+
+    def output(self, arguments, *, input_data=None) -> bytes:
+        self.commands.append(arguments)
+        if arguments[:4] == ["xdotool", "search", "--onlyvisible", "--class"]:
+            return (self.window_id + "\n").encode() if self.found else b""
+        if arguments[:2] == ["xdotool", "getwindowgeometry"]:
+            return b"WIDTH=1280\nHEIGHT=800\n"
+        return b""
+
+    def action(self, arguments, *, input_data=None) -> None:
+        self.commands.append(arguments)
 
 
 class MonitorTests(unittest.TestCase):
@@ -398,6 +418,20 @@ class PushSenderTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.store.all()), 1)
 
 
+class WindowRaiseTests(unittest.TestCase):
+    def test_raise_activates_found_window(self) -> None:
+        runner = FakeWindowRunner()
+        self.assertTrue(_raise_wechat_window(runner))
+        self.assertIn(["xdotool", "windowactivate", "--sync", "123"], runner.commands)
+
+    def test_raise_gives_up_when_window_missing(self) -> None:
+        runner = FakeWindowRunner(found=False)
+        self.assertFalse(_raise_wechat_window(runner))
+        self.assertFalse(
+            any("windowactivate" in command for command in runner.commands)
+        )
+
+
 class ApiTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -415,6 +449,7 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
             vapid = SimpleNamespace(public_key="public-key")
             subscriptions = SubscriptionStore(root / "subscriptions.json")
             sender = Sender()
+            window_runner = FakeWindowRunner()
 
             async def start(_):
                 return None
@@ -471,6 +506,41 @@ class ApiTests(unittest.IsolatedAsyncioTestCase):
             payload["error"],
             {"code": "KEY_STALE", "message": "保存的密钥已失效；请显式重新扫描"},
         )
+
+    async def test_raise_activates_window_for_same_origin_request(self) -> None:
+        response = await self.client.post(
+            "/wechat-notifications/api/raise",
+            json={"tag": "wechat-abc"},
+            headers={"Origin": self.origin},
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(await response.json(), {"ok": True, "raised": True})
+
+    async def test_raise_reports_not_raised_when_window_missing(self) -> None:
+        self.runtime.window_runner = FakeWindowRunner(found=False)
+        response = await self.client.post(
+            "/wechat-notifications/api/raise",
+            json={"tag": "wechat-abc"},
+            headers={"Origin": self.origin},
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(await response.json(), {"ok": True, "raised": False})
+
+    async def test_raise_rejects_cross_origin(self) -> None:
+        response = await self.client.post(
+            "/wechat-notifications/api/raise",
+            json={"tag": "wechat-abc"},
+            headers={"Origin": "https://evil.example"},
+        )
+        self.assertEqual(response.status, 403)
+
+    async def test_raise_rejects_non_string_tag(self) -> None:
+        response = await self.client.post(
+            "/wechat-notifications/api/raise",
+            json={"tag": 123},
+            headers={"Origin": self.origin},
+        )
+        self.assertEqual(response.status, 400)
 
 
 class ErrorDetailTests(unittest.TestCase):

@@ -159,7 +159,7 @@ function testViewerIsExcluded() {
   assert.strictEqual(fixture.elements.size, 0);
 }
 
-function workerContext() {
+function workerContext(config = {}) {
   const handlers = {};
   const shown = [];
   const fetches = [];
@@ -187,7 +187,13 @@ function workerContext() {
     String,
     Number,
     JSON,
-    fetch: async (url, options) => { fetches.push({ url, options }); return { ok: true }; }
+    fetch: async (url, options) => {
+      fetches.push({ url, options });
+      if (config.failRaise && String(url).indexOf("/api/raise") !== -1) {
+        throw new Error("network down");
+      }
+      return { ok: true };
+    }
   });
   vm.runInContext(workerSource, context, { filename: "wechat-notification-sw.js" });
   return { handlers, shown, windows, fetches };
@@ -234,12 +240,17 @@ async function testWorkerClickAndRenewal() {
   fixture.handlers.notificationclick({
     notification: {
       data: { url: "https://wechat.example/" },
+      tag: "wechat-testtag",
       close() {}
     },
     waitUntil(value) { clickPromise = value; }
   });
   await clickPromise;
   assert.strictEqual(focused, true);
+  const raiseCall = fixture.fetches.find((entry) => String(entry.url).indexOf("/api/raise") !== -1);
+  assert(raiseCall, "notification click must request a container-side window raise");
+  assert.strictEqual(raiseCall.options.method, "POST");
+  assert.strictEqual(JSON.parse(raiseCall.options.body).tag, "wechat-testtag");
 
   let renewalPromise;
   fixture.handlers.pushsubscriptionchange({
@@ -247,8 +258,32 @@ async function testWorkerClickAndRenewal() {
     waitUntil(value) { renewalPromise = value; }
   });
   await renewalPromise;
-  assert.strictEqual(fixture.fetches.length, 1);
-  assert.strictEqual(fixture.fetches[0].options.method, "PUT");
+  const putCalls = fixture.fetches.filter((entry) => entry.options.method === "PUT");
+  assert.strictEqual(putCalls.length, 1);
+  assert.strictEqual(putCalls[0].options.method, "PUT");
+}
+
+async function testWorkerClickRaiseFailureDoesNotBlockFocus() {
+  const fixture = workerContext({ failRaise: true });
+  let focused = false;
+  fixture.windows.push({
+    focused: false,
+    visibilityState: "hidden",
+    url: "https://wechat.example/",
+    async focus() { focused = true; },
+    async navigate() {}
+  });
+  let clickPromise;
+  fixture.handlers.notificationclick({
+    notification: {
+      data: { url: "https://wechat.example/" },
+      tag: "wechat-testtag",
+      close() {}
+    },
+    waitUntil(value) { clickPromise = value; }
+  });
+  await clickPromise;
+  assert.strictEqual(focused, true, "raise failure must not block focusing the controller");
 }
 
 (async function main() {
@@ -257,6 +292,7 @@ async function testWorkerClickAndRenewal() {
   testViewerIsExcluded();
   await testWorkerForegroundAndBackground();
   await testWorkerClickAndRenewal();
+  await testWorkerClickRaiseFailureDoesNotBlockFocus();
   console.log("wechat notification browser tests passed");
 }()).catch((error) => {
   console.error(error);
