@@ -88,6 +88,36 @@ def _history_sampling(row: ContactRow) -> dict:
     }
 
 
+def _truncate_history_at_breakup(
+    rows: list[dict], row: ContactRow
+) -> tuple[list[dict], dict | None]:
+    """确认绝交的联系人只显示绝交日（含）之前的温度曲线。
+
+    截断只发生在下发时：score_history 的行一条不动——曲线是客观记录，
+    清除绝交标记后完整曲线要能立刻回来，不必重算全史。没有真的截掉
+    东西时不返回 cutoff，免得前端在数据范围外画标记线撑坏 time 轴。
+    """
+
+    data = row.breakup_data()
+    if data is None or data.get("verdict") != "confirmed":
+        return rows, None
+    cutoff_day = data.get("date")
+    if not isinstance(cutoff_day, str) or not re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}", cutoff_day
+    ):
+        # 脏数据防御：日期形状不对就不截断，绝交结论照常展示。
+        return rows, None
+    kept = [point for point in rows if point["day"] <= cutoff_day]
+    if len(kept) == len(rows):
+        # 绝交日晚于最后一个采样点：曲线本来就结束了，截断没有意义。
+        return rows, None
+    return kept, {
+        "day": cutoff_day,
+        "kind": data.get("kind"),
+        "certainty": data.get("certainty"),
+    }
+
+
 def _parse_hhmm(value: str) -> tuple[int, int] | None:
     """解析单个 HH:MM，非法返回 None。"""
 
@@ -485,6 +515,8 @@ def create_app(runtime: InsightsRuntime) -> web.Application:
             {"day": day, "overall": overall}
             for day, overall, _dims in store.load_score_history(row.session_id)
         ]
+        # 确认绝交的联系人只下发绝交日（含）之前的点，曲线止于当天。
+        history, history_cutoff = _truncate_history_at_breakup(history, row)
         return no_store(
             {
                 "ok": True,
@@ -495,6 +527,7 @@ def create_app(runtime: InsightsRuntime) -> web.Application:
                 "milestones": row.milestones(),
                 "anomalies": anomalies,
                 "history": history,
+                "history_cutoff": history_cutoff,
                 "history_sampling": _history_sampling(row),
             }
         )

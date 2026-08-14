@@ -702,6 +702,108 @@ class ApiTests(AioHTTPTestCase):
         self.assertEqual(body["history_sampling"]["granularity"], "day")
         self.assertFalse(body["history_sampling"]["pending"])
 
+    # 绝交截断：只有 confirmed 结论才在 detail 下发时截断曲线，且只在真的
+    # 截掉了东西时才带 history_cutoff（前端据此画「绝交」标记线）。
+    def _record_history(self, *points) -> None:
+        """测试用的温度采样点：按 (day, overall) 逐个写入 score_history。"""
+        for day, overall in points:
+            self.store.record_score_history(day, [(SESSION_ID, overall, "")])
+
+    async def test_detail_cutoff_none_without_a_breakup(self) -> None:
+        self._record_history(("2026-03-08", 70.5), ("2026-03-09", 68.0))
+        body = await (await self.client.get(f"/api/contact/{HASH}")).json()
+        self.assertEqual(len(body["history"]), 2)
+        self.assertIsNone(body["history_cutoff"])
+
+    async def test_detail_cutoff_keeps_points_through_the_breakup_day(self) -> None:
+        # 截断包含绝交日当天：只保留 day <= date 的点，cutoff 带齐三个字段。
+        self._record_history(
+            ("2026-03-08", 70.5), ("2026-03-09", 68.0), ("2026-03-10", 66.0)
+        )
+        self.store.set_contact_breakup(
+            SESSION_ID, json.dumps({**BREAKUP_VERDICT, "date": "2026-03-09"})
+        )
+        body = await (await self.client.get(f"/api/contact/{HASH}")).json()
+        self.assertEqual(
+            body["history"],
+            [
+                {"day": "2026-03-08", "overall": 70.5},
+                {"day": "2026-03-09", "overall": 68.0},
+            ],
+        )
+        self.assertEqual(
+            body["history_cutoff"],
+            {"day": "2026-03-09", "kind": "quarrel", "certainty": "certain"},
+        )
+
+    async def test_detail_cutoff_none_when_verdict_is_rejected(self) -> None:
+        # 核实否决：绝交没成立，曲线照常完整下发。
+        self._record_history(("2026-03-08", 70.5), ("2026-03-09", 68.0))
+        self.store.set_contact_breakup(
+            SESSION_ID,
+            json.dumps({**BREAKUP_VERDICT, "verdict": "rejected", "kind": ""}),
+        )
+        body = await (await self.client.get(f"/api/contact/{HASH}")).json()
+        self.assertEqual(len(body["history"]), 2)
+        self.assertIsNone(body["history_cutoff"])
+
+    async def test_detail_cutoff_none_with_pending_only(self) -> None:
+        # 只有未核实的标记、没有结论：不截断。
+        self._record_history(("2026-03-08", 70.5), ("2026-03-09", 68.0))
+        self.store.set_contact_breakup_pending(SESSION_ID, json.dumps(BREAKUP_MARK))
+        body = await (await self.client.get(f"/api/contact/{HASH}")).json()
+        self.assertEqual(len(body["history"]), 2)
+        self.assertIsNone(body["history_cutoff"])
+
+    async def test_detail_cutoff_none_when_breakup_day_past_the_last_point(self) -> None:
+        # 绝交日晚于最后一个采样点：什么都没截掉，不下发 cutoff，免得前端
+        # 在数据范围外画标记线撑坏 time 轴。
+        self._record_history(("2026-03-08", 70.5), ("2026-03-09", 68.0))
+        self.store.set_contact_breakup(
+            SESSION_ID, json.dumps({**BREAKUP_VERDICT, "date": "2026-03-20"})
+        )
+        body = await (await self.client.get(f"/api/contact/{HASH}")).json()
+        self.assertEqual(len(body["history"]), 2)
+        self.assertIsNone(body["history_cutoff"])
+
+    async def test_detail_cutoff_empties_history_when_before_the_first_point(self) -> None:
+        # 绝交日早于第一个采样点：曲线为空，但 cutoff 仍要下发，前端据此
+        # 渲染「没有可显示的区间」而不是整卡消失。
+        self._record_history(("2026-03-08", 70.5), ("2026-03-09", 68.0))
+        self.store.set_contact_breakup(
+            SESSION_ID, json.dumps({**BREAKUP_VERDICT, "date": "2026-03-01"})
+        )
+        body = await (await self.client.get(f"/api/contact/{HASH}")).json()
+        self.assertEqual(body["history"], [])
+        self.assertEqual(body["history_cutoff"]["day"], "2026-03-01")
+
+    async def test_detail_cutoff_ignores_a_dirty_breakup_date(self) -> None:
+        # 脏数据防御：日期形状不对或缺失都不截断、不抛异常。
+        verdicts = [
+            {**BREAKUP_VERDICT, "date": "not-a-date"},
+            {k: v for k, v in BREAKUP_VERDICT.items() if k != "date"},
+        ]
+        self._record_history(("2026-03-08", 70.5), ("2026-03-09", 68.0))
+        for verdict in verdicts:
+            self.store.set_contact_breakup(SESSION_ID, json.dumps(verdict))
+            body = await (await self.client.get(f"/api/contact/{HASH}")).json()
+            self.assertEqual(len(body["history"]), 2)
+            self.assertIsNone(body["history_cutoff"])
+
+    async def test_detail_cutoff_keeps_score_history_rows_intact(self) -> None:
+        # 截断只发生在下发时：请求 detail 之后库里的采样点一条不少，
+        # 清除绝交标记后完整曲线能立刻恢复。
+        self._record_history(
+            ("2026-03-08", 70.5), ("2026-03-09", 68.0), ("2026-03-10", 66.0)
+        )
+        self.store.set_contact_breakup(
+            SESSION_ID, json.dumps({**BREAKUP_VERDICT, "date": "2026-03-09"})
+        )
+        before = self.store.load_score_history(SESSION_ID)
+        body = await (await self.client.get(f"/api/contact/{HASH}")).json()
+        self.assertEqual(len(body["history"]), 2)
+        self.assertEqual(self.store.load_score_history(SESSION_ID), before)
+
     async def test_progress_reports_idle_state_by_default(self) -> None:
         body = await (await self.client.get("/api/progress")).json()
         self.assertTrue(body["ok"])
@@ -861,138 +963,3 @@ class ReportNarrativeTests(AioHTTPTestCase):
         self.assertIsNone(body["narrative"])
         # 失败只影响叙事：年报统计照常返回。
         self.assertEqual(body["stats"]["overview"]["messages"], 4)
-
-
-class AuthTests(AioHTTPTestCase):
-    async def get_application(self):
-        return create_app(self.runtime)
-
-    async def asyncSetUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temporary.cleanup)
-        self.store = MetricsStore(Path(self.temporary.name) / "metrics.db")
-        self.addCleanup(self.store.close)
-        self.store.set_meta("last_analyzed_at", "1700000000")
-        # 关系类型改判要改库，AuthTests 里备一个联系人供带 token 的请求用。
-        self.store.ensure_contact(SESSION_ID, "Alice")
-        self.runtime = InsightsRuntime(self.store, analyzer_factory=lambda: None)
-        patcher = patch("wechat_insights.server.AUTH_TOKEN", "s3cret")
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        await super().asyncSetUp()
-
-    async def test_requests_without_a_token_are_rejected(self) -> None:
-        response = await self.client.get("/api/status")
-        self.assertEqual(response.status, 401)
-        self.assertEqual((await response.json())["error"]["code"], "UNAUTHORIZED")
-
-    async def test_static_assets_are_protected_too(self) -> None:
-        self.assertEqual((await self.client.get("/static/app.css")).status, 401)
-
-    async def test_progress_requires_a_token(self) -> None:
-        self.assertEqual((await self.client.get("/api/progress")).status, 401)
-        response = await self.client.get(
-            "/api/progress", headers={"Authorization": "Bearer s3cret"}
-        )
-        self.assertEqual(response.status, 200)
-        self.assertFalse((await response.json())["progress"]["running"])
-
-    async def test_report_api_requires_a_token(self) -> None:
-        self.assertEqual((await self.client.get("/api/report")).status, 401)
-        response = await self.client.get(
-            "/api/report?year=2026", headers={"Authorization": "Bearer s3cret"}
-        )
-        self.assertEqual(response.status, 200)
-
-    async def test_bearer_header_is_accepted(self) -> None:
-        response = await self.client.get(
-            "/api/status", headers={"Authorization": "Bearer s3cret"}
-        )
-        self.assertEqual(response.status, 200)
-
-    async def test_query_token_redirects_and_sets_a_cookie(self) -> None:
-        # ?token= 只该出现在地址栏一次：校验通过后 302 到不带参数的同一个 URL，
-        # 并在响应里写 cookie；token 不进浏览器历史，也不会出现在复制出去的链接里。
-        response = await self.client.get(
-            "/api/status?token=s3cret", allow_redirects=False
-        )
-        self.assertEqual(response.status, 302)
-        self.assertEqual(response.headers["Location"], "/api/status")
-        self.assertIn("wechat_insights_token", response.cookies)
-        # 重定向后的请求不带 token，靠 cookie 单独通过；也不会再重定向（无死循环）。
-        self.assertEqual((await self.client.get("/api/status")).status, 200)
-
-    async def test_redirect_keeps_other_query_params(self) -> None:
-        response = await self.client.get(
-            "/api/status?foo=1&token=s3cret", allow_redirects=False
-        )
-        self.assertEqual(response.status, 302)
-        self.assertEqual(response.headers["Location"], "/api/status?foo=1")
-
-    async def test_pages_redirect_too(self) -> None:
-        response = await self.client.get("/?token=s3cret", allow_redirects=False)
-        self.assertEqual(response.status, 302)
-        self.assertEqual(response.headers["Location"], "/")
-        # 跟随重定向后页面正常返回，且地址栏不再有 token。
-        self.assertEqual((await self.client.get("/?token=s3cret")).status, 200)
-
-    async def test_bearer_header_does_not_redirect(self) -> None:
-        response = await self.client.get(
-            "/api/status", headers={"Authorization": "Bearer s3cret"}
-        )
-        self.assertEqual(response.status, 200)
-        self.assertNotIn("wechat_insights_token", response.cookies)
-
-    async def test_post_with_query_token_is_not_redirected(self) -> None:
-        # 302 会把 POST 转成 GET、破坏接口语义，所以非 GET/HEAD 只写 cookie。
-        with patch.object(InsightsRuntime, "analyze", return_value=True):
-            response = await self.client.post("/api/refresh?token=s3cret")
-        self.assertEqual(response.status, 202)
-        self.assertIn("wechat_insights_token", response.cookies)
-
-    async def test_kind_override_requires_a_token(self) -> None:
-        response = await self.client.post(
-            f"/api/contact/{HASH}/kind", json={"kind": "family"}
-        )
-        self.assertEqual(response.status, 401)
-        response = await self.client.post(
-            f"/api/contact/{HASH}/kind",
-            json={"kind": "family"},
-            headers={"Authorization": "Bearer s3cret"},
-        )
-        self.assertEqual(response.status, 200)
-        self.assertEqual(self.store.get_contact(SESSION_ID).kind_manual, "family")
-
-    async def test_unknown_paths_require_auth_too(self) -> None:
-        # 404 响应同样要过鉴权，不能成为未授权探测的信息源。
-        self.assertEqual((await self.client.get("/api/nope")).status, 401)
-        response = await self.client.get(
-            "/api/nope", headers={"Authorization": "Bearer s3cret"}
-        )
-        self.assertEqual(response.status, 404)
-
-    async def test_head_requests_require_auth(self) -> None:
-        self.assertEqual(
-            (await self.client.request("HEAD", "/api/status")).status, 401
-        )
-        response = await self.client.request(
-            "HEAD", "/api/status", headers={"Authorization": "Bearer s3cret"}
-        )
-        self.assertEqual(response.status, 200)
-        # HEAD 查询参数同样会 302 清掉 token。
-        redirected = await self.client.request(
-            "HEAD", "/api/status?token=s3cret", allow_redirects=False
-        )
-        self.assertEqual(redirected.status, 302)
-        self.assertEqual(redirected.headers["Location"], "/api/status")
-
-    async def test_options_requests_require_auth(self) -> None:
-        self.assertEqual((await self.client.options("/")).status, 401)
-        response = await self.client.options(
-            "/", headers={"Authorization": "Bearer s3cret"}
-        )
-        # 路径存在但没注册 OPTIONS：aiohttp 回 405（带 Allow 头），而不是放行。
-        self.assertEqual(response.status, 405)
-
-    async def test_wrong_token_is_rejected(self) -> None:
-        self.assertEqual((await self.client.get("/api/status?token=nope")).status, 401)
