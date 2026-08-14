@@ -51,6 +51,8 @@
     period: "AI 时段评分",
     // 好感度校准：消化右键标记，把幅度分配到七维。
     calibrate: "好感度校准",
+    // 绝交日期推算：消化「不知道」标记，从消息统计里找候选断点。
+    breakup_guess: "推算绝交日期",
     // 绝交核实：消化右键绝交标记，核实后封顶压低分数。
     breakup: "绝交核实",
     score: "重算打分",
@@ -662,9 +664,13 @@
         var pending = result.data && result.data.pending;
         if (pending) {
           // 服务端已把 breakup_pending 写进 payload，重拉列表让
-          // 「绝交核实中」角标与清除项立刻可见。
+          // 「绝交核实中」/「推算日期中」角标与清除项立刻可见。
           loadContacts();
-          I.snackbar("已标记，下一轮分析核实");
+          I.snackbar(
+            pending.date == null
+              ? "已标记，下一轮分析会先推算日期再核实"
+              : "已标记，下一轮分析核实"
+          );
         }
       })
       .catch(function (err) {

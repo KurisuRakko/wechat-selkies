@@ -20,6 +20,7 @@ from urllib.parse import urlencode
 from aiohttp import web
 
 from .analyzer import Analyzer
+from .breakup import truncate_history_at_breakup
 from .classify import KIND_VALUES
 from .history import refine_limit_day
 from .constants import (
@@ -85,36 +86,6 @@ def _history_sampling(row: ContactRow) -> dict:
             and row.first_message_at is not None
             and (until is None or until < refine_limit_day(int(time.time())))
         ),
-    }
-
-
-def _truncate_history_at_breakup(
-    rows: list[dict], row: ContactRow
-) -> tuple[list[dict], dict | None]:
-    """确认绝交的联系人只显示绝交日（含）之前的温度曲线。
-
-    截断只发生在下发时：score_history 的行一条不动——曲线是客观记录，
-    清除绝交标记后完整曲线要能立刻回来，不必重算全史。没有真的截掉
-    东西时不返回 cutoff，免得前端在数据范围外画标记线撑坏 time 轴。
-    """
-
-    data = row.breakup_data()
-    if data is None or data.get("verdict") != "confirmed":
-        return rows, None
-    cutoff_day = data.get("date")
-    if not isinstance(cutoff_day, str) or not re.fullmatch(
-        r"\d{4}-\d{2}-\d{2}", cutoff_day
-    ):
-        # 脏数据防御：日期形状不对就不截断，绝交结论照常展示。
-        return rows, None
-    kept = [point for point in rows if point["day"] <= cutoff_day]
-    if len(kept) == len(rows):
-        # 绝交日晚于最后一个采样点：曲线本来就结束了，截断没有意义。
-        return rows, None
-    return kept, {
-        "day": cutoff_day,
-        "kind": data.get("kind"),
-        "certainty": data.get("certainty"),
     }
 
 
@@ -516,7 +487,7 @@ def create_app(runtime: InsightsRuntime) -> web.Application:
             for day, overall, _dims in store.load_score_history(row.session_id)
         ]
         # 确认绝交的联系人只下发绝交日（含）之前的点，曲线止于当天。
-        history, history_cutoff = _truncate_history_at_breakup(history, row)
+        history, history_cutoff = truncate_history_at_breakup(history, row)
         return no_store(
             {
                 "ok": True,
@@ -676,6 +647,10 @@ def create_app(runtime: InsightsRuntime) -> web.Application:
         综合分与七维，界面马上回到绝交前的口径。重新标记时旧结论同时从
         contacts 与 payload 里撤下，避免旧封顶在核实之前一直压着分数。
         标记只落在响应里，wxid 不出现在任何响应中。
+
+        date 为 null（或不传）表示用户选了「不知道」：标记会先进入下一轮
+        分析的日期推算（guess_breakup_dates），推算出日期后再走既有核实；
+        这条路径跳过日期格式与未来日期校验，certainty 仍必须合法。
         """
 
         value = request.match_info["hash"]
@@ -735,44 +710,50 @@ def create_app(runtime: InsightsRuntime) -> web.Application:
             return no_store({"ok": True, "cleared": True})
         date = body.get("date") if isinstance(body, dict) else None
         certainty = body.get("certainty") if isinstance(body, dict) else None
-        if not isinstance(date, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
-            return web.json_response(
-                {
-                    "ok": False,
-                    "error": {
-                        "code": "BAD_REQUEST",
-                        "message": "日期格式应为 YYYY-MM-DD",
+        if date is not None:
+            # date 为 null（"不知道"）跳过这一整段格式/未来日期校验：
+            # 具体日期由下一轮分析的 guess_breakup_dates 推算，这里没有
+            # 值可校验。
+            if not isinstance(date, str) or not re.fullmatch(
+                r"\d{4}-\d{2}-\d{2}", date
+            ):
+                return web.json_response(
+                    {
+                        "ok": False,
+                        "error": {
+                            "code": "BAD_REQUEST",
+                            "message": "日期格式应为 YYYY-MM-DD",
+                        },
                     },
-                },
-                status=400,
-                headers={"Cache-Control": "no-store"},
-            )
-        try:
-            time.strptime(date, "%Y-%m-%d")
-        except ValueError:
-            return web.json_response(
-                {
-                    "ok": False,
-                    "error": {
-                        "code": "BAD_REQUEST",
-                        "message": "日期格式应为 YYYY-MM-DD",
+                    status=400,
+                    headers={"Cache-Control": "no-store"},
+                )
+            try:
+                time.strptime(date, "%Y-%m-%d")
+            except ValueError:
+                return web.json_response(
+                    {
+                        "ok": False,
+                        "error": {
+                            "code": "BAD_REQUEST",
+                            "message": "日期格式应为 YYYY-MM-DD",
+                        },
                     },
-                },
-                status=400,
-                headers={"Cache-Control": "no-store"},
-            )
-        if date > datetime.now().date().isoformat():
-            return web.json_response(
-                {
-                    "ok": False,
-                    "error": {
-                        "code": "BAD_REQUEST",
-                        "message": "绝交日期不能在未来",
+                    status=400,
+                    headers={"Cache-Control": "no-store"},
+                )
+            if date > datetime.now().date().isoformat():
+                return web.json_response(
+                    {
+                        "ok": False,
+                        "error": {
+                            "code": "BAD_REQUEST",
+                            "message": "绝交日期不能在未来",
+                        },
                     },
-                },
-                status=400,
-                headers={"Cache-Control": "no-store"},
-            )
+                    status=400,
+                    headers={"Cache-Control": "no-store"},
+                )
         if certainty not in ("certain", "suspected"):
             return web.json_response(
                 {

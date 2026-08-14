@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from wechat_history.reader import HistoryReader
 from wechat_history.sessions import scan_direct_rows
 
-from .breakup import refresh_breakups
+from .breakup import guess_breakup_dates, refresh_breakups
 from .calibrate import refresh_calibrations
 from .classify import classify_contacts
 from .constants import (
@@ -80,6 +80,8 @@ class AnalysisResult:
     llm_periods: int = 0
     # 本轮消化的好感度右键标记数（写入校准的联系人数）。
     calibrated: int = 0
+    # 本轮处理的「不知道」标记数（推算出日期 + 推算失败写终态，两者合计）。
+    breakup_guesses: int = 0
     # 本轮核实的绝交标记数（写入结论的联系人数）。
     breakups: int = 0
     # 本轮全史回放写入的采样点行数（关系温度曲线补上部署日之前的历史）。
@@ -261,6 +263,16 @@ class Analyzer:
                 )
             except Exception:
                 LOG.exception("好感度校准失败，本轮跳过")
+            # 绝交日期推算：消化「不知道」标记，从 stats_daily 的活跃度断崖
+            # 推算候选日期写回 pending，交给下面的核实流程照常处理；推算
+            # 不出候选就落终态失败结论。纯统计计算，不需要 reader/LLM，
+            # 可选项，出意外不能拖垮整轮打分。
+            try:
+                result.breakup_guesses = guess_breakup_dates(
+                    self.store, moment, self._report
+                )
+            except Exception:
+                LOG.exception("绝交日期推算失败，本轮跳过")
             # 绝交核实同样要在 reader 关闭前做（llm 策略下要从快照里读采样
             # 文本）。所有策略都跑：冷断判定不依赖 LLM。可选项，出意外
             # 不能拖垮整轮打分，隔离处理。
@@ -545,19 +557,20 @@ class Analyzer:
     def _apply_breakup(payload: dict[str, object], contact: ContactRow) -> None:
         """把核实过的绝交结论应用进 payload：确认的封顶压低七维与综合分。
 
-        rejected 只挂信息不改分，供前端展示「绝交存疑」；confirmed 把
-        校准之后的最终值整体等比缩到封顶（分数已低于封顶则不缩放），并
-        把 base 快照与压掉的幅度一并塞进 payload 的 breakup 键——前端
-        据此显示角标，清除时按 base 即时还原。
+        rejected/unknown 都只挂信息不改分，分别供前端展示「绝交存疑」
+        「日期不明」；confirmed 把校准之后的最终值整体等比缩到封顶（分数
+        已低于封顶则不缩放），并把 base 快照与压掉的幅度一并塞进 payload
+        的 breakup 键——前端据此显示角标，清除时按 base 即时还原。
         """
 
         data = contact.breakup_data()
         if data is None or data.get("verdict") != "confirmed":
-            if data is not None and data.get("verdict") == "rejected":
+            if data is not None and data.get("verdict") in ("rejected", "unknown"):
                 payload["breakup"] = {
-                    "verdict": "rejected",
+                    "verdict": data.get("verdict"),
                     "note": data.get("note"),
                     "date": data.get("date"),
+                    "date_source": data.get("date_source", "user"),
                 }
             return
         cap = (
@@ -587,6 +600,7 @@ class Analyzer:
             "note": data.get("note") or None,
             "overall_delta": round(float(payload["overall"]) - base_overall, 1),
             "base": {"overall": base_overall, "dimensions": base_dims},
+            "date_source": data.get("date_source", "user"),
         }
 
     def _scores_asof(
