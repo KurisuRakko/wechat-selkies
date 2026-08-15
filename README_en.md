@@ -72,6 +72,10 @@ The top bar offers four quality presets, all using `x264enc-striped` with CBR ra
 
 Every page load runs an automatic speed test against a generated 1 MiB same-origin file: measured download `< 3 Mbps` selects 省流, `3–8 Mbps` selects 流畅, `8–15 Mbps` selects 高清, and `>= 15 Mbps` selects 极致. If RTT exceeds 150ms, the automatic pick is capped at 流畅. A 3-second timeout or failure keeps the current preset. Once the user manually clicks any preset, auto selection is disabled for that session and returns after a page refresh.
 
+### Auto Power Saving When Idle
+
+A closable toggle in the top bar: when the page is sent to the background, loses focus, or receives no mouse or keyboard input for over 60 seconds, the encoding quality is temporarily lowered to the same settings as the 省流 preset (12 fps, 2 Mbps, static CRF 33). As soon as the page becomes visible again, regains focus, or receives any input, the actual settings from before the idle period are restored immediately — your manually chosen quality preset is never overwritten. Enabled by default; click the toggle to turn it off, which also restores the settings right away if power saving is active.
+
 ### Files Panel
 
 The sidebar's Files panel is a visual browser for the downloads directory

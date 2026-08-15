@@ -193,6 +193,15 @@ RUN sh /tmp/inject-quality-presets-script.sh && rm -f /tmp/inject-quality-preset
 RUN dd if=/dev/urandom of=/usr/share/selkies/selkies-dashboard/wechat-speedtest.bin bs=1048576 count=1 && \
     test "$(wc -c < /usr/share/selkies/selkies-dashboard/wechat-speedtest.bin)" -eq 1048576
 
+# 空闲自动省流：页面切到后台或超过 60 秒无任何键鼠输入时，自动把编码临时降到
+# 「省流」档（12 fps / 2 Mbps / 静态 CRF 33），恢复可见/聚焦/任意输入后立即还原
+# 进入空闲前的真实设置。复用画质预设的 settings postMessage 通道（键级合并）与
+# 三个 localStorage 键，只临时覆盖 framerate / video_bitrate / h264_paintover_crf，
+# 永不触碰 wechatQualityPreset（用户手动保存的画质预设）与锁定设置的名下键。
+COPY patches/wechat-idle-saver.js /usr/share/selkies/selkies-dashboard/src/wechat-idle-saver.js
+COPY patches/inject-idle-saver-script.sh /tmp/inject-idle-saver-script.sh
+RUN sh /tmp/inject-idle-saver-script.sh && rm -f /tmp/inject-idle-saver-script.sh
+
 # 锁定部署所需的显示/编码设置，隐藏侧边栏“应用程序/共享”卡片，并统一画质
 # 滑块方向（最左差、最右好）。浏览器在 bundle 启动前写入这些键，随后由
 # MutationObserver 持续锁定后渲染出来的控件和面板。
