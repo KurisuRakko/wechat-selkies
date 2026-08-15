@@ -324,6 +324,13 @@ Tailscale 地址上，所以「不挂 Tailscale 就访问不了」这条约束�
 证书（内置本地 CA）与验收清单见
 [integrations/wechat-proxy/README.md](integrations/wechat-proxy/README.md)。
 
+### 可选：摄像头转发（实验性，仅 Linux 宿主）
+
+默认关闭。把浏览器的摄像头画面桥接成微信视频通话可选的虚拟摄像头（需要宿主
+已加载 v4l2loopback 并把 `/dev/videoN` 传入容器）。**Windows + Docker
+Desktop（WSL2 backend）宿主不支持**——原因和启用方法见
+[docs/webcam-forwarding.md](docs/webcam-forwarding.md)。
+
 ## 安装第三方应用（如 Telegram）
 
 本项目支持通过 [proot-apps](https://github.com/linuxserver/proot-apps) 安装第三方 Linux 应用。以 Telegram 为例：
