@@ -246,6 +246,12 @@ RUN /lsiopy/bin/python3 /tmp/upload-and-stats-fixes.py && rm -f /tmp/upload-and-
 COPY patches/audio-silence-gate.py /tmp/audio-silence-gate.py
 RUN /lsiopy/bin/python3 /tmp/audio-silence-gate.py && rm -f /tmp/audio-silence-gate.py
 
+# 麦克风转发是 Selkies 原生能力，这里不改行为，只在构建期断言其依赖的上游
+# 实现细节还在（虚拟源创建参数、设置项注册、dashboard 按钮），防止未来基础
+# 镜像迁移无声失效。
+COPY patches/verify-microphone-support.py /tmp/verify-microphone-support.py
+RUN /lsiopy/bin/python3 /tmp/verify-microphone-support.py && rm -f /tmp/verify-microphone-support.py
+
 # stop horizontal tearing in the striped (x264enc-striped) video path. pixelflux
 # cuts each frame into horizontal Y-stripes and the bundle runs one VideoDecoder
 # per stripe, pushing every decoded output into one global paint queue that the
@@ -280,6 +286,9 @@ ENV SELKIES_ENABLE_RATE_CONTROL="true"
 # sidebar's "Gamepads" section so no gamepad UI ever renders.
 ENV SELKIES_GAMEPAD_ENABLED="false"
 ENV SELKIES_UI_SIDEBAR_SHOW_GAMEPADS="false"
+
+# Selkies 原生麦克风转发默认开启，显式声明只为可发现/可覆盖。
+ENV SELKIES_MICROPHONE_ENABLED="true"
 
 # set app name
 ENV TITLE="WeChat-Selkies"

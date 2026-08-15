@@ -39,6 +39,7 @@ This project packages the official WeChat/QQ Linux client in a Docker container,
 - 🤖 **Auto Start**: Configurable auto-start for WeChat and QQ clients (optional)
 - 📋 **Desktop Shortcut Integration**: Automatically scans `.desktop` files in `~/Desktop/` and adds them to the right-click menu, making it easy to launch third-party applications (e.g., apps installed via proot-apps)
 - 📂 **File Manager**: Built-in PCManFM lightweight file manager, accessible from the right-click menu for easy file management inside the container
+- 🎤 **Microphone Forwarding**: Use the browser microphone as WeChat's input device inside the container (native Selkies capability), for voice messages and call audio
 
 ### Locked Settings
 
@@ -101,6 +102,20 @@ page is involved anymore.
 > set, upstream init-nginx deletes the whole `/files` block and the panel
 > reports a read failure — that is the upstream hardening switch working as
 > intended.
+
+### Microphone Forwarding
+
+The microphone icon at the top of the sidebar is a native Selkies feature and
+this project leaves it untouched. To use it: click the sidebar microphone icon
+once and allow the browser's microphone permission, then open WeChat's
+**Settings → Calls** and pick `SelkiesVirtualMic` from the microphone dropdown.
+The order matters — the virtual device is only created once the browser sends
+its first audio frame, so opening WeChat settings first will not show it. The
+environment variable `SELKIES_MICROPHONE_ENABLED` (default `true`) disables it.
+Note that this only guarantees WeChat can read the microphone audio; whether
+voice/video calls actually connect depends on WeChat's own NAT traversal and is
+unrelated to this project. Voice message recording does not depend on peer
+traversal and should be reliably available.
 
 ### Drag-out Export
 
