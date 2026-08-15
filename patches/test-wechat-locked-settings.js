@@ -368,6 +368,12 @@ const gamepadButton = makeGamepadButton();
 const otherActionButton = makeControl("audioActionButton");
 const videoCrf = makeCrfSlider("videoCRFSlider", 5, 50, 25);
 const paintoverCrf = makeCrfSlider("h264PaintoverCRFSlider", 5, 50, 18);
+const coreButtonsRow = new FakeElement("DIV");
+coreButtonsRow.className = "sidebar-action-buttons";
+const micButton = new FakeElement("BUTTON");
+micButton.className = "action-button";
+coreButtonsRow.appendChild(micButton);
+body.appendChild(coreButtonsRow);
 
 run();
 
@@ -419,6 +425,10 @@ assert.notEqual(videoSettingsSection.style.display, "none", "Video Settings card
 assert.equal(gamepadButton.style.display, "none", "floating gamepad button is hidden");
 assert.notEqual(otherActionButton.style.display, "none", "other action button is not hidden");
 assert.deepEqual(observeArgs.options, { childList: true, subtree: true });
+// 麦克风按钮属于侧边栏核心按钮排，锁定脚本只隐藏设置行/面板/手柄按钮，不得波及。
+assert.notEqual(coreButtonsRow.style.display, "none", "麦克风按钮所在的核心按钮排不应被隐藏");
+assert.equal(coreButtonsRow.getAttribute("hidden"), null, "核心按钮排不应带 hidden 属性");
+assert.notEqual(micButton.style.display, "none", "麦克风按钮本身不应被隐藏");
 
 /* 2. CRF 滑块保留真实值，用 RTL 让最左差、最右好 ------------------------ */
 
@@ -466,6 +476,12 @@ const lateApps = makeSection("apps-content", "Apps");
 const lateScreenSettings = makeSection("screen-settings-content", "屏幕设置");
 const lateToggle = makeControl("antiAliasingToggle");
 const lateGamepadButton = makeGamepadButton();
+const lateCoreButtonsRow = new FakeElement("DIV");
+lateCoreButtonsRow.className = "sidebar-action-buttons";
+const lateMicButton = new FakeElement("BUTTON");
+lateMicButton.className = "action-button";
+lateCoreButtonsRow.appendChild(lateMicButton);
+body.appendChild(lateCoreButtonsRow);
 assert.notEqual(lateApps.style.display, "none", "not hidden before the observer runs");
 assert.notEqual(lateToggle.parentNode.style.display, "none", "row not hidden before the observer runs");
 assert.ok(observerCallback, "MutationObserver is installed");
@@ -480,6 +496,9 @@ assert.equal(lateGamepadButton.style.display, "none", "late gamepad button is hi
 assert.notEqual(videoSettingsSection.style.display, "none", "Video Settings is not hidden after mutations");
 assert.notEqual(otherActionButton.style.display, "none", "other action button is not hidden after mutations");
 assert.equal(lateToggle.parentNode.style.display, "none", "late toggle row is hidden");
+assert.notEqual(lateCoreButtonsRow.style.display, "none", "迟渲染的核心按钮排不应被隐藏");
+assert.equal(lateCoreButtonsRow.getAttribute("hidden"), null, "迟渲染的核心按钮排不应带 hidden 属性");
+assert.notEqual(lateMicButton.style.display, "none", "迟渲染的麦克风按钮本身不应被隐藏");
 
 /* 5. DOM mutation 不触发 seed，定时 enforce 才兜底回写 ------------------- */
 
@@ -521,9 +540,18 @@ assert.equal(rebuiltSection.style.display, "none", "soft reload re-hides section
 assert.ok(observerCallback, "soft reload reinstalls the observer");
 // 重装后新渲染的节点仍由观察器接管。
 const softReloadLateToggle = makeControl("antiAliasingToggle");
+const softReloadLateCoreButtonsRow = new FakeElement("DIV");
+softReloadLateCoreButtonsRow.className = "sidebar-action-buttons";
+const softReloadLateMicButton = new FakeElement("BUTTON");
+softReloadLateMicButton.className = "action-button";
+softReloadLateCoreButtonsRow.appendChild(softReloadLateMicButton);
+body.appendChild(softReloadLateCoreButtonsRow);
 observerCallback([]);
 flushRaf();
 assert.equal(softReloadLateToggle.parentNode.style.display, "none", "reinstalled observer hides late rows");
+assert.notEqual(softReloadLateCoreButtonsRow.style.display, "none", "软重载后迟渲染的核心按钮排不应被隐藏");
+assert.equal(softReloadLateCoreButtonsRow.getAttribute("hidden"), null, "软重载后迟渲染的核心按钮排不应带 hidden 属性");
+assert.notEqual(softReloadLateMicButton.style.display, "none", "软重载后迟渲染的麦克风按钮本身不应被隐藏");
 
 /* 8. 观察器自愈：文档根被整体替换（旧文档丢弃），enforce 节拍重新挂载 ------ */
 
