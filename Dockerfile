@@ -16,6 +16,7 @@ ARG BUILDPLATFORM
 ARG INSTALL_QQ=true
 ARG INSTALL_PCMANFM=true
 ARG INSTALL_WECHAT_HISTORY=false
+ARG INSTALL_WEBCAM_FORWARD=false
 RUN echo "🏗️ Building WeChat-Selkies on $BUILDPLATFORM, targeting $TARGETPLATFORM"
 
 RUN apt-get update && \
@@ -41,6 +42,16 @@ RUN if [ "$INSTALL_PCMANFM" = "true" ]; then \
 # images; only the local compose file enables it.
 RUN if [ "$INSTALL_WECHAT_HISTORY" = "true" ]; then \
         apt-get install -y --no-install-recommends xdotool xclip; \
+    fi
+
+# 摄像头转发是可选实验功能，默认关闭：浏览器把 getUserMedia 采集的画面按
+# 15fps 编码成 JPEG，经独立 WebSocket 送入容器内 bridge，由 pyfakewebcam
+# 写入宿主映射进来的 v4l2loopback 虚拟摄像头。仅对已加载 v4l2loopback 的
+# Linux 宿主有意义；Windows + Docker Desktop（WSL2 backend）宿主无法加载
+# 自定义内核模块，详见 docs/webcam-forwarding.md。
+ARG INSTALL_WEBCAM_FORWARD
+RUN if [ "$INSTALL_WEBCAM_FORWARD" = "true" ]; then \
+        pip install --no-cache-dir pyfakewebcam numpy; \
     fi
 
 RUN pip install --no-cache-dir python-xlib
@@ -374,3 +385,15 @@ COPY patches/wechat-export-s6 /tmp/wechat-desktop-export/s6
 COPY patches/install-wechat-desktop-export.sh /tmp/install-wechat-desktop-export.sh
 RUN sh /tmp/install-wechat-desktop-export.sh /tmp/wechat-desktop-export && \
     rm -rf /tmp/wechat-desktop-export /tmp/install-wechat-desktop-export.sh
+
+# 摄像头转发（可选，仅 Linux 宿主）：浏览器摄像头 → 独立 WebSocket → nginx
+# 反代 → bridge → pyfakewebcam → v4l2loopback 虚拟摄像头 → 微信视频通话可选
+# 用。资源无条件 COPY，是否安装由脚本第一个参数（INSTALL_WEBCAM_FORWARD）
+# 决定，与 install-wechat-notifications.sh 同一约定。必须在 COPY /root / 之后：
+# 安装脚本要校验并 chmod /scripts/webcam/wechat-webcam-bridge.py。
+COPY patches/wechat-webcam-forward.js /tmp/wechat-webcam/wechat-webcam-forward.js
+COPY root/scripts/webcam/wechat-webcam-bridge.py /tmp/wechat-webcam/wechat-webcam-bridge.py
+COPY patches/webcam-s6 /tmp/wechat-webcam/s6
+COPY patches/install-wechat-webcam-forward.sh /tmp/install-wechat-webcam-forward.sh
+RUN sh /tmp/install-wechat-webcam-forward.sh "$INSTALL_WEBCAM_FORWARD" /tmp/wechat-webcam && \
+    rm -rf /tmp/wechat-webcam /tmp/install-wechat-webcam-forward.sh

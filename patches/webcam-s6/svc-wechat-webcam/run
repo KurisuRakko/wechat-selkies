@@ -1,0 +1,5 @@
+#!/usr/bin/with-contenv bash
+# 以 root 运行：/dev/videoN 设备节点权限在不同宿主上不可预测。
+export PYTHONDONTWRITEBYTECODE=1
+export PYTHONUNBUFFERED=1
+exec /lsiopy/bin/python3 /scripts/webcam/wechat-webcam-bridge.py

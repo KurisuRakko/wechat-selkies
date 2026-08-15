@@ -331,6 +331,12 @@ See [Local WeChat Chat History MCP](docs/wechat-history.md) for setup, security
 boundaries, testing, and legal cautions. Do not publish a public image with this
 feature enabled.
 
+### Optional Webcam Forwarding (experimental, Linux host only)
+
+Disabled by default; bridges the browser camera into a v4l2loopback virtual
+camera for WeChat video calls, and is not supported on Windows + Docker Desktop
+(WSL2 backend) hosts — see [docs/webcam-forwarding.md](docs/webcam-forwarding.md).
+
 ## Installing Third-Party Applications (e.g., Telegram)
 
 This project supports installing third-party Linux applications via [proot-apps](https://github.com/linuxserver/proot-apps). Here's how to install Telegram as an example:
