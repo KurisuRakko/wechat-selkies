@@ -1,0 +1,15 @@
+#!/usr/bin/with-contenv bash
+
+# ENABLE_WECHAT_SECOND_DISPLAY 默认 false：关闭时这个 longrun 常驻但什么都
+# 不做（sleep infinity），既不占用 X11 连接也不监听端口——这是
+# s6-overlay 里"资源无条件随镜像存在、行为由运行期开关决定"的标准写法。
+export DISPLAY="${DISPLAY:-:1}"
+export PYTHONDONTWRITEBYTECODE=1
+export PYTHONUNBUFFERED=1
+export PYTHONPATH="/scripts:${PYTHONPATH:-}"
+
+if [ "${ENABLE_WECHAT_SECOND_DISPLAY:-false}" != "true" ]; then
+    exec sleep infinity
+fi
+
+exec s6-setuidgid abc /lsiopy/bin/python3 -m second_display

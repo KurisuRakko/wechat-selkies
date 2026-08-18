@@ -333,6 +333,11 @@ ENV ENABLE_WECHAT_AUTO_RELOGIN="true"
 ENV WECHAT_RELOGIN_MAX_ATTEMPTS="3"
 ENV WECHAT_RELOGIN_RETRY_DELAY="30"
 
+# 副屏窗口管家（实验性，默认关闭）：副屏（第二个 selkies 浏览器窗口）出现
+# 时，自动把微信的小程序/图片查看器一类非主窗口搬到副屏区域平铺；副屏消失
+# 时收回主屏。完全建立在上游既有的多显示器机制之上，不改 selkies.py/
+# selkies-core.js，见 docs/second-display.md。
+ENV ENABLE_WECHAT_SECOND_DISPLAY="false"
 
 
 # update favicon

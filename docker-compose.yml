@@ -40,4 +40,5 @@ services:
       - WECHAT_WEBCAM_WIDTH=${WECHAT_WEBCAM_WIDTH:-640}
       - WECHAT_WEBCAM_HEIGHT=${WECHAT_WEBCAM_HEIGHT:-480}
       - WECHAT_WEBCAM_BRIDGE_PORT=${WECHAT_WEBCAM_BRIDGE_PORT:-8767}
+      - ENABLE_WECHAT_SECOND_DISPLAY=${ENABLE_WECHAT_SECOND_DISPLAY:-false}  # 副屏窗口管家（实验性），见 docs/second-display.md
     shm_size: "${SHM_SIZE:-1gb}"        # recommended, will improve performance
