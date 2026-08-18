@@ -93,9 +93,16 @@
     if (!document.body) return;
     var existing = document.getElementById(PROMPT_ID);
     if (existing) {
-      existing.querySelector("button[data-action]").textContent =
-        "检测到 " + count + " 个可弹出的微信窗口 · 点击在副屏打开";
-      return;
+      var button = existing.querySelector("button[data-action]");
+      if (button) {
+        button.textContent = "检测到 " + count + " 个可弹出的微信窗口 · 点击在副屏打开";
+        return;
+      }
+      // Whatever currently occupies PROMPT_ID is not the normal prompt bar
+      // (the popup-blocked fallback link from showFallbackPrompt() shares
+      // the same id and has no data-action button) — replace it instead of
+      // touching a node that was never there.
+      existing.remove();
     }
 
     var bar = document.createElement("div");

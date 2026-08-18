@@ -252,7 +252,34 @@ assert.equal(link.tagName, "A");
 assert.equal(link.href, "https://wechat.example/index.html#display2");
 assert.equal(link.target, "_blank");
 
-/* 7. closing the secondary window brings the prompt back within 2s --------- */
+/* 7. a poll landing while the fallback prompt is showing must not throw ---- */
+
+// showPrompt() used to blindly call
+// existing.querySelector("button[data-action]").textContent = ... — but the
+// fallback bar (still occupying the same PROMPT_ID) has an <a>, not a
+// button[data-action], so that threw a TypeError inside the fetch .then
+// handler. The chain's own .catch then mistook it for a network failure and
+// started backing off, and the fallback bar's count never updated again.
+reset();
+respondWith(1);
+await bootAndFetch();
+openReturnValue = null; // simulate the popup blocker
+byId.get("wechat-second-display-prompt").querySelector("button[data-action]").emit("click");
+const fallbackShowing = byId.get("wechat-second-display-prompt");
+assert.equal(fallbackShowing.children[0].tagName, "A", "fallback link is showing");
+
+respondWith(5);
+assert.ok(fireTimeout(5000), "next scheduled poll fires while the fallback is up");
+await settle();
+assert.equal(fetchCalls.length, 2, "the poll after the fallback still went through (no exception, no backoff)");
+const rebuilt = byId.get("wechat-second-display-prompt");
+assert.ok(rebuilt, "a prompt is still showing after the poll");
+const rebuiltButton = rebuilt.querySelector("button[data-action]");
+assert.ok(rebuiltButton, "the normal action button replaced the fallback link");
+assert.match(rebuiltButton.textContent, /5 个可弹出的微信窗口/);
+assert.ok(fireTimeout(5000), "polling resumed at the normal 5s interval, not a backed-off one");
+
+/* 8. closing the secondary window brings the prompt back within 2s --------- */
 
 reset();
 respondWith(4);
@@ -265,7 +292,7 @@ handle.closed = true;
 fireInterval(2000);
 assert.ok(byId.get("wechat-second-display-prompt"), "prompt reappears once the handle is observed closed");
 
-/* 8. failures back off exponentially to a 30s ceiling; success resets to 5s */
+/* 9. failures back off exponentially to a 30s ceiling; success resets to 5s */
 
 reset();
 fetchBehavior = () => Promise.reject(new Error("network down"));
