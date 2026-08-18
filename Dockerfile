@@ -143,6 +143,15 @@ ARG DAMAGE_BLOCK_DURATION=4
 COPY patches/damage-block-duration.sh /tmp/damage-block-duration.sh
 RUN sh /tmp/damage-block-duration.sh "$DAMAGE_BLOCK_DURATION" && rm -f /tmp/damage-block-duration.sh
 
+# shorten how long a transient network stall can freeze the picture (and how
+# long recovery takes to notice) by polling frame backpressure more often.
+# Conservative 2.5x speedup, not more -- see patches/backpressure-check-interval.sh
+# for the trade-off this is not free of. Raise back toward 0.5 if it ever reads
+# as more micro-stutter instead of less.
+ARG BACKPRESSURE_CHECK_INTERVAL=0.2
+COPY patches/backpressure-check-interval.sh /tmp/backpressure-check-interval.sh
+RUN sh /tmp/backpressure-check-interval.sh "$BACKPRESSURE_CHECK_INTERVAL" && rm -f /tmp/backpressure-check-interval.sh
+
 # drag files from the host onto the stream and they are pasted into WeChat; drag
 # them out of the sidebar file list and they download. Added as a plain script
 # beside the bundle (like src/universalTouchGamepad.js) rather than as surgery

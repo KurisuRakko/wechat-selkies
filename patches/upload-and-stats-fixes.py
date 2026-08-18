@@ -5,7 +5,7 @@ Same house style as input-and-backpressure-fixes.py: exact-string replacement
 with a count assertion and an ast.parse check, so a base-image bump fails the
 build instead of silently shipping the unpatched behaviour.
 
-Three unrelated single-socket problems, all in selkies/selkies.py:
+Four unrelated single-socket problems, all in selkies/selkies.py:
 
   1. The 0x01 upload-chunk handler calls a plain blocking file.write() straight
      on the asyncio event loop. With the stock 1 MiB chunk that is a
@@ -143,6 +143,39 @@ patch(
 )
 
 
+# --------------------------------------------------------------------------- 4
+# TCP_NODELAY on the data websocket connection.
+
+patch(
+    "selkies.py",
+    "TCP_NODELAY on the data websocket connection",
+    """    async def ws_handler(self, websocket):
+        if self.is_secure_mode:
+""",
+    """    async def ws_handler(self, websocket):
+        # This one socket carries video, audio, input, clipboard and upload
+        # bytes. websockets' own sync implementation sets TCP_NODELAY on every
+        # accepted connection (websockets/sync/server.py); its asyncio
+        # implementation never does, so Nagle's algorithm can sit on small
+        # outgoing writes (frame ACK replies, pings, stats pushes, tiny
+        # paint-over stripes) until more data queues up or a peer ACK
+        # arrives -- tens of milliseconds of avoidable latency on exactly the
+        # small, frequent traffic that makes typing/click/scroll feel
+        # responsive. Every write on this connection is already a complete,
+        # pre-assembled application message, so disabling Nagle has no
+        # downside here.
+        try:
+            sock = websocket.transport.get_extra_info("socket")
+            if sock is not None:
+                import socket as _socket
+                sock.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+        if self.is_secure_mode:
+""",
+)
+
+
 # The bundled .pyc files would otherwise be consulted first. Python invalidates
 # them on the source mtime, which we just changed, but drop them so nothing can
 # shadow the patched source.
@@ -152,4 +185,4 @@ if os.path.isdir(cache):
         os.remove(os.path.join(cache, name))
     os.rmdir(cache)
 
-print("upload-and-stats-fixes: 3 patch(es) applied")
+print("upload-and-stats-fixes: 4 patch(es) applied")
