@@ -331,6 +331,14 @@ Tailscale 地址上，所以「不挂 Tailscale 就访问不了」这条约束�
 Desktop（WSL2 backend）宿主不支持**——原因和启用方法见
 [docs/webcam-forwarding.md](docs/webcam-forwarding.md)。
 
+### 可选：副屏窗口（实验性）
+
+默认关闭。打开第二个 selkies 浏览器窗口（`#display2`，上游原生的多显示器
+能力）后，微信的小程序/图片查看器一类非主窗口会自动搬过去平铺；关掉那个
+窗口，它们会自动收回主屏。不需要额外硬件或宿主内核模块，纯软件功能。
+启用步骤、环境变量与已知限制（含"副屏连接/断开会让主屏画面短暂重置，
+系上游行为"）见 [docs/second-display.md](docs/second-display.md)。
+
 ## 安装第三方应用（如 Telegram）
 
 本项目支持通过 [proot-apps](https://github.com/linuxserver/proot-apps) 安装第三方 Linux 应用。以 Telegram 为例：
