@@ -184,7 +184,12 @@ def list_monitors(disp, root) -> dict[str, tuple[int, int, int, int]]:
         if not name.startswith(MONITOR_NAME_PREFIX):
             continue
         display_id = name[len(MONITOR_NAME_PREFIX):]
-        result[display_id] = (monitor.x, monitor.y, monitor.width, monitor.height)
+        # 注意字段名是 width_in_pixels/height_in_pixels，不是 width/height
+        # ——MonitorInfo 结构体里没有后者，实测过（RandR 1.5 的
+        # GetMonitors 回复本身按毫米/像素两套单位分别命名宽高）。
+        result[display_id] = (
+            monitor.x, monitor.y, monitor.width_in_pixels, monitor.height_in_pixels
+        )
     return result
 
 
