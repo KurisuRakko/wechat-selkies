@@ -411,3 +411,16 @@ COPY patches/webcam-s6 /tmp/wechat-webcam/s6
 COPY patches/install-wechat-webcam-forward.sh /tmp/install-wechat-webcam-forward.sh
 RUN sh /tmp/install-wechat-webcam-forward.sh "$INSTALL_WEBCAM_FORWARD" /tmp/wechat-webcam && \
     rm -rf /tmp/wechat-webcam /tmp/install-wechat-webcam-forward.sh
+
+# 副屏窗口管家的 nginx 反代：把浏览器可见的 SUBFOLDERwechat-second-display/
+# 转发给 root/scripts/second_display 的 loopback HTTP 状态端点（8768 端口）。
+# 守护进程本体（s6 服务 + root/scripts/second_display 包）随无条件的
+# "COPY /root /" 自动带入镜像，这里只需要接通 nginx 这一段。
+COPY patches/patch-second-display-nginx.py /tmp/patch-second-display-nginx.py
+RUN /lsiopy/bin/python3 /tmp/patch-second-display-nginx.py && rm -f /tmp/patch-second-display-nginx.py
+
+# 副屏窗口管家完全建立在 Selkies 上游既有的多显示器机制之上，不改
+# selkies.py/selkies-core.js。这里只做构建期只读断言，确认该机制依赖的三处
+# 上游实现细节仍然成立，防止未来基础镜像迁移无声弄丢这条能力。
+COPY patches/verify-second-display-support.py /tmp/verify-second-display-support.py
+RUN /lsiopy/bin/python3 /tmp/verify-second-display-support.py && rm -f /tmp/verify-second-display-support.py
