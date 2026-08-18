@@ -412,6 +412,14 @@ COPY patches/install-wechat-webcam-forward.sh /tmp/install-wechat-webcam-forward
 RUN sh /tmp/install-wechat-webcam-forward.sh "$INSTALL_WEBCAM_FORWARD" /tmp/wechat-webcam && \
     rm -rf /tmp/wechat-webcam /tmp/install-wechat-webcam-forward.sh
 
+# 副屏窗口管家的提示条：检测到可搬去副屏的窗口时提示用户点击，由一次真实
+# 用户手势触发 window.open(...#display2)。always-on（不像摄像头转发那样受
+# 构建期开关限制）——脚本本身在 #display2 被动模式和无副屏时都是安静的轮询，
+# 真正决定要不要搬窗口的是 ENABLE_WECHAT_SECOND_DISPLAY 控制的守护进程。
+COPY patches/wechat-second-display.js /usr/share/selkies/selkies-dashboard/src/wechat-second-display.js
+COPY patches/inject-second-display-script.sh /tmp/inject-second-display-script.sh
+RUN sh /tmp/inject-second-display-script.sh && rm -f /tmp/inject-second-display-script.sh
+
 # 副屏窗口管家的 nginx 反代：把浏览器可见的 SUBFOLDERwechat-second-display/
 # 转发给 root/scripts/second_display 的 loopback HTTP 状态端点（8768 端口）。
 # 守护进程本体（s6 服务 + root/scripts/second_display 包）随无条件的
