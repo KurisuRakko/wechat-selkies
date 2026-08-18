@@ -548,6 +548,29 @@ patch(
 )
 
 
+# --------------------------------------------------------------------------- 5
+# Space is the most frequent non-letter key in ordinary typing, and it is on
+# every X11 keyboard layout, so it is already in the server's current keyboard
+# mapping -- exactly as safe to inject in-process as a letter. Keep it off the
+# xdotool fork+exec path (one subprocess per press and per release).
+
+patch(
+    "input_handler.py",
+    "route space through the in-process pynput path",
+    """                if char.isalpha():
+""",
+    """                # Space is on every X11 keyboard layout and therefore already
+                # in the server's current keyboard mapping -- exactly as safe
+                # as a letter here (same keysym-to-keycode lookup, no dynamic
+                # remapping race). It is also the most frequent non-letter key
+                # in ordinary typing, so keep it off the xdotool fork+exec path
+                # below and let it fall through with the same in-process pynput
+                # injection letters already use.
+                if char.isalpha() or char == " ":
+""",
+)
+
+
 # The bundled .pyc files would otherwise be consulted first. Python invalidates
 # them on the source mtime, which we just changed, but drop them so nothing can
 # shadow the patched source.
@@ -557,4 +580,4 @@ if os.path.isdir(cache):
         os.remove(os.path.join(cache, name))
     os.rmdir(cache)
 
-print("input-and-backpressure-fixes: 5 patch(es) applied")
+print("input-and-backpressure-fixes: 6 patch(es) applied")
