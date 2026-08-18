@@ -121,9 +121,9 @@ class Daemon:
             self._assign_movable(by_id, categories, display_id, monitor_rect)
             self._assign_followers(by_id, categories, display_id, monitor_rect)
         else:
-            self._recall_all(by_id, monitors)
+            self._recall_all(by_id, categories, monitors)
 
-        self._snapshot = self._build_snapshot(monitors, categories)
+        self._snapshot = self._build_snapshot(by_id, monitors, categories)
 
     def _is_main_window(self, window: classify.WindowInfo) -> bool:
         # 复用 classify() 本身的 MAIN_WINDOW 规则，不在别处重复一份"什么算
@@ -158,16 +158,42 @@ class Daemon:
             self.assigned[wid] = display_id
             self._move_if_needed(window, rect)
 
-    def _recall_all(self, by_id, monitors) -> None:
-        # 副屏不在了：把所有仍标记着 assigned 的窗口用 cascade 摆回主屏，
-        # 清空 assigned——它们在下一轮 reconcile 里会被当成普通的"未分配"
-        # 窗口重新判断。只改位置，不恢复"搬去副屏之前"的尺寸——那个尺寸本来
-        # 就没有被记录下来，和计划的"只改位置不改尺寸"是同一件事。
-        primary = monitors.get("primary") or self._fallback_primary_rect(by_id)
-        recalled = [wid for wid in self.assigned if wid in by_id]
-        recalled.sort(key=lambda wid: self.first_seen.get(wid, 0.0))
+    def _recall_all(self, by_id, categories, monitors) -> None:
+        # 副屏不在了：把所有仍标记着 assigned 的窗口，连同"滞留在所有已知
+        # 显示器范围之外"的 MOVABLE 窗口，一起用 cascade 摆回主屏，清空
+        # assigned——它们在下一轮 reconcile 里会被当成普通的"未分配"窗口
+        # 重新判断。只改位置，不恢复"搬去副屏之前"的尺寸——那个尺寸本来就
+        # 没有被记录下来，和计划的"只改位置不改尺寸"是同一件事。
+        #
+        # 后一类滞留窗口是启动自愈需要的场景：assigned 是纯内存状态，
+        # 守护进程在窗口还位于副屏区域时被杀掉/重启后，assigned 会是空的；
+        # 如果此时上游已经把副屏的 xrandr 布局收回，这些窗口的几何就会
+        # 永远停在"不属于任何当前显示器"的位置，直到用户凑巧再开一次副屏。
+        # 这里不依赖 assigned 的记忆，而是每轮直接用窗口当前几何去判断
+        # "它现在是不是不在任何显示器上"（find_owning_display 返回 None），
+        # 天然覆盖重启，也天然幂等——一旦窗口被搬回 primary，下一轮就会
+        # 命中 primary，不再判定为滞留。
+        primary_rect = monitors.get("primary")
+        cascade_target = primary_rect if primary_rect is not None else self._fallback_primary_rect(by_id)
+
+        recall_ids = {wid for wid in self.assigned if wid in by_id}
+        # 只有确认 selkies-primary 已经存在时才做这条自愈：容器极早期 RandR
+        # 还没建立任何显示器时，"不属于任何显示器"对所有窗口都成立，贸然
+        # 判定滞留会在启动瞬间把窗口错误地拉去兜底矩形。
+        if primary_rect is not None:
+            for wid, category in categories.items():
+                if category is not classify.Category.MOVABLE or wid in recall_ids:
+                    continue
+                window = by_id[wid]
+                if not window.mapped:
+                    continue
+                geometry = (window.x, window.y, window.width, window.height)
+                if classify.find_owning_display(geometry, monitors) is None:
+                    recall_ids.add(wid)
+
+        recalled = sorted(recall_ids, key=lambda wid: self.first_seen.get(wid, 0.0))
         sizes = [(by_id[wid].width, by_id[wid].height) for wid in recalled]
-        rects = layout.cascade_rects(sizes, primary)
+        rects = layout.cascade_rects(sizes, cascade_target)
         for wid, rect in zip(recalled, rects):
             self._move_if_needed(by_id[wid], rect)
         self.assigned.clear()
@@ -185,12 +211,20 @@ class Daemon:
             return  # 防抖：目标几何和当前几何一致就不发 xdotool 命令
         x11.move_resize(window.window_id, rect, window.title)
 
-    def _build_snapshot(self, monitors, categories) -> dict[str, object]:
-        movable_count = sum(1 for c in categories.values() if c is classify.Category.MOVABLE)
+    def _build_snapshot(self, by_id, monitors, categories) -> dict[str, object]:
+        # 两个计数都只统计 mapped 的窗口，和 _assign_movable() 的过滤条件
+        # 对齐——否则一个未 map（比如被最小化）的 MOVABLE 窗口会让
+        # unassigned_count 恒大于 0，提示条会在副屏已经打开、没有任何真正
+        # 未分配窗口的情况下继续常驻。
+        movable_count = sum(
+            1
+            for wid, c in categories.items()
+            if c is classify.Category.MOVABLE and by_id[wid].mapped
+        )
         unassigned_count = sum(
             1
             for wid, c in categories.items()
-            if c is classify.Category.MOVABLE and wid not in self.assigned
+            if c is classify.Category.MOVABLE and by_id[wid].mapped and wid not in self.assigned
         )
         # displays 只列出"当前实际已连接"的副屏（RandR 里存在对应
         # selkies-* 显示器），空数组即代表没有副屏——v1 单副屏下这已经是

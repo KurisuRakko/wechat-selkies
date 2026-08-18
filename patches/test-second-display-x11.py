@@ -212,30 +212,50 @@ def close_to(a: tuple[int, int, int, int], b: tuple[int, int, int, int], toleran
     return all(abs(x - y) <= tolerance for x, y in zip(a, b))
 
 
-def setup_display2(primary: tuple[int, int, int, int], display2: tuple[int, int, int, int]) -> None:
-    def geom(rect: tuple[int, int, int, int]) -> str:
-        x, y, w, h = rect
-        return f"{w}/0x{h}/0+{x}+{y}"
+def _geom(rect: tuple[int, int, int, int]) -> str:
+    x, y, w, h = rect
+    return f"{w}/0x{h}/0+{x}+{y}"
 
-    # 已有一块足够大的既存 mode，直接拿来当framebuffer，不必用 cvt/gtf 现造
+
+def ensure_framebuffer() -> None:
+    # 已有一块足够大的既存 mode，直接拿来当 framebuffer，不必用 cvt/gtf 现造
     # 一个新 mode——探测确认过 15360x8640 在这个虚拟输出上本来就存在。
-    steps = [
-        ["xrandr", "--fb", "15360x8640", "--output", "screen", "--mode", "15360x8640"],
-        ["xrandr", "--setmonitor", "selkies-primary", geom(primary), "screen"],
-        ["xrandr", "--setmonitor", "selkies-display2", geom(display2), "screen"],
-    ]
-    for step in steps:
-        result = docker_exec("env", "DISPLAY=:1", *step, timeout=10)
-        if result.returncode != 0:
-            raise TestFailure(f"{' '.join(step)} failed: {result.stderr}")
+    result = docker_exec(
+        "env", "DISPLAY=:1", "xrandr", "--fb", "15360x8640",
+        "--output", "screen", "--mode", "15360x8640", timeout=10,
+    )
+    if result.returncode != 0:
+        raise TestFailure(f"xrandr --fb setup failed: {result.stderr}")
+
+
+def set_monitor(name: str, rect: tuple[int, int, int, int]) -> None:
+    # 探测确认过：用 --setmonitor 原地重定义一个已存在的同名 monitor 到一个
+    # 相去甚远的新位置会报 BadValue（RandR 似乎要求同名重定义时新旧位置不能
+    # 差太远）；先删后建则不受此限——两种情况都先尝试删除（不存在也不报错），
+    # 保证这个函数对"该 monitor 是否已存在"保持幂等/健壮。
+    docker_exec("env", "DISPLAY=:1", "xrandr", "--delmonitor", name, timeout=10)
+    result = docker_exec(
+        "env", "DISPLAY=:1", "xrandr", "--setmonitor", name, _geom(rect), "screen",
+        timeout=10,
+    )
+    if result.returncode != 0:
+        raise TestFailure(f"xrandr --setmonitor {name} {_geom(rect)} failed: {result.stderr}")
+
+
+def delete_monitor(name: str) -> None:
+    result = docker_exec("env", "DISPLAY=:1", "xrandr", "--delmonitor", name, timeout=10)
+    if result.returncode != 0:
+        raise TestFailure(f"xrandr --delmonitor {name} failed: {result.stderr}")
+
+
+def setup_display2(primary: tuple[int, int, int, int], display2: tuple[int, int, int, int]) -> None:
+    ensure_framebuffer()
+    set_monitor("selkies-primary", primary)
+    set_monitor("selkies-display2", display2)
 
 
 def teardown_display2() -> None:
-    result = docker_exec(
-        "env", "DISPLAY=:1", "xrandr", "--delmonitor", "selkies-display2", timeout=10
-    )
-    if result.returncode != 0:
-        raise TestFailure(f"xrandr --delmonitor selkies-display2 failed: {result.stderr}")
+    delete_monitor("selkies-display2")
 
 
 def wait_until(predicate, timeout: float, interval: float = POLL_INTERVAL_S) -> bool:
@@ -259,6 +279,59 @@ def main() -> int:
             f"test setup bug: main window is not big enough to satisfy the "
             f"main-window criterion: {main_geometry_before}"
         )
+
+        # ------------------------------------------------------------------
+        # 启动自愈：一个 MOVABLE 窗口滞留在所有已知显示器范围之外时（daemon
+        # 在窗口位于副屏区域时被杀掉/重启，assigned 记忆丢失，上游又已经把
+        # 副屏 xrandr 布局收回），下一轮 reconcile 必须把它 cascade 拉回
+        # primary——这条自愈逻辑跑在每轮 reconcile 里，和是否真的重启过
+        # daemon 进程无关，不需要真的杀掉容器里的进程，直接构造等价的
+        # "窗口位置 vs. 已知显示器"错位状态即可。
+        #
+        # 实测过好几种"把窗口挪到不与任何 monitor 重叠的地方"的直接手法都
+        # 会被 openbox 挡下来：不管是 xdotool windowmove 还是客户端自己发的
+        # 原始 ConfigureWindow，只要目标位置会导致窗口和"当前唯一已知的
+        # monitor"完全不重叠，openbox 都会把落点钳制回贴着那块 monitor 边缘
+        # 几像素重叠的位置——即使先建一块很远的 selkies-primary 再让窗口在
+        # 它已经存在之后才出现也一样，openbox 的窗口摆放策略只认"当前有没有
+        # 至少一块 monitor 能沾上边"，不认哪个 monitor 叫什么名字。
+        #
+        # 绕过办法：额外建一块不带 selkies- 前缀、覆盖窗口原本自然落点的
+        # "decoy" monitor——它满足 openbox"总得沾上点 monitor"的摆放需求，
+        # 窗口因此完全不会被挪动；而 x11.list_monitors() 只认 selkies- 前缀，
+        # decoy 对我们自己的守护进程形同不存在。selkies-primary 这时首次
+        # 建在完全另一个角落，对守护进程来说"窗口位置"和"它认识的唯一显示器"
+        # 就是货真价实地对不上——和窗口物理位置没变、只是 daemon 记忆丢失的
+        # 真实重启场景等价。
+        native_area = (0, 0, 1024, 768)
+        stray_primary_rect = (2000, 2000, 400, 400)
+        ensure_framebuffer()
+        set_monitor("decoy", native_area)
+        set_monitor("selkies-primary", stray_primary_rect)  # 首次建立，不是重定义
+
+        def movable1_healed() -> bool:
+            return within_rect(get_geometry(windows["movable1"]), stray_primary_rect)
+
+        healed_ok = wait_until(movable1_healed, RECONCILE_TIMEOUT_S)
+        movable1_after_heal = get_geometry(windows["movable1"])
+        assert healed_ok, (
+            "a movable window stranded outside every known display never got "
+            f"cascaded back into the (relocated) primary rect {stray_primary_rect} "
+            f"within {RECONCILE_TIMEOUT_S}s: movable1={movable1_after_heal}"
+        )
+        assert within_rect(movable1_after_heal, stray_primary_rect), movable1_after_heal
+
+        main_geometry_after_heal = get_geometry(windows["main"])
+        assert close_to(main_geometry_before, main_geometry_after_heal), (
+            "main window geometry changed during the startup self-heal: "
+            f"before={main_geometry_before} after={main_geometry_after_heal}"
+        )
+
+        # 收尾：删掉这两块临时 monitor，给后面的正常 display2 场景让路——
+        # set_monitor()/setup_display2() 自己也会先删后建，这里显式删除只是
+        # 让测试的每个阶段读起来彼此独立。
+        delete_monitor("selkies-primary")
+        delete_monitor("decoy")
 
         primary_rect = (0, 0, 1024, 768)
         display2_rect = (1024, 0, 800, 600)
