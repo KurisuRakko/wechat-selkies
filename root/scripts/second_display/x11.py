@@ -70,21 +70,28 @@ def _absolute_geometry(root, window) -> tuple[int, int, int, int]:
     return translated.x, translated.y, geom.width, geom.height
 
 
-def _is_modal(disp, window) -> bool:
-    """_NET_WM_STATE 属性里是否含 _NET_WM_STATE_MODAL。
+def _net_wm_state_atoms(disp, window) -> frozenset:
+    """读取窗口 _NET_WM_STATE 属性里当前设置的全部原子；读取失败或属性为空
+    时返回空集合。
+
+    是原来 _is_modal() 的泛化版本：以前这里只单独判断
+    _NET_WM_STATE_MODAL 一个原子，现在 _describe() 还要用同一份原子集合
+    判断 _NET_WM_STATE_MAXIMIZED_VERT/_HORZ（窗口是否已被最大化，决定
+    move_resize() 搬它之前要不要先摘状态位）——把"读属性"和"判断具体是哪个
+    状态"拆开，调用方对同一个窗口只需发一次 GetProperty 请求，就能回答
+    任意多个"是不是含有某个状态位"的问题。
 
     注意这不是 Xlib Window.get_wm_state()——那个方法读的是 ICCCM 的
-    WM_STATE（Normal/Iconic），语义完全不同，不能用来判断模态。
+    WM_STATE（Normal/Iconic），语义完全不同，不能用来判断模态或最大化。
     """
     state_atom = disp.get_atom("_NET_WM_STATE")
-    modal_atom = disp.get_atom("_NET_WM_STATE_MODAL")
     try:
         prop = window.get_full_property(state_atom, X.AnyPropertyType)
     except error.XError:
-        return False
+        return frozenset()
     if prop is None or not prop.value:
-        return False
-    return modal_atom in prop.value
+        return frozenset()
+    return frozenset(prop.value)
 
 
 def _describe(disp, root, window) -> classify.WindowInfo | None:
@@ -99,9 +106,15 @@ def _describe(disp, root, window) -> classify.WindowInfo | None:
         x, y, width, height = _absolute_geometry(root, window)
         transient = window.get_wm_transient_for()
         title = window.get_wm_name() or ""
-        modal = _is_modal(disp, window)
+        state_atoms = _net_wm_state_atoms(disp, window)
     except error.XError:
         return None
+
+    is_modal = disp.get_atom("_NET_WM_STATE_MODAL") in state_atoms
+    is_maximized = (
+        disp.get_atom("_NET_WM_STATE_MAXIMIZED_VERT") in state_atoms
+        or disp.get_atom("_NET_WM_STATE_MAXIMIZED_HORZ") in state_atoms
+    )
 
     return classify.WindowInfo(
         window_id=window.id,
@@ -113,7 +126,8 @@ def _describe(disp, root, window) -> classify.WindowInfo | None:
         y=y,
         mapped=(attrs.map_state == X.IsViewable),
         override_redirect=bool(attrs.override_redirect),
-        is_modal=modal,
+        is_modal=is_modal,
+        is_maximized=is_maximized,
         transient_for=(transient.id if transient is not None else None),
     )
 
@@ -194,15 +208,46 @@ def list_monitors(disp, root) -> dict[str, tuple[int, int, int, int]]:
     return result
 
 
-def move_resize(window_id: int, rect: tuple[int, int, int, int], title: str = "") -> None:
+def move_resize(
+    window_id: int,
+    rect: tuple[int, int, int, int],
+    title: str = "",
+    demaximize: bool = False,
+) -> None:
     """用 xdotool 挪动并改尺寸一个窗口。
 
-    单个窗口的 xdotool 调用超时或失败不应该拖垮整个 reconcile 循环——记一条
-    警告日志就跳过，下一轮 reconcile 会自然重试（幂等）。title 只进本地日志，
-    不会出现在任何 HTTP 响应里。
+    demaximize=True 时先摘掉这个窗口的 _NET_WM_STATE_MAXIMIZED_* 状态位：
+    仍带着这两个状态位的窗口会无视普通的 xdotool windowmove/windowsize
+    请求（openbox 认为它就该待在"已最大化"的位置，不管请求的坐标是什么）
+    ——生产里典型命中 wm_class="wechat" 的图片/视频查看器，会被 openbox
+    的 <application class="wechat"><maximized>yes</maximized></application>
+    规则自动最大化，但它其实该被当成 MOVABLE 平铺进副屏。摘完状态位之后
+    只挪动/改尺寸，不像 restore_maximized_to() 那样再把状态位加回去——
+    被平铺的窗口就该老老实实停在平铺给出的具体像素几何上，不应该在新
+    位置上继续"表现得像最大化"。sleep 0.3 秒与 restore_maximized_to() 的
+    第 1 步完全一致，同样是实测必须的，不是保险起见，具体原因见那个函数
+    文档字符串里的说明。
+
+    单个窗口的 xdotool/wmctrl 调用超时或失败不应该拖垮整个 reconcile
+    循环——记一条警告日志就跳过，下一轮 reconcile 会自然重试（幂等）。
+    title 只进本地日志，不会出现在任何 HTTP 响应里。
     """
-    x, y, w, h = rect
     wid = str(window_id)
+    if demaximize:
+        try:
+            subprocess.run(
+                [
+                    "wmctrl", "-i", "-r", hex(window_id),
+                    "-b", "remove,maximized_vert,maximized_horz",
+                ],
+                capture_output=True, timeout=XDOTOOL_TIMEOUT_S, check=False,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            LOG.warning("wmctrl demaximize failed for window %s (%r): %s", wid, title, exc)
+            return
+        time.sleep(0.3)
+
+    x, y, w, h = rect
     for args in (
         ["xdotool", "windowmove", wid, str(x), str(y)],
         ["xdotool", "windowsize", wid, str(w), str(h)],

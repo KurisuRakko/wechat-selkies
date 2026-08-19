@@ -48,6 +48,7 @@ def make_window(**overrides) -> classify.WindowInfo:
         "mapped": True,
         "override_redirect": False,
         "is_modal": False,
+        "is_maximized": False,  # 不影响任何一条分类规则，见 WindowInfo 的字段注释
         "transient_for": None,
     }
     fields.update(overrides)

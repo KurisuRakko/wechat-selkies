@@ -57,6 +57,9 @@ class WindowInfo:
     mapped: bool
     override_redirect: bool
     is_modal: bool  # _NET_WM_STATE 是否含 _NET_WM_STATE_MODAL
+    is_maximized: bool  # _NET_WM_STATE 是否含 MAXIMIZED_VERT 或 _HORZ 任一；
+    # 只影响 x11.move_resize() 搬运窗口前要不要先摘状态位，不参与分类判据
+    # ——一个窗口是不是主窗口/该不该搬走，和它当前是不是最大化无关。
     transient_for: int | None  # WM_TRANSIENT_FOR 指向的窗口 id，没有则 None
 
 

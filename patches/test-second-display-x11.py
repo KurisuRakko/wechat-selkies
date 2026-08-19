@@ -118,13 +118,21 @@ while True:
 # 可以被最大化/被 restore_maximized_to() 改尺寸，固定 min==max 的窗口测不出
 # Bug 2 的抢回场景。
 #
-# candidate_b（落选者，之后会退化成 MOVABLE）反而要固定尺寸（min==max，
-# 和 movable1/movable2 同一手法）：wm_class 同样是 "wechat"，会被 openbox
-# 的 <application class="wechat"><maximized>yes</maximized></application>
-# 规则自动最大化，而一个已最大化的窗口会无视 move_resize() 的普通
-# xdotool 移动/改尺寸请求（这里只是绕开它去测选举/分类本身；这个"落选后
-# 仍带着陈旧的最大化状态、move_resize() 未必抢得过 openbox"的现象本身是
-# 单独的观察，不在这次修复范围内，见 EXECUTION_REPORT 的 risks）。
+# candidate_b（落选者，之后会退化成 MOVABLE）同样要固定尺寸（min==max，
+# 和 movable1/movable2 同一手法）：ICCCM 的固定尺寸约束能让断言比对的
+# 目标尺寸稳定不变；wm_class 同样是 "wechat"，会被 openbox 的
+# <application class="wechat"><maximized>yes</maximized></application>
+# 规则自动最大化（状态位被置位，实际几何仍被 min==max 钳制住，不会真的
+# 变成全屏）。
+#
+# 这正是本次修复的决定性验证场景：candidate_b 落选后被分类成 MOVABLE，
+# daemon 会通过 move_resize(..., demaximize=True) 尝试把它搬进 display2
+# ——一个仍带着陈旧 _NET_WM_STATE_MAXIMIZED_* 状态位的窗口本会无视普通的
+# xdotool windowmove/windowsize 请求，daemon 必须自己先用 wmctrl 摘掉这两
+# 个状态位才能真正搬动它。测试不再像之前那样手动摘位绕开这个场景，让
+# candidate_b 带着 openbox 自动加上的最大化状态直接进入 daemon 的搬运
+# 流程，能否落进 display2 矩形就是对 move_resize() 的 demaximize 参数
+# 最直接的验证。
 ELECTION_WINDOW_FACTORY_SCRIPT = """
 import json
 import time
@@ -380,7 +388,17 @@ def force_unmaximize(window_id: str) -> None:
     """摘掉一个窗口的 _NET_WM_STATE_MAXIMIZED_* 状态位，并轮询确认状态确实
     生效——一个仍带着这两个状态位的窗口会无视普通的 xdotool windowmove/
     windowsize 请求（openbox 认为它就该待在"最大化"的位置，不管请求的坐标
-    是什么），必须先摘状态位才能真正移动它。"""
+    是什么），必须先摘状态位才能真正移动它。
+
+    现在只在 run_main_election_scenarios() 里给 candidate_a 用：测试需要
+    用自己的 xdotool windowmove 模拟"openbox 把已最大化的主窗口甩到副屏"
+    这个生产场景（真实场景里这一步是 openbox 自己做的，不经过任何 xdotool
+    调用），而测试自己发起的这条 xdotool 命令同样会被 openbox 无视，所以
+    要先摘状态位。这与 move_resize() 的 demaximize 参数摘的是同一种状态位，
+    但目的不同：这里是测试在搭建前置场景，不是在绕开被测的生产代码路径
+    ——candidate_b 那条真正的 MOVABLE 搬运路径已经不再需要（也不应该）用
+    这个函数手动摘位，直接交给 move_resize(..., demaximize=True) 自己处理，
+    见 ELECTION_WINDOW_FACTORY_SCRIPT 上方的说明。"""
     hex_id = hex(int(window_id))
     result = docker_exec(
         "env", "DISPLAY=:1", "wmctrl", "-i", "-r", hex_id,
@@ -568,13 +586,11 @@ def run_main_election_scenarios() -> None:
 
         windows = create_election_windows()
 
-        # candidate_b 的 WM_CLASS 也是 "wechat"，一样会被 openbox 的
-        # <application class="wechat"><maximized>yes</maximized></application>
-        # 规则自动最大化（状态位被置位，即便固定尺寸的 ICCCM 约束不让实际
-        # 几何真的变成全屏）；带着这个状态位会让它后面被判定成 MOVABLE 后，
-        # move_resize() 的普通 xdotool 移动请求被无视。这里预先摘掉，让它
-        # 从一个干净、不带陈旧最大化状态的窗口开始参与选举/分类。
-        force_unmaximize(windows["candidate_b"])
+        # candidate_b 带着 openbox 自动加上的 _NET_WM_STATE_MAXIMIZED_*
+        # 状态位直接进入下面的选举/分类断言——不再手动摘位，这正是本次
+        # 修复的决定性验证：daemon 必须自己通过
+        # move_resize(..., demaximize=True) 把它摘位并平铺进 display2，
+        # 见 ELECTION_WINDOW_FACTORY_SCRIPT 上方的说明。
 
         # wm_class="wechat" 的窗口被 openbox 加上的装饰（标题栏）比
         # WeChatAppEx 类窗口明显更高——实测过 xdotool windowmove 请求的是

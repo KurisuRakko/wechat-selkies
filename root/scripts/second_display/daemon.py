@@ -284,7 +284,16 @@ class Daemon:
         if layout.is_converged(self.last_commanded.get(window.window_id), rect, current):
             return
         self.last_commanded[window.window_id] = rect
-        x11.move_resize(window.window_id, rect, window.title)
+        # is_maximized 透传给 demaximize：openbox 对 wm_class="wechat" 窗口
+        # 的自动最大化规则（生产里典型命中图片/视频查看器）会让窗口带着
+        # _NET_WM_STATE_MAXIMIZED_* 状态位无视普通的 xdotool 移动/改尺寸
+        # 请求，move_resize() 需要先摘状态位才能真正搬动它。这里是
+        # _move_if_needed() 唯一的调用点，MOVABLE（_assign_movable）和
+        # FOLLOWS_PARENT（_assign_followers）两条路径共用同一处改动，不需要
+        # 分别处理。
+        x11.move_resize(
+            window.window_id, rect, window.title, demaximize=window.is_maximized
+        )
 
     def _build_snapshot(self, by_id, monitors, categories) -> dict[str, object]:
         # 两个计数都只统计 mapped 的窗口，和 _assign_movable() 的过滤条件
