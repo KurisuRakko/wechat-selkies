@@ -24,6 +24,14 @@ LOG = logging.getLogger("wechat-second-display.daemon")
 # x11.watch() 的说明）由这个周期性兜底轮询兜底，是正确性的最终保障。
 SAFETY_POLL_INTERVAL_S = 3.0
 
+# 事件防抖：wake 被 x11.watch() 的事件唤醒后，先等一下再 reconcile，把短时间
+# 内的连续事件聚合成一次——包括 move_resize()/restore_maximized_to() 自己
+# 发的 xdotool 命令产生的 ConfigureNotify。没有这道防抖，事件驱动的 reconcile
+# 会比 3 秒兜底轮询快得多地被自己的命令重新唤醒；配合 layout.is_converged()
+# 的容差判断（而不是精确相等）两者共同堵住这条自激循环：is_converged() 保证
+# 收敛后不再重发命令，防抖保证即使真的重发也不会在几毫秒内又触发下一轮。
+EVENT_DEBOUNCE_S = 0.3
+
 Rect = tuple[int, int, int, int]
 
 
@@ -55,6 +63,9 @@ class Daemon:
         # window_id -> 首次见到的单调时间戳，决定平铺顺序——先来的排前面，
         # 平铺结果不会因为每轮枚举顺序的抖动而跳来跳去。
         self.first_seen: dict[int, float] = {}
+        # window_id -> 上一次通过 move_resize() 命令过的目标几何，供
+        # layout.is_converged() 判断是否需要重发命令，避免自激循环。
+        self.last_commanded: dict[int, Rect] = {}
         # 当选的主窗口 id（恰好一个，或者还没选出来时是 None）——见
         # _elect_main_window()。
         self._elected_main_id: int | None = None
@@ -79,7 +90,12 @@ class Daemon:
 
         self.reconcile()  # 启动自愈：进程一起来先跑一次，不等第一个事件
         while True:
-            wake.wait(timeout=SAFETY_POLL_INTERVAL_S)
+            woken_by_event = wake.wait(timeout=SAFETY_POLL_INTERVAL_S)
+            if woken_by_event:
+                # 事件防抖：见 EVENT_DEBOUNCE_S 的说明。超时唤醒（安全轮询
+                # 本身）不需要这道等待，只有真正被 x11.watch() 的事件唤醒时
+                # 才等一下聚合突发。
+                time.sleep(EVENT_DEBOUNCE_S)
             wake.clear()
             self.reconcile()
 
@@ -111,6 +127,8 @@ class Daemon:
             del self.assigned[stale]
         for stale in [wid for wid in self.first_seen if wid not in live_ids]:
             del self.first_seen[stale]
+        for stale in [wid for wid in self.last_commanded if wid not in live_ids]:
+            del self.last_commanded[stale]
 
         main_window_id = self._elect_main_window(windows)
         categories = {
@@ -257,8 +275,15 @@ class Daemon:
         return (0, 0, 1920, 1080)
 
     def _move_if_needed(self, window: classify.WindowInfo, rect: Rect) -> None:
-        if (window.x, window.y, window.width, window.height) == rect:
-            return  # 防抖：目标几何和当前几何一致就不发 xdotool 命令
+        # 用 layout.is_converged() 而不是精确相等：openbox 的窗口装饰会让
+        # xdotool 实际落地的 client 几何和请求的目标差着几十像素，精确相等
+        # 永远不成立，会导致每轮都重发同一条命令、命令自己的 ConfigureNotify
+        # 又唤醒下一轮 reconcile 的自激循环（见 layout.is_converged() 与
+        # EVENT_DEBOUNCE_S 的说明）。
+        current = (window.x, window.y, window.width, window.height)
+        if layout.is_converged(self.last_commanded.get(window.window_id), rect, current):
+            return
+        self.last_commanded[window.window_id] = rect
         x11.move_resize(window.window_id, rect, window.title)
 
     def _build_snapshot(self, by_id, monitors, categories) -> dict[str, object]:

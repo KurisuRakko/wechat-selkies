@@ -10,7 +10,8 @@ MOVABLE（这是最不能出错的一条——错判会把用户正在用的主�
 WM_CLASS 也是 wechat 且经常 >=600x600）必须落回 MOVABLE，而不是被误判成
 "又一个主窗口"；托盘图标、无主窗口时的登录/登出窗受到保护；选举规则
 （粘性连任、first_seen 最早胜出、id 决胜）；tile_rects/cascade_rects 产出
-的矩形互不重叠、且落在目标区域内。
+的矩形互不重叠、且落在目标区域内；is_converged() 的收敛判断（带装饰偏移
+的几何应判收敛、漂移超容差或目标变更都应判需要重发命令）。
 """
 
 from __future__ import annotations
@@ -251,6 +252,36 @@ def test_cascade_rects_stay_within_primary():
     assert rects[0][2:] == (400, 300)
     # 超尺寸的窗口被钳制到 primary 能放下的最大值。
     assert rects[3][2:] == (1920, 1080)
+
+
+# ------------------------------------------------------------- is_converged
+
+
+def test_is_converged_with_frame_offset():
+    """命令过的目标，client 几何带着 openbox 装饰造成的偏移（生产实测
+    (4072,8) 目标落地成 (4073,48)）——应该判定已收敛，不再重发命令。"""
+    target = (4072, 8, 300, 300)
+    current = (4073, 48, 300, 300)  # x 偏 1px、y 偏 40px，都在 64px 容差内
+    assert layout.is_converged(last_commanded=target, target=target, current=current)
+
+
+def test_is_converged_false_when_drifted_beyond_tolerance():
+    """已经命令过这个目标，但当前几何偏出容差之外（用户手动拖走、或被
+    其它程序改了位置）——必须判定未收敛，需要重发命令。"""
+    target = (0, 0, 300, 300)
+    drifted = (0, 100, 300, 300)  # y 偏 100px，超过 64px 容差
+    assert not layout.is_converged(last_commanded=target, target=target, current=drifted)
+
+
+def test_is_converged_false_when_target_changed():
+    """即使当前几何恰好等于新目标，只要 last_commanded 不是这次的 target
+    （比如从没命令过，或者上一次命令的是别的目标），也要重发一次——
+    确保"目标变了"这件事总会被至少命令一次，不会因为凑巧位置已经对上就
+    被跳过。"""
+    old_target = (0, 0, 300, 300)
+    new_target = (100, 0, 300, 300)
+    assert not layout.is_converged(last_commanded=old_target, target=new_target, current=new_target)
+    assert not layout.is_converged(last_commanded=None, target=new_target, current=new_target)
 
 
 # ------------------------------------------------------- find_owning_display
