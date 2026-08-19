@@ -118,6 +118,11 @@ class Daemon:
             for window in windows
         }
 
+        # 抢回被 openbox 偷走的主窗口：与副屏是否连接无关，每轮都检查一次，
+        # 见 _reclaim_main_window() 的说明。放在 tile/cascade 之前——主窗口
+        # 归位不影响这一轮 MOVABLE 窗口该分到哪，顺序对结果没有影响。
+        self._reclaim_main_window(by_id, main_window_id, monitors)
+
         secondary = _pick_secondary_display(monitors)
         if secondary is not None:
             display_id, monitor_rect = secondary
@@ -146,6 +151,35 @@ class Daemon:
 
     def _is_main_window(self, window: classify.WindowInfo) -> bool:
         return window.window_id == self._elected_main_id
+
+    def _reclaim_main_window(self, by_id, main_window_id: int | None, monitors) -> None:
+        """抢回被 openbox 偷走的主窗口。
+
+        上游 reconfigure_displays() 重划 RandR 布局（典型场景：副屏刚连接
+        的那一刻）时，openbox 有时会把已经最大化的主窗口重新最大化到新出现
+        的 selkies-display2 上——这是 openbox 自己对"屏幕变了"的反应，不是
+        本项目代码引发的，我们只能事后纠正。每轮都检查一次主窗口是否仍然
+        落在 primary 上（find_owning_display 返回 None 也算不在，覆盖副屏
+        断开后主窗口滞留在所有已知显示器之外的情况），不是就用
+        x11.restore_maximized_to() 抢回来；已经在 primary 上时什么都不做，
+        天然幂等。
+
+        只有 monitors 里已经有 primary 时才检查：容器极早期 RandR 还没
+        建立任何显示器时，任何窗口都会被判定"不在 primary 上"，此时没有
+        primary 可以抢回去，什么都不做更安全。
+        """
+        if main_window_id is None:
+            return
+        primary_rect = monitors.get("primary")
+        if primary_rect is None:
+            return
+        window = by_id.get(main_window_id)
+        if window is None:
+            return
+        geometry = (window.x, window.y, window.width, window.height)
+        if classify.find_owning_display(geometry, monitors) == "primary":
+            return
+        x11.restore_maximized_to(main_window_id, primary_rect)
 
     def _assign_movable(self, by_id, categories, display_id: str, monitor_rect: Rect) -> None:
         movable_ids = [

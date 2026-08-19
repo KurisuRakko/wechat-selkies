@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import subprocess
+import time
 from typing import Callable
 
 from Xlib import X, error
@@ -213,6 +214,51 @@ def move_resize(window_id: int, rect: tuple[int, int, int, int], title: str = ""
         except (subprocess.TimeoutExpired, OSError) as exc:
             LOG.warning("xdotool command failed for window %s (%r): %s", wid, title, exc)
             return
+
+
+def restore_maximized_to(window_id: int, rect: tuple[int, int, int, int]) -> None:
+    """把一个仍带着 _NET_WM_STATE_MAXIMIZED_* 状态位的窗口挪回 rect 并重新
+    最大化——配方与 wechat-window-watchdog.sh 的 maximize() 完全一致，已经
+    在生产环境验证过对微信主窗口有效：
+
+      1. wmctrl 摘掉两个 maximized 状态位——不摘的话 wmctrl -b add 是空
+         操作，openbox 认为"已经是最大化状态"就不会重新套用几何；
+      2. xdotool 把窗口挪到目标位置、改成目标尺寸；
+      3. wmctrl 重新加回两个状态位，让窗口在新位置上正确地"表现得像
+         已最大化"（而不是停在第 2 步给的具体像素尺寸上）。
+
+    步骤之间的 sleep 是必要的，不是保险起见——实测过省略它们时 openbox
+    对"wechat" class 窗口的 <maximized>yes</maximized> 规则会在下一个步骤
+    发出前就抢先重新生效（第 1 步摘掉状态位后几十毫秒内，第 2 步的
+    move/resize 还没来得及被采纳，窗口就已经被 openbox 自己重新最大化回
+    摘除前的几何），必须给 openbox 留出反应时间，数值与
+    wechat-window-watchdog.sh 的 maximize() 完全一致（那份实现已经在生产
+    验证过这两个具体数值足够）。
+
+    wmctrl 用十六进制窗口 id（wmctrl -l 自己列出来的也是这个格式），
+    xdotool 沿用 move_resize() 已经在用的十进制。单个子进程超时/失败只
+    记警告并放弃这一轮的其余步骤，下一轮 reconcile 会自然重试——与
+    move_resize() 同一容错风格。
+    """
+    hex_id = hex(window_id)
+    wid = str(window_id)
+    x, y, w, h = rect
+    steps = (
+        (["wmctrl", "-i", "-r", hex_id, "-b", "remove,maximized_vert,maximized_horz"], 0.3),
+        (["xdotool", "windowmove", wid, str(x), str(y)], 0.0),
+        (["xdotool", "windowsize", wid, str(w), str(h)], 0.0),
+        (["wmctrl", "-i", "-r", hex_id, "-b", "add,maximized_vert,maximized_horz"], 0.7),
+    )
+    for args, settle_s in steps:
+        try:
+            subprocess.run(
+                args, capture_output=True, timeout=XDOTOOL_TIMEOUT_S, check=False
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            LOG.warning("restore_maximized_to failed for window %s: %s", wid, exc)
+            return
+        if settle_s:
+            time.sleep(settle_s)
 
 
 def watch(wake: Callable[[], None]) -> None:
