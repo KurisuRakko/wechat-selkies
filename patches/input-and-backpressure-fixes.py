@@ -606,6 +606,40 @@ patch(
 )
 
 
+# --------------------------------------------------------------------------- 7
+# Digits and letters share the same in-process injection channel, so digits
+# leave the xdotool fork+exec failure surface behind exactly like letters.
+# "!".isalnum() is False, so Shift+symbols are unaffected; and the keypad's
+# XK_KP_* range (0xFFB0-0xFFB9) never reaches this branch anyway, because
+# is_printable's 0x20-0xFF window excludes it.
+
+patch(
+    "input_handler.py",
+    "route digits through the in-process pynput path",
+    '                if char.isalpha() or char == " ":\n',
+    '                if char.isalnum() or char == " ":\n',
+)
+
+
+# --------------------------------------------------------------------------- 8
+# on_message's kd branch used to route modifier-free bare digits into the
+# co,end atomic text-injection path (the clipboard/subprocess machinery shared
+# with CJK commits) -- the crowded shared channel behind the "digits eaten
+# while typing Chinese" symptom. With isalnum() bare digits travel the same
+# in-process route as letters, straight to send_x11_keypress, which pairs with
+# fix 7's pynput injection. The keyup side is symmetric for free: digits no
+# longer enter atomically_typed_keys, so their ku flows to
+# send_x11_keypress(down=False) as normal. Punctuation and symbols still take
+# the atomic path, unchanged.
+
+patch(
+    "input_handler.py",
+    "route bare digits to the keypress path instead of atomic typing",
+    "                        if not char_to_type.isalpha() and char_to_type != ' ':\n",
+    "                        if not char_to_type.isalnum() and char_to_type != ' ':\n",
+)
+
+
 # The bundled .pyc files would otherwise be consulted first. Python invalidates
 # them on the source mtime, which we just changed, but drop them so nothing can
 # shadow the patched source.
@@ -615,4 +649,4 @@ if os.path.isdir(cache):
         os.remove(os.path.join(cache, name))
     os.rmdir(cache)
 
-print("input-and-backpressure-fixes: 7 patch(es) applied")
+print("input-and-backpressure-fixes: 9 patch(es) applied")

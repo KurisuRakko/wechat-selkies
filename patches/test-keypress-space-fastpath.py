@@ -13,9 +13,8 @@ directly -- no real X11/pynput required for that half either, since the
 fixture's own send_x11_keypress_printable() only exercises the plain-Python
 branching this patch changes, not the pynput call itself.
 
-The fixtures reproduce every anchor the script's seven patch() calls look for
-(fixes 1, 2a, 2b, 3, 4 already in the file, plus this candidate's fixes 5
-and 6),
+The fixtures reproduce every anchor the script's nine patch() calls look for
+(fixes 1, 2a, 2b, 3, 4 already in the file, plus this candidate's fixes 5-8),
 because the script applies all of its patches, across both target files, in
 one run, and fails fast on the first missing anchor.
 """
@@ -145,6 +144,21 @@ class WebRTCInput:
                         stderr=subprocess.PIPE
                     )
                     await asyncio.wait_for(process.communicate(), timeout=0.5)
+
+    # Minimal stand-in for on_message's kd branch: the 24-space indent of the
+    # gating line is what fix 8 anchors on, so the nesting depth matters here,
+    # not the surrounding logic.
+    async def on_message(self, msg_type, *args):
+        if msg_type == "kd":
+            if args:
+                char_to_type = args[0]
+                if True:
+                    try:
+                        if not char_to_type.isalpha() and char_to_type != ' ':
+                            return "atomic"
+                        return "keypress"
+                    except Exception:
+                        return "keypress"
 '''
 
 SELKIES_FIXTURE = '''import time
@@ -194,23 +208,32 @@ def run(site: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
-# 1. a clean site gets all seven patches applied, including the space fast-path
-#    and the clipboard-restore retry.
+# 1. a clean site gets all nine patches applied, including the space fast-path,
+#    the clipboard-restore retry, and both digit fast-paths.
 site, input_handler_target = make_site()
 result = run(site)
 assert result.returncode == 0, result.stderr
-assert "7 patch(es) applied" in result.stdout, result.stdout
+assert "9 patch(es) applied" in result.stdout, result.stdout
 assert "route space through the in-process pynput path" in result.stdout
 assert "retry clipboard restore once before giving up" in result.stdout
+assert "route digits through the in-process pynput path" in result.stdout
+assert "route bare digits to the keypress path instead of atomic typing" in result.stdout
 
 patched = input_handler_target.read_text(encoding="utf-8")
 ast.parse(patched)
-assert 'char.isalpha() or char == " "' in patched
+assert 'char.isalnum() or char == " "' in patched
+assert 'char.isalpha() or char == " "' not in patched
 assert "if char.isalpha():\n" not in patched, "the old, space-excluding condition must be gone"
+assert "if not char_to_type.isalnum() and char_to_type != ' ':" in patched
+assert "if not char_to_type.isalpha() and char_to_type != ' ':" not in patched, (
+    "the old kd gate that pushed bare digits into the atomic path must be gone"
+)
 
 # 2. behavioural check: exec the patched input_handler.py fixture and confirm
-#    space now behaves exactly like a letter (pynput branch, no xdotool
-#    command built), while a digit is unaffected (still xdotool).
+#    space and digits now behave exactly like letters (pynput branch, no
+#    xdotool command built), while punctuation is untouched (still xdotool);
+#    and the kd gate routes a bare digit to the keypress path while
+#    punctuation still takes the atomic one.
 namespace: dict = {}
 exec(compile(patched, "<patched-fixture>", "exec"), namespace)
 
@@ -226,11 +249,22 @@ assert use_pynput is True
 assert command is None
 
 command, use_pynput = asyncio.run(instance.send_x11_keypress_printable(ord("5"), down=True))
-assert use_pynput is False, "digits are deliberately out of scope for this candidate"
-assert command == ["xdotool", "keydown", "--clearmodifiers", "U0035"]
+assert use_pynput is True, "digits must take the pynput branch now"
+assert command is None, "digits must not build an xdotool command anymore"
+
+command, use_pynput = asyncio.run(instance.send_x11_keypress_printable(ord(","), down=True))
+assert use_pynput is False, "punctuation must stay on the xdotool path"
+assert command == ["xdotool", "keydown", "--clearmodifiers", "U002C"]
+
+assert asyncio.run(instance.on_message("kd", "5")) == "keypress", (
+    "bare digits must reach the keypress path"
+)
+assert asyncio.run(instance.on_message("kd", ",")) == "atomic", (
+    "punctuation must still take the atomic path"
+)
 
 # 3. re-running the patch script must fail loudly (anchors consumed), matching
-#    this file's existing non-idempotent patch() contract for its other five
+#    this file's existing non-idempotent patch() contract for its other eight
 #    fixes.
 second = run(site)
 assert second.returncode != 0, "a second run must fail, not double-patch"
