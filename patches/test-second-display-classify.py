@@ -4,10 +4,13 @@
 
     python3 -m pytest patches/test-second-display-classify.py -v
 
-覆盖的核心不变量：真正的微信主窗口在任何 main_window_present/assigned 组合
-下都不会被误判成 MOVABLE（这是最不能出错的一条——错判会把用户正在用的主
-窗口拖去副屏）；托盘图标、无主窗口时的登录/登出窗受到保护；tile_rects/
-cascade_rects 产出的矩形互不重叠、且落在目标区域内。
+覆盖的核心不变量：真正当选的主窗口在任何 assigned 组合下都不会被误判成
+MOVABLE（这是最不能出错的一条——错判会把用户正在用的主窗口拖去副屏）；
+同样满足主窗口几何判据、但没有当选的窗口（生产环境实测：图片/视频查看器
+WM_CLASS 也是 wechat 且经常 >=600x600）必须落回 MOVABLE，而不是被误判成
+"又一个主窗口"；托盘图标、无主窗口时的登录/登出窗受到保护；选举规则
+（粘性连任、first_seen 最早胜出、id 决胜）；tile_rects/cascade_rects 产出
+的矩形互不重叠、且落在目标区域内。
 """
 
 from __future__ import annotations
@@ -23,6 +26,12 @@ from second_display import classify  # noqa: E402
 from second_display import layout  # noqa: E402
 
 Category = classify.Category
+
+# 表示"主窗口存在，但不是当前正在测试的这个窗口"——window_id 用 1 起步的
+# 小整数，999 绝不会和它们撞车。classify() 现在只按身份（window_id ==
+# main_window_id）判定 MAIN_WINDOW，不再重新跑一遍几何判据，因此这类测试
+# 只需要一个"存在但不是我"的哨兵 id，而不是像旧签名那样传布尔值。
+OTHER_MAIN_ID = 999
 
 
 def make_window(**overrides) -> classify.WindowInfo:
@@ -47,53 +56,66 @@ def make_window(**overrides) -> classify.WindowInfo:
 # --------------------------------------------------------------- classify()
 
 
-def test_main_window_never_classified_as_movable():
-    """不变量：满足主窗口判据的窗口，在任何 main_window_present/assigned
-    组合下都必须分类成 MAIN_WINDOW，绝不会是 MOVABLE——这是唯一一条错了就
-    会把用户正在用的主窗口拖去副屏的规则。
-    """
+def test_elected_main_window_never_classified_as_movable():
+    """不变量：当选的主窗口在任何 assigned 组合下都必须分类成 MAIN_WINDOW，
+    绝不会是 MOVABLE——这是唯一一条错了就会把用户正在用的主窗口拖去副屏
+    的规则。"""
     for width, height in ((600, 600), (600, 601), (1920, 1080), (3232, 2048)):
         window = make_window(width=width, height=height)
-        for main_present in (True, False):
-            for assigned in ({}, {window.window_id: "display2"}):
-                result = classify.classify(window, main_present, assigned)
-                assert result is Category.MAIN_WINDOW, (width, height, main_present, assigned, result)
-                assert result is not Category.MOVABLE
+        for assigned in ({}, {window.window_id: "display2"}):
+            result = classify.classify(window, window.window_id, assigned)
+            assert result is Category.MAIN_WINDOW, (width, height, assigned, result)
+            assert result is not Category.MOVABLE
+
+
+def test_main_candidate_that_lost_the_election_is_movable():
+    """生产实测的核心场景：两个窗口都满足主窗口的几何判据（WM_CLASS
+    "wechat"、>=600x600、非 modal——典型例子是图片/视频查看器全屏打开
+    时），只有当选的那个是 MAIN_WINDOW，另一个必须落回 MOVABLE，而不是
+    也被当成主窗口晾在原地搬不走。"""
+    elected = make_window(window_id=1, width=700, height=700)
+    loser = make_window(window_id=2, width=1200, height=900)
+    assert classify.is_main_candidate(elected)
+    assert classify.is_main_candidate(loser)  # 落选者本身仍然"够格参选"
+
+    assert classify.classify(elected, elected.window_id, {}) is Category.MAIN_WINDOW
+    assert classify.classify(loser, elected.window_id, {}) is Category.MOVABLE
 
 
 def test_tray_icon_is_ignored():
     """24x24 的托盘图标——不管 override_redirect 是否显式为真，光凭尺寸下限
     就必须被过滤。"""
     tray_by_size = make_window(width=24, height=24, override_redirect=False)
-    assert classify.classify(tray_by_size, True, {}) is Category.IGNORE
+    assert classify.classify(tray_by_size, OTHER_MAIN_ID, {}) is Category.IGNORE
 
     tray_by_flag = make_window(width=24, height=24, override_redirect=True)
-    assert classify.classify(tray_by_flag, True, {}) is Category.IGNORE
+    assert classify.classify(tray_by_flag, OTHER_MAIN_ID, {}) is Category.IGNORE
 
     # override_redirect 单独也足以判定 IGNORE，即便尺寸不小。
     override_redirect_large = make_window(width=800, height=600, override_redirect=True)
-    assert classify.classify(override_redirect_large, True, {}) is Category.IGNORE
+    assert classify.classify(override_redirect_large, OTHER_MAIN_ID, {}) is Category.IGNORE
 
 
 def test_login_window_without_main_window_is_protected():
-    """无主窗口时，560x760 的登录/二维码窗（wechat-window-watchdog.sh 记录
-    的真实尺寸）必须受保护，不能被当成 MOVABLE 搬走。"""
+    """无主窗口（main_window_id 为 None）时，560x760 的登录/二维码窗
+    （wechat-window-watchdog.sh 记录的真实尺寸）必须受保护，不能被当成
+    MOVABLE 搬走。"""
     login_window = make_window(width=560, height=760)
-    assert classify.classify(login_window, False, {}) is Category.PROTECTED_LOGIN_OR_LOGOUT
+    assert classify.classify(login_window, None, {}) is Category.PROTECTED_LOGIN_OR_LOGOUT
 
 
 def test_wechat_subwindow_with_main_window_present_is_movable():
     """主窗口在场时，一个不够格当主窗口、但尺寸高于下限的 wechat 类窗口
     （比如聊天详情/小窗口）应该是 MOVABLE。"""
     subwindow = make_window(width=500, height=700)
-    assert classify.classify(subwindow, True, {}) is Category.MOVABLE
+    assert classify.classify(subwindow, OTHER_MAIN_ID, {}) is Category.MOVABLE
 
 
 def test_wechat_app_ex_is_movable():
     """小程序运行时窗口 WeChatAppEx（WM_CLASS 含 wechat 但不是精确的
     "wechat"）在主窗口在场时应该是 MOVABLE。"""
     mini_program = make_window(wm_class="WeChatAppEx", width=400, height=600)
-    assert classify.classify(mini_program, True, {}) is Category.MOVABLE
+    assert classify.classify(mini_program, OTHER_MAIN_ID, {}) is Category.MOVABLE
 
 
 def test_modal_follows_assigned_parent():
@@ -101,24 +123,88 @@ def test_modal_follows_assigned_parent():
     而不是被保护在原地。"""
     modal = make_window(window_id=2, is_modal=True, transient_for=1, width=300, height=200)
     assigned = {1: "display2"}
-    assert classify.classify(modal, True, assigned) is Category.FOLLOWS_PARENT
+    assert classify.classify(modal, OTHER_MAIN_ID, assigned) is Category.FOLLOWS_PARENT
 
 
 def test_modal_without_assigned_parent_is_protected():
     """模态窗口没有 transient_for，或 transient_for 指向的窗口不在 assigned
     里（父窗口还没搬、或根本没有父窗口）时，必须保持受保护，不能跟着搬。"""
     modal_no_parent = make_window(window_id=2, is_modal=True, transient_for=None)
-    assert classify.classify(modal_no_parent, True, {}) is Category.PROTECTED_MODAL
+    assert classify.classify(modal_no_parent, OTHER_MAIN_ID, {}) is Category.PROTECTED_MODAL
 
     modal_unassigned_parent = make_window(window_id=2, is_modal=True, transient_for=1)
-    assert classify.classify(modal_unassigned_parent, True, {}) is Category.PROTECTED_MODAL
+    assert classify.classify(modal_unassigned_parent, OTHER_MAIN_ID, {}) is Category.PROTECTED_MODAL
 
 
 def test_tiny_non_wechat_window_is_ignored():
     """低于 REAL_MIN 下限的窗口（比如某些应用的辅助小窗）即使主窗口在场也
     应该被忽略，不当成 MOVABLE。"""
     tiny = make_window(wm_class="SomeHelper", width=100, height=100)
-    assert classify.classify(tiny, True, {}) is Category.IGNORE
+    assert classify.classify(tiny, OTHER_MAIN_ID, {}) is Category.IGNORE
+
+
+# ------------------------------------------------------- is_main_candidate()
+
+
+def test_is_main_candidate_geometry():
+    """候选资格只看 WM_CLASS/尺寸/模态，和"最终选不选它"无关。"""
+    assert classify.is_main_candidate(make_window(width=600, height=600))
+    assert not classify.is_main_candidate(make_window(width=599, height=600)), "宽度差 1px 不够格"
+    assert not classify.is_main_candidate(make_window(width=600, height=599)), "高度差 1px 不够格"
+    assert not classify.is_main_candidate(
+        make_window(wm_class="WeChatAppEx", width=1200, height=900)
+    ), "WM_CLASS 不是精确的 wechat，再大也不参选"
+    assert not classify.is_main_candidate(
+        make_window(width=1200, height=900, is_modal=True)
+    ), "模态窗口不参选，即便尺寸够格"
+
+
+# ---------------------------------------------------------- elect_main_window()
+
+
+def test_elect_main_window_no_candidates_returns_none():
+    assert classify.elect_main_window({}, {}, incumbent=None) is None
+    assert classify.elect_main_window({}, {}, incumbent=1) is None, "候选池清空后不能凭空连任"
+
+
+def test_elect_main_window_earliest_first_seen_wins():
+    candidates = {
+        1: make_window(window_id=1, width=700, height=700),
+        2: make_window(window_id=2, width=700, height=700),
+    }
+    first_seen = {1: 100.0, 2: 50.0}  # 2 先出现
+    assert classify.elect_main_window(candidates, first_seen, incumbent=None) == 2
+
+
+def test_elect_main_window_tie_break_by_window_id():
+    """生产实测的决胜规则：同一轮首见（first_seen 相同）时选 window_id
+    最小的——微信真正的主窗口 0x1800013 先于图片查看器 0x180001d 创建，
+    id 更小。"""
+    candidates = {
+        0x1800013: make_window(window_id=0x1800013, width=700, height=700),
+        0x180001D: make_window(window_id=0x180001D, width=700, height=700),
+    }
+    first_seen = {0x1800013: 10.0, 0x180001D: 10.0}
+    assert classify.elect_main_window(candidates, first_seen, incumbent=None) == 0x1800013
+
+
+def test_elect_main_window_sticky_incumbent():
+    """上一轮已当选者只要仍在候选池里就连任，即便另一个候选的 first_seen
+    更早/id 更小——避免主窗口在多个候选之间反复横跳。"""
+    candidates = {
+        1: make_window(window_id=1, width=700, height=700),
+        2: make_window(window_id=2, width=700, height=700),
+    }
+    first_seen = {1: 999.0, 2: 1.0}  # 2 明显更早，但 1 是在任者
+    assert classify.elect_main_window(candidates, first_seen, incumbent=1) == 1
+
+
+def test_elect_main_window_incumbent_replaced_when_no_longer_candidate():
+    """在任者一旦跌出候选池（消失、缩小、变 modal……），必须重新选举，
+    而不是没有候选人也继续"连任"。"""
+    candidates = {2: make_window(window_id=2, width=700, height=700)}
+    first_seen = {2: 5.0}
+    assert classify.elect_main_window(candidates, first_seen, incumbent=1) == 2
 
 
 # ----------------------------------------------------------------- layout

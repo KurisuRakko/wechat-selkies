@@ -55,6 +55,9 @@ class Daemon:
         # window_id -> 首次见到的单调时间戳，决定平铺顺序——先来的排前面，
         # 平铺结果不会因为每轮枚举顺序的抖动而跳来跳去。
         self.first_seen: dict[int, float] = {}
+        # 当选的主窗口 id（恰好一个，或者还没选出来时是 None）——见
+        # _elect_main_window()。
+        self._elected_main_id: int | None = None
         self._snapshot: dict[str, object] = _empty_snapshot()
 
     # ---------------------------------------------------------- 对外查询
@@ -109,9 +112,9 @@ class Daemon:
         for stale in [wid for wid in self.first_seen if wid not in live_ids]:
             del self.first_seen[stale]
 
-        main_window_present = any(self._is_main_window(w) for w in windows)
+        main_window_id = self._elect_main_window(windows)
         categories = {
-            window.window_id: classify.classify(window, main_window_present, self.assigned)
+            window.window_id: classify.classify(window, main_window_id, self.assigned)
             for window in windows
         }
 
@@ -125,11 +128,24 @@ class Daemon:
 
         self._snapshot = self._build_snapshot(by_id, monitors, categories)
 
+    def _elect_main_window(self, windows: list[classify.WindowInfo]) -> int | None:
+        """选出恰好一个主窗口 id，并把结果记进 self._elected_main_id 供下一轮
+        连任判断——真正的决策规则是纯函数 classify.elect_main_window()（连带
+        候选资格判据 classify.is_main_candidate() 一起单测覆盖），这里只做
+        "从 windows 里筛出候选池、喂给决策函数、记住跨轮次状态"这层编排。
+
+        生产环境观察到微信的图片/视频查看器窗口 WM_CLASS 同样是 "wechat"
+        且经常 >=600x600，必须在多个候选里选出恰好一个当主窗口，其余的
+        落回 MOVABLE，因此才需要"选举"而不是"只要满足几何判据就是主窗口"。
+        """
+        candidates = {w.window_id: w for w in windows if classify.is_main_candidate(w)}
+        self._elected_main_id = classify.elect_main_window(
+            candidates, self.first_seen, self._elected_main_id
+        )
+        return self._elected_main_id
+
     def _is_main_window(self, window: classify.WindowInfo) -> bool:
-        # 复用 classify() 本身的 MAIN_WINDOW 规则，不在别处重复一份"什么算
-        # 主窗口"的判据。该规则只看几何/类名/模态，不看 main_window_present/
-        # assigned，所以传探测性的 (True, {}) 不会影响这里的判断结果。
-        return classify.classify(window, True, {}) is classify.Category.MAIN_WINDOW
+        return window.window_id == self._elected_main_id
 
     def _assign_movable(self, by_id, categories, display_id: str, monitor_rect: Rect) -> None:
         movable_ids = [
