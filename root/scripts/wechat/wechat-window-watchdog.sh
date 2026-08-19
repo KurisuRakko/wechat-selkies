@@ -120,6 +120,27 @@ log() {
 }
 
 screen_size() {
+    # 副屏（second_display 功能，见 docs/second-display.md）接入后，xdpyinfo
+    # 报的是 primary+display2 合并后的 framebuffer 尺寸（比如 primary 4064
+    # 宽，合并 fb 约 7008 宽）——主窗口正常最大化到 primary 时相对合并 fb
+    # 只占 58%，永远达不到下面 MAX_W_PCT/MAX_H_PCT 的门槛，geometry_is_
+    # maximized 因此永远判"未最大化"，maximize() 每轮都重新执行一遍：wmctrl
+    # 重新最大化（openbox 把它压回单屏）→ 仍不达标 → 显式 resize 到全 fb
+    # 尺寸（主窗口被硬拉横跨两屏）→ openbox 再压回单屏 → 下一轮重来，5 秒
+    # 一次感知为"主屏画面一直闪"。
+    #
+    # 优先取 selkies-primary 这块逻辑显示器的真实几何（xrandr --listmonitors
+    # 的名字前可能带 +/* 标记，[+*]* 兼容两种写法）；副屏功能关闭、或者
+    # RandR 还没建立 selkies-primary 时这一行不存在，退回原来的 xdpyinfo
+    # 合并尺寸——和引入副屏功能之前完全一样的行为。
+    local from_monitor
+    from_monitor=$(xrandr --listmonitors 2>/dev/null \
+        | sed -n 's/.* [+*]*selkies-primary \([0-9]*\)\/[0-9]*x\([0-9]*\)\/.*/\1 \2/p' \
+        | head -1)
+    if [ -n "$from_monitor" ]; then
+        printf '%s\n' "$from_monitor"
+        return
+    fi
     xdpyinfo 2>/dev/null | sed -n 's/^  dimensions: *\([0-9]*\)x\([0-9]*\).*/\1 \2/p' | head -1
 }
 
