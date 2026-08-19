@@ -310,6 +310,11 @@ ENV SELKIES_UI_SIDEBAR_SHOW_GAMEPADS="false"
 # Selkies 原生麦克风转发默认开启，显式声明只为可发现/可覆盖。
 ENV SELKIES_MICROPHONE_ENABLED="true"
 
+# selkies 默认关闭二进制剪贴板（enable_binary_clipboard=False），侧边栏的
+# Image Support 开关因此形同虚设。这里把默认值改为开，不锁死（不加 |locked），
+# docker-compose.yml 里同名变量可覆盖回退。
+ENV SELKIES_ENABLE_BINARY_CLIPBOARD="true"
+
 # set app name
 ENV TITLE="WeChat-Selkies"
 ENV TZ="Asia/Shanghai"

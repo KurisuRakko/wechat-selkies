@@ -139,14 +139,43 @@ class ClipboardInjectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(instance.clipboard_paused)
 
     async def test_restore_failure_does_not_reclassify_successful_paste(self):
-        instance = make_input(writes=[True, False])
+        # Fix 6 retries the restore once, so "failure" here means both attempts
+        # failed (writes: paste ok, restore attempt 1 fails, retry fails).
+        instance = make_input(writes=[True, False, False])
         factory = ProcessFactory(FakeProcess())
 
         with patch.object(input_handler.subprocess, "create_subprocess_exec", factory):
             dispatched = await instance._inject_unicode_via_clipboard("只粘贴一次")
 
         self.assertTrue(dispatched)
-        self.assertEqual(instance.write_clipboard.await_count, 2)
+        self.assertEqual(instance.write_clipboard.await_count, 3)
+        self.assertFalse(instance.clipboard_paused)
+
+    async def test_restore_retries_once_before_giving_up(self):
+        instance = make_input(writes=[True, False, True])
+        factory = ProcessFactory(FakeProcess())
+
+        with patch.object(input_handler.subprocess, "create_subprocess_exec", factory):
+            dispatched = await instance._inject_unicode_via_clipboard("只粘贴一次")
+
+        self.assertTrue(dispatched)
+        self.assertEqual(instance.write_clipboard.await_count, 3)
+        self.assertEqual(
+            instance.write_clipboard.await_args_list[1],
+            instance.write_clipboard.await_args_list[2],
+            "retry passes the exact same payload and mime type",
+        )
+        self.assertFalse(instance.clipboard_paused)
+
+    async def test_restore_failing_twice_still_reports_dispatch_result(self):
+        instance = make_input(writes=[True, False, False])
+        factory = ProcessFactory(FakeProcess())
+
+        with patch.object(input_handler.subprocess, "create_subprocess_exec", factory):
+            dispatched = await instance._inject_unicode_via_clipboard("只粘贴一次")
+
+        self.assertTrue(dispatched, "a successful paste must not be reclassified by restore failure")
+        self.assertEqual(instance.write_clipboard.await_count, 3)
         self.assertFalse(instance.clipboard_paused)
 
     async def test_concurrent_commits_do_not_interleave_clipboards(self):

@@ -571,6 +571,41 @@ patch(
 )
 
 
+# --------------------------------------------------------------------------- 6
+# A clipboard restore failure is transient under load: xclip/wl-copy forks a
+# short-lived owner process for the selection, and that fork can miss its own
+# internal timeout once without the selection being lost. With the binary
+# clipboard now enabled by default, large images linger in the selection far
+# more often, and a single-shot restore would throw the user's clipboard away
+# on a momentary hiccup -- retry once before giving up.
+
+patch(
+    "input_handler.py",
+    "retry clipboard restore once before giving up",
+    """                            if old_data:
+                                restored = await self.write_clipboard(
+                                    old_data, mime_type=old_mime or "text/plain"
+                                )
+                                if not restored:
+                                    raise RuntimeError("clipboard restore returned false")
+""",
+    """                            if old_data:
+                                restored = await self.write_clipboard(
+                                    old_data, mime_type=old_mime or "text/plain"
+                                )
+                                if not restored:
+                                    logger_webrtc_input.warning(
+                                        "Clipboard restore failed once; retrying"
+                                    )
+                                    restored = await self.write_clipboard(
+                                        old_data, mime_type=old_mime or "text/plain"
+                                    )
+                                    if not restored:
+                                        raise RuntimeError("clipboard restore returned false after retry")
+""",
+)
+
+
 # The bundled .pyc files would otherwise be consulted first. Python invalidates
 # them on the source mtime, which we just changed, but drop them so nothing can
 # shadow the patched source.
@@ -580,4 +615,4 @@ if os.path.isdir(cache):
         os.remove(os.path.join(cache, name))
     os.rmdir(cache)
 
-print("input-and-backpressure-fixes: 6 patch(es) applied")
+print("input-and-backpressure-fixes: 7 patch(es) applied")

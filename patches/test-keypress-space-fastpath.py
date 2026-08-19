@@ -13,8 +13,9 @@ directly -- no real X11/pynput required for that half either, since the
 fixture's own send_x11_keypress_printable() only exercises the plain-Python
 branching this patch changes, not the pynput call itself.
 
-The fixtures reproduce every anchor the script's five patch() calls look for
-(fixes 1, 2a, 2b, 3, 4 already in the file, plus this candidate's fix 5),
+The fixtures reproduce every anchor the script's seven patch() calls look for
+(fixes 1, 2a, 2b, 3, 4 already in the file, plus this candidate's fixes 5
+and 6),
 because the script applies all of its patches, across both target files, in
 one run, and fails fast on the first missing anchor.
 """
@@ -193,12 +194,14 @@ def run(site: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
-# 1. a clean site gets all six patches applied, including the space fast-path.
+# 1. a clean site gets all seven patches applied, including the space fast-path
+#    and the clipboard-restore retry.
 site, input_handler_target = make_site()
 result = run(site)
 assert result.returncode == 0, result.stderr
-assert "6 patch(es) applied" in result.stdout, result.stdout
+assert "7 patch(es) applied" in result.stdout, result.stdout
 assert "route space through the in-process pynput path" in result.stdout
+assert "retry clipboard restore once before giving up" in result.stdout
 
 patched = input_handler_target.read_text(encoding="utf-8")
 ast.parse(patched)
